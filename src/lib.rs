@@ -1,1 +1,2 @@
-pub mod queued_signal;
+pub mod signal;
+

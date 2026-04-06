@@ -1,40 +1,46 @@
 use dioxus::prelude::*;
-use queued_signal::queued_signal::QueuedSignal;
-use std::{time::Duration};
+use queued_signal::signal::{QueuedSignalRegistry, use_queued_signal};
+use std::time::Duration;
 
-#[derive(Clone)]
-pub struct Counter {
-    signal: QueuedSignal<i32>,
+#[derive(Default, Clone)]
+pub struct AppNumbers {
+    pub numbers: Vec<i32>,
 }
 
-
-pub fn main() {
+fn main() {
+    let registry = QueuedSignalRegistry::new();
     dioxus::LaunchBuilder::new()
-        .with_context(Counter {
-            signal: QueuedSignal::new(0, Duration::from_millis(100)),
-        })
+        .with_context(registry)
         .launch(app);
 }
 
 fn app() -> Element {
-    let counter = use_context::<Counter>();
+    let numbers = use_queued_signal::<AppNumbers>();
 
-    // Attaches the queued signal to this component – returns a Dioxus signal
-    let count_signal = counter.signal.use_attached();
-
+    let numbers_clone = numbers.clone();
     use_future(move || {
-        let value = counter.signal.clone();
-        async move {
-            loop {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                value.mutate(|x| *x += 1);
-            }
+    let value = numbers_clone.clone();
+    async move {
+        let mut counter = 0;
+        loop {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            value.mutate(move |data| {
+                data.numbers.push(counter);
+                let _ = counter += 1;
+            }).ok();
         }
+    }
     });
+
+    let display = numbers.read_signal()()
+        .as_ref()
+        .map(|data| format!("len = {}, data = {:?}", data.numbers.len(), data.numbers))
+        .unwrap_or_else(|| "Initializing...".to_string());
 
     rsx! {
         div {
-            h1 { "Signal: {count_signal}" }
+            h1 { "Queued Signal Demo (Lock‑Free Reads)" }
+            p { "{display}" }
         }
     }
 }
