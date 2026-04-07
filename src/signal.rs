@@ -1,12 +1,10 @@
 use arc_swap::ArcSwap;
+use bytemuck::TransparentWrapper;
 use dioxus::prelude::*;
 use flume::{Receiver, Sender};
-use std::any::{Any, TypeId};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-
 
 #[derive(Clone)]
 struct QueuedState<T> {
@@ -81,13 +79,13 @@ struct QueuedSignalInner<T> {
 
 #[derive(Clone)]
 pub struct QueuedSignal<T> {
-    inner: Arc<OnceLock<QueuedSignalInner<T>>>,
+    inner: Arc<std::sync::OnceLock<QueuedSignalInner<T>>>,
 }
 
 impl<T: Send + Sync + 'static + Clone> QueuedSignal<T> {
     pub fn new_uninitialized() -> Self {
         Self {
-            inner: Arc::new(OnceLock::new()),
+            inner: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -122,13 +120,12 @@ impl<T: Send + Sync + 'static + Clone> QueuedSignal<T> {
         Ok(())
     }
 
-    /// Attaches the signal to the current component.
+    /// Attaches the signal to the current Dioxus component.
     /// Returns a reactive `Signal<Option<Arc<T>>>`.
     pub fn attach_signal(&self) -> Signal<Option<Arc<T>>> {
         let inner_ref = use_hook(|| self.inner.clone());
-        let mut value_signal = use_signal(|| {
-            inner_ref.get().map(|inner| inner.state.read())
-        });
+        let mut value_signal = use_signal(|| inner_ref.get().map(|inner| inner.state.read()));
+
         use_future(move || {
             let inner = inner_ref.clone();
             async move {
@@ -143,71 +140,30 @@ impl<T: Send + Sync + 'static + Clone> QueuedSignal<T> {
                 }
             }
         });
+
         value_signal
     }
 }
 
-impl<T: Send + Sync + 'static + Clone> Default for QueuedSignal<T> {
-    fn default() -> Self {
-        Self::new_uninitialized()
-    }
+/// A handle to a queued, lock‑free copy of a resource.
+/// Can be mutated locally and synchronised with an authoritative source.
+#[derive(Clone, TransparentWrapper)]
+#[repr(transparent)]
+pub struct QueuedResource<T> {
+    pub signal: QueuedSignal<T>,
 }
 
-const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_millis(10);
-
-#[derive(Clone)]
-pub struct QueuedSignalRegistry {
-    map: Arc<Mutex<HashMap<TypeId, Box<dyn Any + Send + Sync>>>>,
-}
-
-impl QueuedSignalRegistry {
-    pub fn new() -> Self {
+impl<T: Send + Sync + 'static + Clone> QueuedResource<T> {
+    pub fn new(initial: T, interval: Duration) -> Self {
         Self {
-            map: Arc::new(Mutex::new(HashMap::new())),
+            signal: QueuedSignal::new(initial, interval),
         }
     }
 
-    pub fn get_signal<T: Send + Sync + 'static + Clone + Default>(
-        &self,
-    ) -> Arc<QueuedSignal<T>> {
-        let type_id = TypeId::of::<T>();
-        // First, try to read without locking (we can't, because we need to check existence).
-        // We must lock the mutex. But this lock is taken only once per type, then cached.
-        let mut map = self.map.lock().unwrap();
-        if let Some(entry) = map.get(&type_id) {
-            return entry
-                .downcast_ref::<Arc<QueuedSignal<T>>>()
-                .expect("Type mismatch")
-                .clone();
-        }
-        let signal = Arc::new(QueuedSignal::new(T::default(), DEFAULT_FLUSH_INTERVAL));
-        map.insert(type_id, Box::new(signal.clone()));
-        signal
+    pub fn read(&self) -> Result<Arc<T>, &'static str> {
+        self.signal.read()
     }
 
-    pub fn register_signal<T: Send + Sync + 'static + Clone>(
-        &self,
-        signal: Arc<QueuedSignal<T>>,
-    ) {
-        let type_id = TypeId::of::<T>();
-        let mut map = self.map.lock().unwrap();
-        map.insert(type_id, Box::new(signal));
-    }
-}
-
-impl Default for QueuedSignalRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[derive(Clone)]
-pub struct QueuedSignalHandle<T> {
-    read_signal: Signal<Option<Arc<T>>>,
-    signal: Arc<QueuedSignal<T>>,
-}
-
-impl<T: Send + Sync + 'static + Clone> QueuedSignalHandle<T> {
     pub fn mutate<F>(&self, f: F) -> Result<(), &'static str>
     where
         F: FnOnce(&mut T) + Send + 'static,
@@ -215,14 +171,18 @@ impl<T: Send + Sync + 'static + Clone> QueuedSignalHandle<T> {
         self.signal.mutate(f)
     }
 
-    pub fn read_signal(&self) -> Signal<Option<Arc<T>>> {
-        self.read_signal
+    pub fn attach(&self) -> Signal<Option<Arc<T>>> {
+        self.signal.attach_signal()
     }
-}
 
-pub fn use_queued_signal<T: Send + Sync + 'static + Clone + Default>() -> QueuedSignalHandle<T> {
-    let registry = use_context::<QueuedSignalRegistry>();
-    let signal = registry.get_signal::<T>();
-    let read_signal = signal.attach_signal();
-    QueuedSignalHandle { read_signal, signal }
+    pub fn current_value(&self) -> Arc<T> {
+        self.signal
+            .read()
+            .unwrap_or_else(|_| panic!("QueuedResource not initialized"))
+    }
+
+    /// Consumes the wrapper and returns the inner `QueuedSignal`.
+    pub fn into_inner(self) -> QueuedSignal<T> {
+        self.signal
+    }
 }

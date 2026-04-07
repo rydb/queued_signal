@@ -10,3 +10,6 @@ arc-swap = "1.9"
 flume = {version = "0.12"}
 tokio = "1.51"
 flashmap = "0.2"
+bevy_ecs = {version = "0.17"}
+bevy_app = {version = "0.17"}
+bytemuck = {version = "1.25", features = ["derive"]}
