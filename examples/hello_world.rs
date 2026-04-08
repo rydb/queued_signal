@@ -1,181 +1,157 @@
-// main.rs
 use std::any::TypeId;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use bevy_app::prelude::*;
-use bevy_ecs::prelude::*;
+use bevy_ecs::{prelude::*, schedule::ScheduleLabel, system::ScheduleSystem};
 use dioxus::prelude::*;
 use flume::{Receiver, Sender};
-use queued_signal::signal::{QueuedResource, QueuedSignal};
+use queued_signal::signal::{QueuedResource, QueuedSignal, QueuedSignalHandle};
 
-type SignalRequest = (TypeId, Sender<Box<dyn std::any::Any + Send>>);
 
-/// Context passed to Dioxus. It allows requesting a `QueuedResource<T>` without
-/// locking or accessing the Bevy world directly.
-#[derive(Clone)]
-pub struct SignalRequestContext {
-    request_tx: Sender<SignalRequest>,
+/// A command that can be sent from Dioxus to Bevy.
+pub trait BevyCommand: Send + 'static {
+    fn apply(self: Box<Self>, world: &mut World);
 }
 
-impl SignalRequestContext {
-    /// Request a `QueuedResource<T>` for a given resource type.
-    /// Returns `None` if the type is not registered or the request times out.
-    pub fn request_signal<T: Send + Sync + 'static + Clone>(
-        &self,
-    ) -> Option<QueuedResource<T>> {
-        let (tx, rx) = flume::bounded(1);
-        let type_id = TypeId::of::<T>();
-        self.request_tx.send((type_id, tx)).ok()?;
+pub type CommandSender = Sender<Box<dyn BevyCommand>>;
+pub type CommandReceiver = Receiver<Box<dyn BevyCommand>>;
 
-        let boxed = rx.recv_timeout(Duration::from_millis(100)).ok()?;
-        let resource = boxed.downcast::<QueuedResource<T>>().ok()?;
-        Some(*resource)
+/// Context passed to Dioxus. Holds a sender to the Bevy command queue.
+#[derive(Clone)]
+pub struct CommandQueueContext {
+    tx: CommandSender,
+}
+
+impl CommandQueueContext {
+    fn send_command<R: Send + 'static>(
+        &self,
+        make_command: impl FnOnce(Sender<R>) -> Box<dyn BevyCommand>,
+    ) -> Option<R> {
+        let (response_tx, response_rx) = flume::bounded(1);
+        let cmd = make_command(response_tx);
+        self.tx.send(cmd).ok()?;
+        response_rx.recv_timeout(Duration::from_millis(100)).ok()
     }
 }
 
-#[derive(Resource)]
-struct SyncHandle<T: Send + Sync + 'static + Clone> {
-    resource: QueuedResource<T>,
+#[derive(Resource, Clone)]
+#[repr(transparent)]
+pub struct BevyResourceClone<T: Send + Sync + 'static + Clone> {
+    pub inner: QueuedResource<T>,
 }
 
-impl<T: Send + Sync + 'static + Clone> SyncHandle<T> {
-    fn new() -> Self {
+impl<T: Send + Sync + 'static + Clone> BevyResourceClone<T> {
+    fn new_uninitialized() -> Self {
         Self {
-            resource: QueuedResource {
+            inner: QueuedResource {
                 signal: QueuedSignal::new_uninitialized(),
             },
         }
     }
 }
 
-const SYNC_INTERVAL_MS: u64 = 16; // ~60 FPS
-
-pub struct ResourceSyncPlugin<T: Resource + Send + Sync + 'static + Clone> {
-    _marker: std::marker::PhantomData<T>,
+struct RequestBevyResource<T: Resource + Send + Sync + 'static + Clone> {
+    response_tx: Sender<BevyResourceClone<T>>,
 }
 
-impl<T: Resource + Send + Sync + 'static + Clone> ResourceSyncPlugin<T> {
-    pub fn new() -> Self {
-        Self {
-            _marker: std::marker::PhantomData,
-        }
-    }
-}
-
-impl<T: Resource + Send + Sync + 'static + Clone> Plugin for ResourceSyncPlugin<T> {
-    fn build(&self, app: &mut App) {
-        println!("building sync plugin for: {:?}", TypeId::of::<T>());
-        app.insert_resource(SyncHandle::<T>::new())
-            .add_systems(Update, (
-                initialize_signal::<T>,
-                sync_signal_to_resource::<T>,
-                handle_signal_requests::<T>,
-            ));
-    }
-}
-
-/// Initialises the `QueuedSignal` with a clone of the current authoritative resource.
-fn initialize_signal<T: Resource + Send + Sync + 'static + Clone>(
-    mut handle: ResMut<SyncHandle<T>>,
-    res: Res<T>,
-) {
-    if !handle.resource.signal.is_initialized() {
-        let initial = res.clone();
-        let _ = handle.resource.signal.initialize(initial, Duration::from_millis(SYNC_INTERVAL_MS));
-    }
-}
-
-/// Writes the latest value from the `QueuedSignal` back to the authoritative resource.
-fn sync_signal_to_resource<T: Resource + Send + Sync + 'static + Clone>(
-    handle: Res<SyncHandle<T>>,
-    mut res: ResMut<T>,
-) {
-    if let Ok(latest) = handle.resource.read() {
-        *res = (*latest).clone();
-    }
-}
-
-/// Processes incoming requests from Dioxus. Matches by `TypeId`.
-/// If the request is not for this type, it is forwarded back to the main queue.
-fn handle_signal_requests<T: Send + Sync + 'static + Clone>(
-    handle: Res<SyncHandle<T>>,
-    receiver: Res<SignalRequestReceiver>,
-    forwarder: Res<SignalRequestForwarder>,
-) {
-    while let Ok((type_id, reply_tx)) = receiver.rx.try_recv() {
-        if type_id == TypeId::of::<T>() {
-            let boxed: Box<dyn std::any::Any + Send> = Box::new(handle.resource.clone());
-            let _ = reply_tx.send(boxed);
+impl<T: Resource + Send + Sync + 'static + Clone> BevyCommand for RequestBevyResource<T> {
+    fn apply(self: Box<Self>, world: &mut World) {
+        let clone = if let Some(existing) = world.get_resource::<BevyResourceClone<T>>() {
+            existing.clone()
         } else {
-            // Not our type – put it back for other plugins.
-            let _ = forwarder.tx.send((type_id, reply_tx));
+            let new_clone = BevyResourceClone::<T>::new_uninitialized();
+            world.insert_resource(new_clone.clone());
+            new_clone
+        };
+
+        if !clone.inner.signal.is_initialized() {
+            if let Some(resource) = world.get_resource::<T>() {
+                let initial = resource.clone();
+                let _ = clone
+                    .inner
+                    .signal
+                    .initialize(initial, Duration::from_millis(SYNC_INTERVAL_MS));
+            }
         }
+
+        if !world.contains_resource::<SyncMarker<T>>() {
+            world.insert_resource(SyncMarker::<T>(PhantomData));
+            add_systems_through_world(
+                world,
+                Update,
+                (
+                    sync_resource_to_signal::<T>,
+                    sync_signal_to_resource::<T>,
+                ),
+            );
+        }
+
+        let _ = self.response_tx.send(clone);
     }
 }
 
 #[derive(Resource)]
-struct SignalRequestReceiver {
-    rx: Receiver<SignalRequest>,
-}
+struct SyncMarker<T>(PhantomData<T>);
 
-#[derive(Resource, Clone)]
-struct SignalRequestForwarder {
-    tx: Sender<SignalRequest>,
-}
+const SYNC_INTERVAL_MS: u64 = 16;
 
-fn run_bevy_world(
-    request_rx: Receiver<SignalRequest>,
-    shutdown_rx: Receiver<()>,
-    initial_resources: Vec<Box<dyn std::any::Any + Send>>,
-    request_tx: Sender<SignalRequest>, // <-- Pass the sender explicitly
+
+fn sync_resource_to_signal<T: Resource + Send + Sync + 'static + Clone>(
+    resource: Res<T>,
+    clone: Res<BevyResourceClone<T>>,
 ) {
-    let mut app = App::new();
-
-    // Add plugins for each resource type we want to sync.
-    app.add_plugins(ResourceSyncPlugin::<Counter>::new());
-
-    // Insert initial resources.
-    for resource in initial_resources {
-        if let Some(counter) = resource.downcast_ref::<Counter>() {
-            app.insert_resource(counter.clone());
-        }
-    }
-
-    app.insert_resource(SignalRequestReceiver { rx: request_rx });
-    app.insert_resource(SignalRequestForwarder { tx: request_tx });
-
-    loop {
-        if shutdown_rx.try_recv().is_ok() {
-            break;
-        }
-        app.update();
-        std::thread::sleep(Duration::from_millis(SYNC_INTERVAL_MS));
+    if resource.is_changed() && clone.inner.signal.is_initialized() {
+        let _ = clone.inner.signal.set_value(resource.clone());
     }
 }
 
-pub fn use_queued_resource<T: Send + Sync + 'static + Clone>(
-) -> (Signal<Option<Arc<T>>>, impl Fn(Box<dyn FnOnce(&mut T) + Send + 'static>) + Clone + 'static) {
-    let ctx = use_context::<SignalRequestContext>();
-    // Store the QueuedResource in a use_signal so it persists across renders.
-    let mut resource_signal = use_signal(|| {
-        ctx.request_signal::<T>()
-            .expect("Resource type not registered with Bevy")
+fn sync_signal_to_resource<T: Resource + Send + Sync + 'static + Clone>(
+    clone: Res<BevyResourceClone<T>>,
+    mut resource: ResMut<T>,
+) {
+    if let Ok(latest) = clone.inner.read() {
+        *resource = (*latest).clone();
+    }
+}
+
+pub fn add_systems_through_world<T>(
+    world: &mut World,
+    schedule: impl ScheduleLabel,
+    systems: impl IntoScheduleConfigs<ScheduleSystem, T>,
+) {
+    let mut schedules = world.get_resource_mut::<Schedules>().unwrap();
+    if let Some(schedule) = schedules.get_mut(schedule) {
+        schedule.add_systems(systems);
+    }
+}
+
+
+
+#[derive(Resource)]
+struct CommandReceiverResource {
+    rx: CommandReceiver,
+}
+
+fn process_commands(world: &mut World) {
+    let rx = world.resource::<CommandReceiverResource>().rx.clone();
+    while let Ok(cmd) = rx.try_recv() {
+        cmd.apply(world);
+    }
+}
+
+pub fn use_queued_resource<T: Resource + Send + Sync + 'static + Clone>(
+) -> QueuedSignalHandle<T> {
+    let ctx = use_context::<CommandQueueContext>();
+
+    let resource_clone = use_hook(|| {
+        ctx.send_command(|tx| Box::new(RequestBevyResource::<T> { response_tx: tx }))
+            .expect("Failed to request resource from Bevy")
     });
 
-    let resource = resource_signal.read().clone();
-    let read_signal = resource.attach();
-
-    // Create a mutate function that captures the resource.
-    let mutate = {
-        let resource = resource.clone();
-        move |f: Box<dyn FnOnce(&mut T) + Send + 'static>| {
-            let _ = resource.mutate(move |data| f(data));
-        }
-    };
-
-    (read_signal, mutate)
+    QueuedSignalHandle::new(resource_clone.inner)
 }
 
 #[derive(Clone, Resource)]
@@ -184,51 +160,53 @@ pub struct Counter {
 }
 
 fn main() {
-    let (request_tx, request_rx) = flume::unbounded::<SignalRequest>();
+    let (cmd_tx, cmd_rx) = flume::unbounded::<Box<dyn BevyCommand>>();
     let (shutdown_tx, shutdown_rx) = flume::bounded(1);
 
-    let initial_resources: Vec<Box<dyn std::any::Any + Send>> = vec![
-        Box::new(Counter { value: 0 }),
-    ];
-
-    // Clone the sender to pass into the bevy thread.
-    let request_tx_for_bevy = request_tx.clone();
     thread::spawn(move || {
-        run_bevy_world(request_rx, shutdown_rx, initial_resources, request_tx_for_bevy);
+        let mut app = App::new();
+        app.insert_resource(Counter { value: 0 });
+        app.insert_resource(CommandReceiverResource { rx: cmd_rx });
+        app.add_systems(Update, process_commands);
+
+        loop {
+            if shutdown_rx.try_recv().is_ok() {
+                break;
+            }
+            app.update();
+            std::thread::sleep(Duration::from_millis(SYNC_INTERVAL_MS));
+        }
     });
 
-    let request_ctx = SignalRequestContext { request_tx };
+    let cmd_ctx = CommandQueueContext { tx: cmd_tx };
 
     dioxus::LaunchBuilder::new()
-        .with_context(request_ctx)
+        .with_context(cmd_ctx)
         .launch(dx_app);
 
     let _ = shutdown_tx.send(());
 }
 
 fn dx_app() -> Element {
-    let (counter, mutate) = use_queued_resource::<Counter>();
-    let value = counter.read().as_ref().map(|arc| arc.value).unwrap_or(0);
+    let counter = use_queued_resource::<Counter>();
+    let counter_value = counter.read().as_ref().map(|n| n.value).unwrap_or(0);
 
-    // Auto‑increment every 10ms
-    let incr_clone = mutate.clone();
+    let r = Arc::new(counter.clone());
     use_future(move || {
-        let mutate = incr_clone.clone();
+        let counter = r.clone();
         async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(10)).await;
-                mutate(Box::new(|c: &mut Counter| c.value += 1));
+                counter.mutate(|c| c.value += 1);
             }
         }
     });
 
     rsx! {
         div {
-            h1 { "Counter: {value}" }
+            h1 { "Counter: {counter_value}" }
             button {
-                onclick: move |_| {
-                    mutate(Box::new(|c: &mut Counter| c.value += 100));
-                },
+                onclick: move |_| counter.mutate(|c| c.value += 100),
                 "Increment"
             }
         }

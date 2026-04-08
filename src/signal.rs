@@ -1,15 +1,20 @@
 use arc_swap::ArcSwap;
-use bytemuck::TransparentWrapper;
 use dioxus::prelude::*;
 use flume::{Receiver, Sender};
+use std::ops::Deref;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+
+// -----------------------------------------------------------------------------
+// QueuedState / QueuedWriter
+// -----------------------------------------------------------------------------
 
 #[derive(Clone)]
 struct QueuedState<T> {
     current: Arc<ArcSwap<T>>,
     notify_rx: Receiver<()>,
+    notify_tx: Sender<()>,
 }
 
 impl<T> QueuedState<T> {
@@ -38,7 +43,8 @@ impl<T: Send + Sync + 'static + Clone> QueuedWriter<T> {
 
         let state = QueuedState {
             current: current.clone(),
-            notify_rx,
+            notify_rx: notify_rx.clone(),
+            notify_tx: notify_tx.clone(),
         };
         let handle = thread::spawn(move || {
             let mut private_state = initial;
@@ -71,6 +77,10 @@ impl<T: Send + Sync + 'static + Clone> QueuedWriter<T> {
         let _ = self.command_tx.send(Box::new(f));
     }
 }
+
+// -----------------------------------------------------------------------------
+// QueuedSignal
+// -----------------------------------------------------------------------------
 
 struct QueuedSignalInner<T> {
     state: QueuedState<T>,
@@ -120,8 +130,13 @@ impl<T: Send + Sync + 'static + Clone> QueuedSignal<T> {
         Ok(())
     }
 
-    /// Attaches the signal to the current Dioxus component.
-    /// Returns a reactive `Signal<Option<Arc<T>>>`.
+    pub fn set_value(&self, value: T) -> Result<(), &'static str> {
+        let inner = self.inner.get().ok_or("QueuedSignal not initialized")?;
+        inner.state.current.store(Arc::new(value));
+        let _ = inner.state.notify_tx.send(());
+        Ok(())
+    }
+
     pub fn attach_signal(&self) -> Signal<Option<Arc<T>>> {
         let inner_ref = use_hook(|| self.inner.clone());
         let mut value_signal = use_signal(|| inner_ref.get().map(|inner| inner.state.read()));
@@ -145,21 +160,16 @@ impl<T: Send + Sync + 'static + Clone> QueuedSignal<T> {
     }
 }
 
-/// A handle to a queued, lock‑free copy of a resource.
-/// Can be mutated locally and synchronised with an authoritative source.
-#[derive(Clone, TransparentWrapper)]
-#[repr(transparent)]
+// -----------------------------------------------------------------------------
+// QueuedResource (registry‑agnostic)
+// -----------------------------------------------------------------------------
+
+#[derive(Clone)]
 pub struct QueuedResource<T> {
     pub signal: QueuedSignal<T>,
 }
 
 impl<T: Send + Sync + 'static + Clone> QueuedResource<T> {
-    pub fn new(initial: T, interval: Duration) -> Self {
-        Self {
-            signal: QueuedSignal::new(initial, interval),
-        }
-    }
-
     pub fn read(&self) -> Result<Arc<T>, &'static str> {
         self.signal.read()
     }
@@ -174,15 +184,47 @@ impl<T: Send + Sync + 'static + Clone> QueuedResource<T> {
     pub fn attach(&self) -> Signal<Option<Arc<T>>> {
         self.signal.attach_signal()
     }
+}
 
-    pub fn current_value(&self) -> Arc<T> {
-        self.signal
-            .read()
-            .unwrap_or_else(|_| panic!("QueuedResource not initialized"))
+// -----------------------------------------------------------------------------
+// Reactive Handle (combines Signal + mutation)
+// -----------------------------------------------------------------------------
+
+/// A handle that behaves like a Dioxus `Signal` for a queued resource.
+/// It implements `Deref<Target = Signal<Option<Arc<T>>>>`, so you can use it
+/// directly in RSX as `{handle.map(|arc| arc.field)}` or call `handle()`.
+#[derive(Clone)]
+pub struct QueuedSignalHandle<T> {
+    signal: Signal<Option<Arc<T>>>,
+    resource: QueuedResource<T>,
+}
+
+impl<T: Send + Sync + 'static + Clone> QueuedSignalHandle<T> {
+    /// Creates a new handle from a `QueuedResource`. This should only be called
+    /// inside a Dioxus component because it uses `attach()` which relies on hooks.
+    pub fn new(resource: QueuedResource<T>) -> Self {
+        let signal = resource.attach();
+        Self { signal, resource }
     }
 
-    /// Consumes the wrapper and returns the inner `QueuedSignal`.
-    pub fn into_inner(self) -> QueuedSignal<T> {
-        self.signal
+    /// Schedules a mutation to be applied asynchronously.
+    pub fn mutate<F>(&self, f: F)
+    where
+        F: FnOnce(&mut T) + Send + 'static,
+    {
+        let _ = self.resource.mutate(f);
+    }
+
+    /// Provides direct access to the underlying `Signal`.
+    pub fn signal(&self) -> &Signal<Option<Arc<T>>> {
+        &self.signal
+    }
+}
+
+impl<T> Deref for QueuedSignalHandle<T> {
+    type Target = Signal<Option<Arc<T>>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.signal
     }
 }
