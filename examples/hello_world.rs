@@ -6,8 +6,10 @@ use std::time::Duration;
 
 use bevy_app::prelude::*;
 use bevy_ecs::{prelude::*, schedule::ScheduleLabel, system::ScheduleSystem};
+use bevy_transform::components::Transform;
 use dioxus::prelude::*;
 use flume::{Receiver, Sender};
+use glam::Vec3;
 use queued_signal::signal::{QueuedResource, QueuedSignal, QueuedSignalHandle};
 
 
@@ -102,7 +104,12 @@ const SYNC_INTERVAL_MS: u64 = 16;
 fn sync_resource_to_signal<T: Resource + Send + Sync + 'static + Clone>(
     resource: Res<T>,
     clone: Res<BevyResourceClone<T>>,
+    cubes: Query<(&mut Transform, Entity)>,
 ) {
+    for (mut transform, e) in cubes {
+        transform.translation += Vec3::new(0.0, 0.1, 0.0);
+        println!("moved entity, {} to {}", e, transform.translation)
+    }
     if resource.is_changed() && clone.inner.signal.is_initialized() {
         let _ = clone.inner.signal.set_value(resource.clone());
     }
@@ -160,6 +167,7 @@ pub struct Counter {
 }
 
 fn main() {
+
     let (cmd_tx, cmd_rx) = flume::unbounded::<Box<dyn BevyCommand>>();
     let (shutdown_tx, shutdown_rx) = flume::bounded(1);
 
@@ -187,10 +195,10 @@ fn main() {
     let _ = shutdown_tx.send(());
 }
 
+
 fn dx_app() -> Element {
     let counter = use_queued_resource::<Counter>();
     let counter_value = counter.read().as_ref().map(|n| n.value).unwrap_or(0);
-
     let r = Arc::new(counter.clone());
     use_future(move || {
         let counter = r.clone();

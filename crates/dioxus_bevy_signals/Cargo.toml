@@ -1,0 +1,11 @@
+[package]
+name = "dioxus_bevy_signals"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy_ecs = {workspace = true}
+bevy_app = {workspace = true}
+queued_signal = {workspace = true}
+trait-set = {workspace = true}
+bevy_log = {workspace = true}

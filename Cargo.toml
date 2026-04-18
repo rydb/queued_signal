@@ -4,7 +4,23 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-dioxus = {version = "0.7.4", features = ["desktop"]}
+dioxus = {workspace = true, features = ["desktop"]}
+dioxus-core = {workspace = true}
+arc-swap = {workspace = true}
+flume = {workspace = true}
+tokio = {workspace = true}
+flashmap = {workspace = true}
+bevy_ecs = {workspace = true}
+bevy_app = {workspace = true}
+bevy_transform = {workspace = true}
+bevy_log = {workspace = true}
+glam = {workspace = true}
+bytemuck = {workspace = true}
+variadics_please = {workspace = true}
+
+
+[workspace.dependencies]
+dioxus = {version = "0.7.4"}
 dioxus-core = {version = "0.7.4"}
 arc-swap = "1.9"
 flume = {version = "0.12"}
@@ -12,4 +28,13 @@ tokio = "1.51"
 flashmap = "0.2"
 bevy_ecs = {version = "0.17"}
 bevy_app = {version = "0.17"}
+bevy_transform = {version = "0.17"}
+bevy_log = {version = "0.17"}
+glam = {version = "0.30"}
+trait-set = {version = "0.3"}
 bytemuck = {version = "1.25", features = ["derive"]}
+variadics_please = "1.1.0"
+queued_signal = {path = "./"}
+
+[workspace]
+members = ["./crates/*", "crates/dioxus_bevy_signals"]
