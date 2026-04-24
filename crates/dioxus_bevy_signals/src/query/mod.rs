@@ -1,7 +1,7 @@
-use std::{any::{TypeId, type_name}, collections::{HashMap, HashSet}, marker::PhantomData, sync::Arc, time::Duration};
+use std::{any::{TypeId, type_name}, collections::{HashMap, HashSet}, marker::PhantomData, time::Duration};
 
 use bevy_app::Update;
-use bevy_ecs::{component::Mutable, prelude::*, query::{QueryData, QueryFilter, QueryItem}};
+use bevy_ecs::{component::Mutable, prelude::*, query::{QueryData, QueryFilter}};
 use bevy_log::warn;
 use queued_signal::signal::QueuedSignal;
 use trait_set::trait_set;
@@ -27,10 +27,14 @@ pub struct DioxusMirror<T: DioxusSync> {
 
 pub const DEFAULT_COMPONENT_SYNC_INTERVAL: Duration = Duration::from_millis(100);
 
+fn query_to_tracking_id<Q: MirrorQueryData>() -> TypeId {
+    TypeId::of::<Q::MirrorItem>()
+}
+
 impl<T: DioxusSync> DioxusMirror<T> {
     pub fn new<Q: MirrorQueryData>(value: T) -> Self {
         let mut map = HashSet::new();
-        map.insert(TypeId::of::<Q::MirrorItem>());
+        map.insert(query_to_tracking_id::<Q>());
         Self {
             value: QueuedSignal::new(value, DEFAULT_COMPONENT_SYNC_INTERVAL),
             tracking_queries: map
@@ -77,29 +81,37 @@ pub fn sync_mirror_to_component<T: DioxusSync>(
 pub fn sync_query_mirror_to_signal<T: MirrorQueryData + 'static, F: QueryFilter + 'static>(
     components_without_signals: Query<T, (F, T::MirrorSignalsWithoutFilter)>,
     mut mirror_components: Query<T::MirrorSignalsQueryData, F>,
-    mirror_signal: ResMut<MirrorQuerySignal<T, F>>,
+    mirror_signal: ResMut<MirrorQuery<T, F>>,
     mut commands: Commands,
 ) {
-    let results = mirror_components.iter_mut();
 
-    if let Some(upper_bound) = results.size_hint().1 && upper_bound > T::MAX_TRACKED_COUNT {
-        warn!("There are more entries in {} then allowed by MAX_TRACKED_COUNT, {}. Killing query for performance.", type_name::<T>(), T::MAX_TRACKED_COUNT);
-        todo!()
+
+    for item in &mut mirror_components {
+        T::increment_tracking_queries(item);
     }
 
-    // Insert DioxusMirror clones on synced bevy components which don't have them already
-    for component in components_without_signals {
-        let entity = T::get_query_entity(&component);
-        let mirrors = T::wrap_as_dioxus_signals(component);
-        let bundle = T::get_mirror_bundle(mirrors);
-        commands.entity(entity).insert(bundle);
+    {
+        let results = mirror_components.iter_mut();
+
+        if let Some(upper_bound) = results.size_hint().1 && upper_bound > T::MAX_TRACKED_COUNT {
+            warn!("There are more entries in {} then allowed by MAX_TRACKED_COUNT, {}. Killing query for performance.", type_name::<T>(), T::MAX_TRACKED_COUNT);
+            todo!()
+        }
+
+        // Insert DioxusMirror clones on synced bevy components which don't have them already
+        for component in components_without_signals {
+            let entity = T::get_query_entity(&component);
+            let mirrors = T::wrap_as_dioxus_signals(component);
+            let bundle = T::get_mirror_bundle(mirrors);
+            commands.entity(entity).insert_if_new(bundle);
+        }
+        
+        let current_values = results.map(|n| (T::get_mirror_entity(&n), T::clone_dioxus_signals(n))).collect::<HashMap<_, _>>();
+
+        //TODO: instead of clearing entire hashmap, only merge new items/delete non-matching entities
+        mirror_signal.into_inner().value = current_values;
     }
 
-
-    let current_values = results.map(|n| (T::get_mirror_entity(&n), T::clone_dioxus_signals(n))).collect::<HashMap<_, _>>();
-
-    //TODO: instead of clearing entire hashmap, only merge new items/delete non-matching entities
-    mirror_signal.into_inner().value = current_values;
 }
 
 
@@ -141,7 +153,7 @@ impl<T: MirrorQueryData + Send + Sync + 'static, F: QueryFilter + Send + Sync + 
             T::register_mirror_sync_systems::<F>(world)
         }
         let mirrored_query = world.get_resource_or_insert_with(|| {
-            MirrorQuerySignal::<T, F>::default()
+            MirrorQuerySignal::<T, F>(QueuedSignal::new(MirrorQuery::default(), 1000))
         });
 
     }
@@ -224,6 +236,9 @@ pub trait MirrorQueryData: QueryData {
     /// get the mirrored components as an insertable bundle
     fn get_mirror_bundle<'w, 's>(item: Self::MirrorItem) -> impl Bundle;
 
+    /// increment the number of tracking queries per mirror item
+    fn increment_tracking_queries<'w, 's>(item: <<Self as MirrorQueryData>::MirrorSignalsQueryData as QueryData>::Item<'w, 's>);
+
     /// clone `Query<(&mut DioxusMirror<A>, ...)>::Item<'w, 's>`(borrowed `MirrorItem`) to owned `MirrorItem`
     fn clone_dioxus_signals<'w, 's>(
         item: <<Self as MirrorQueryData>::MirrorSignalsQueryData as QueryData>::Item<'w, 's>,
@@ -269,22 +284,52 @@ impl<A: DioxusSync, B: DioxusSync> MirrorQueryData for (Entity, &mut A, &mut B) 
         item.0
     }
     
+    fn increment_tracking_queries<'w, 's>(mut item: <<Self as MirrorQueryData>::MirrorSignalsQueryData as QueryData>::Item<'w, 's>) {
+        item.1.tracking_queries.insert(query_to_tracking_id::<Self>());
+        item.2.tracking_queries.insert(query_to_tracking_id::<Self>());
+    }
+    
+    
     
 }
-
-// pub enum MirrorQueryState {
-//     Uninitialized
-//     Capped
-// }
-
-#[derive(Resource)]
-pub struct MirrorQuerySignal<T: MirrorQueryData, F: QueryFilter> {
-    value: HashMap<Entity, T::MirrorItem>,
+// registry of the latest dioxus clones of the matching query
+pub struct MirrorQuery<Q: MirrorQueryData, F: QueryFilter> {
+    value: HashMap<Entity, Q::MirrorItem>,
     _marker: PhantomData<fn() ->F>
 }
 
-impl<T: MirrorQueryData, F: QueryFilter> Default for MirrorQuerySignal<T, F> {
+impl<'a, Q, F> IntoIterator for &'a MirrorQuery<Q, F>
+where
+    Q: MirrorQueryData,
+    F: QueryFilter,
+{
+    type Item = &'a Q::MirrorItem;
+    type IntoIter = std::collections::hash_map::Values<'a, Entity, Q::MirrorItem>;
+
+    /// Yields shared references to each `MirrorItem` tuple without cloning.
+    fn into_iter(self) -> Self::IntoIter {
+        self.value.values()
+    }
+}
+
+impl<'a, Q, F> IntoIterator for &'a mut MirrorQuery<Q, F>
+where
+    Q: MirrorQueryData,
+    F: QueryFilter,
+{
+    type Item = &'a mut Q::MirrorItem;
+    type IntoIter = std::collections::hash_map::ValuesMut<'a, Entity, Q::MirrorItem>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.value.values_mut()
+    }
+}
+
+impl<T: MirrorQueryData, F: QueryFilter> Default for MirrorQuery<T, F> {
     fn default() -> Self {
         Self { value: Default::default(), _marker: Default::default() }
     }
 }
+/// A mirror version of bevy query, accessible from dioxus, that gives access to signals that can be edited from dioxus
+#[derive(Resource)]
+pub struct MirrorQuerySignal<Q: MirrorQueryData, F: QueryFilter>(QueuedSignal<MirrorQuery<Q, F>>);

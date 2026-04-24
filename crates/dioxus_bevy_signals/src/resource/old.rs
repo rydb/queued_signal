@@ -10,7 +10,6 @@ use bevy_transform::components::Transform;
 use dioxus::prelude::*;
 use flume::{Receiver, Sender};
 use glam::Vec3;
-use queued_signal::signal::{QueuedResource, QueuedSignal, QueuedSignalHandle};
 
 
 /// A command that can be sent from Dioxus to Bevy.
