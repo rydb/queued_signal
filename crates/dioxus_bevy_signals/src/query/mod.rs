@@ -1,9 +1,9 @@
-use std::{any::{TypeId, type_name}, collections::{HashMap, HashSet}, marker::PhantomData, time::Duration};
+use std::{any::{TypeId, type_name}, collections::{HashMap, HashSet}, marker::PhantomData, sync::Mutex, time::Duration};
 
 use bevy_app::Update;
 use bevy_ecs::{component::Mutable, prelude::*, query::{QueryData, QueryFilter}};
 use bevy_log::warn;
-use queued_signal::signal::QueuedSignal;
+use queued_signal::signal::{QueuedSignal, WriterDriver};
 use trait_set::trait_set;
 
 use crate::add_systems_through_world;
@@ -17,12 +17,63 @@ trait_set! {
     pub trait DioxusSync = Component<Mutability = Mutable> + Clone
 }
 
-#[derive(Component, Clone)]
+// #[derive(Resource)]
+// pub struct ComponentWriteDrivers<T: Clone + Send + Sync + 'static>(pub Mutex<WriterDriver<T>>);
+
+/// Minimum time to pass til queued mutations from QueuedSignal are published. The time to publish may be longer then this duration, but no shorter then this duration.
+#[derive(Resource)]
+pub struct ComponentSyncTickRate(Duration);
+
+// fn drive_component_signals<T: DioxusSync>(
+//     mut drivers: ResMut<ComponentWriteDrivers<T>>,
+//     components: Query<Entity, With<DioxusMirror<T>>>,
+//     tick_rate: Res<ComponentSyncTickRate>,
+// ) {
+//     /// clear entries to that link to no where
+//     drivers.0.
+//     // for (e, driver) in drivers.0 {
+
+//     // }
+
+//     if let Ok(mut guard) = driver.0.lock().inspect_err(|err| warn!("UNABLE TO AQUIRE LOCK: {}", err)) {
+//         guard.tick(tick_rate.0);
+//     }
+// }
+
+
+// /// holder for internal structures that need to exist in clonable structs but which should not be cloned
+// pub enum NonClone<T> {
+//     /// Original structure if no clone is attempted.
+//     Original(T),
+//     /// This structure was attempted to be cloned, but was skipped.
+//     NotCloned
+// }
+
+// impl<T> Clone for NonClone<T> {
+//     fn clone(&self) -> Self {
+//         match self {
+//             Self::Original(_arg0) => Self::NotCloned,
+//             Self::NotCloned => Self::NotCloned,
+//         }
+//     }
+// }
+
+
+/// mirrored version of bevy component + infastructure for queries
+#[derive(Component)]
 pub struct DioxusMirror<T: DioxusSync> {
     pub value: QueuedSignal<T>,
 
+    /// driver for this component to make signal associated with it tick
+    pub(crate) driver: Mutex<WriterDriver<T>>,
     /// queries referencing this component. Once this is empty, this component is deleted.
     pub tracking_queries: HashSet<TypeId>,
+}
+
+/// dioxus handle to bevy side DioxusMirror
+#[derive(Clone)]
+pub struct DioxusMirrorHandle<T: DioxusSync> {
+    pub value: QueuedSignal<T>,
 }
 
 pub const DEFAULT_COMPONENT_SYNC_INTERVAL: Duration = Duration::from_millis(100);
@@ -32,7 +83,7 @@ fn query_to_tracking_id<Q: MirrorQueryData>() -> TypeId {
 }
 
 impl<T: DioxusSync> DioxusMirror<T> {
-    pub fn new<Q: MirrorQueryData>(value: T) -> Self {
+    pub fn new<Q: MirrorQueryData>(value: T, ) -> Self {
         let mut map = HashSet::new();
         map.insert(query_to_tracking_id::<Q>());
         Self {
@@ -43,11 +94,15 @@ impl<T: DioxusSync> DioxusMirror<T> {
 }
 
 
+
+
 /// sync mirrors to their changed components
 pub fn sync_component_to_mirror<T: DioxusSync>(
 	components: Query<(&mut T, &DioxusMirror<T>), Changed<DioxusMirror<T>>>
 ) {
     for (mut value, mirror) in components {
+
+        let x = mirror.value.read()
         let Ok(mirror) = mirror.value.read().inspect_err(|err| warn!("{err}")) else {
             continue
         };
@@ -74,6 +129,7 @@ pub fn sync_mirror_to_component<T: DioxusSync>(
 
 ) {
      for (value, mut mirror) in components {
+        
         let _ = mirror.bypass_change_detection().value.set_value(value.clone()).inspect_err(|err| warn!("{err}"));
     }
 }
@@ -164,7 +220,23 @@ impl<T: MirrorQueryData + Send + Sync + 'static, F: QueryFilter + Send + Sync + 
 /// let signal = MirrorQuery<(Entity, &mut A, &mut B)> -> Query<(Entity, &mut DioxusMirror<A>, &mut DioxusMirror<B>)> -> HashMap<Entity, (Entity, DioxusMirror<A>, DioxusMirror<B>)> -> QueuedQuerySignal
 /// ```
 pub trait MirrorQueryData: QueryData {
-    type MirrorItem: Clone + Send + Sync + 'static;
+    
+    /// query item results for mirror items of query;
+    /// 
+    /// E.G;
+    type MirrorItem: Send + Sync + 'static;
+
+    /// query item handles to the results for mirror items of query,
+    /// 
+    /// E.G; if `MirrorItem` is 
+    /// ```rust
+    /// (Entity, DioxusMirror<A>, DioxusMirror<A>)
+    /// ```
+    /// this would be
+    /// ```rust
+    /// (Entity, DioxusMirrorHandle<A>, DioxusMirrorHandle<B>)
+    /// ```
+    type MirrorItemHandles: Clone + Send + Sync + 'static;
 
     /// query as its DioxusMirror<T> encapsulated variant.
     /// 
@@ -216,6 +288,9 @@ pub trait MirrorQueryData: QueryData {
     /// clones a bevy component into a pointer that a dioxus signal can read from.
     /// create new `Mirroritem` from borrowed `Query<(&mut A, ...)>::Item<'w, 's>`
     fn wrap_as_dioxus_signals<'w, 's>(item: Self::Item<'w, 's>) -> Self::MirrorItem;
+
+    /// clones dioxus mirror signals into dioxus mirror handles for dioxus to read without unnecessary internals.
+    fn wrap_as_dioxus_mirror_handles<'w, 's>(item: Self::MirrorItem) -> Self::MirrorItemHandles;
 
     /// get the entity of the mirror version of the bevy query
     /// 
@@ -294,8 +369,14 @@ impl<A: DioxusSync, B: DioxusSync> MirrorQueryData for (Entity, &mut A, &mut B) 
 }
 // registry of the latest dioxus clones of the matching query
 pub struct MirrorQuery<Q: MirrorQueryData, F: QueryFilter> {
-    value: HashMap<Entity, Q::MirrorItem>,
+    value: HashMap<Entity, Q::MirrorItemHandles>,
     _marker: PhantomData<fn() ->F>
+}
+
+impl<Q: MirrorQueryData, F: QueryFilter> Clone for MirrorQuery<Q, F> {
+    fn clone(&self) -> Self {
+        Self { value: self.value.clone(), _marker: self._marker.clone() }
+    }
 }
 
 impl<'a, Q, F> IntoIterator for &'a MirrorQuery<Q, F>
@@ -303,8 +384,8 @@ where
     Q: MirrorQueryData,
     F: QueryFilter,
 {
-    type Item = &'a Q::MirrorItem;
-    type IntoIter = std::collections::hash_map::Values<'a, Entity, Q::MirrorItem>;
+    type Item = &'a Q::MirrorItemHandles;
+    type IntoIter = std::collections::hash_map::Values<'a, Entity, Q::MirrorItemHandles>;
 
     /// Yields shared references to each `MirrorItem` tuple without cloning.
     fn into_iter(self) -> Self::IntoIter {
@@ -317,8 +398,8 @@ where
     Q: MirrorQueryData,
     F: QueryFilter,
 {
-    type Item = &'a mut Q::MirrorItem;
-    type IntoIter = std::collections::hash_map::ValuesMut<'a, Entity, Q::MirrorItem>;
+    type Item = &'a mut Q::MirrorItemHandles;
+    type IntoIter = std::collections::hash_map::ValuesMut<'a, Entity, Q::MirrorItemHandles>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.value.values_mut()

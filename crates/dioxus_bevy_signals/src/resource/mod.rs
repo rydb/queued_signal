@@ -1,61 +1,71 @@
-use bevy_app::{ScheduleRunnerPlugin, prelude::*};
+use bevy_app::prelude::*;
 use bevy_ecs::world::CommandQueue;
 use bevy_ecs::{prelude::*, schedule::ScheduleLabel, system::ScheduleSystem};
 use bevy_log::prelude::*;
-use dioxus_core::{Element, use_hook};
-use dioxus_hooks::{use_context, use_future};
+use dioxus_core::use_hook;
+use dioxus_hooks::use_context;
 use dioxus_signals::*;
 use dioxus::prelude::*;
-use flume::{Receiver, Sender, unbounded};
-use queued_signal::signal::{HealthStatus, QueuedSignal, QueuedSignalHandle, WriterDriver};
+use flume::Sender;
+use queued_signal::signal::{HealthStatus, QueuedSignal, QueuedSignalHandle, WriterDriver, SetValueOp};
 use std::any::{TypeId, type_name};
-use std::collections::{HashSet};
+use std::collections::HashSet;
 use std::sync::Mutex;
-
-use std::{result, thread};
+use trait_set::trait_set;
 use std::time::Duration;
 
 use crate::CommandQueueSender;
 
-pub type Result<T, E> = result::Result<T, E>;
+pub type Result<T, E> = std::result::Result<T, E>;
+
+trait_set! {
+    /// Resource that is syncable with dioxus
+    pub trait ResourceDioxusSync = Resource + Clone + Send + Sync + 'static;
+}
 
 #[derive(Resource)]
-pub struct ResourceWriteDriver<T: Clone + Send + Sync + 'static>(pub Mutex<WriterDriver<T>>);
+pub struct ResourceWriteDriver<T: ResourceDioxusSync>(pub Mutex<WriterDriver<T>>);
 
-struct RequestBevyResource<T: Resource + Clone + Send + Sync + 'static> {
+struct RequestBevyResource<T: ResourceDioxusSync> {
     response_tx: Sender<QueuedSignal<T>>,
 }
 
 #[derive(Resource)]
-pub struct ResourceQueuedSignalMirror<T: Clone + Send + Sync + Resource>(pub QueuedSignal<T>);
+pub struct ResourceQueuedSignalMirror<T: ResourceDioxusSync>(pub QueuedSignal<T>);
 
 #[derive(Resource, Default)]
 pub struct RegisteredResourceSyncs(HashSet<TypeId>);
 
-impl<T: Resource + Clone + Send + Sync + 'static> Command for RequestBevyResource<T> {
+impl<T: ResourceDioxusSync> Command for RequestBevyResource<T> {
     fn apply(self, world: &mut World) {
         let signal_to_send = match world.get_resource::<ResourceQueuedSignalMirror<T>>() {
             Some(signal) => signal.0.clone(),
             None => {
-                
                 // put synced resources in registry for tracking
                 world.get_resource_or_init::<RegisteredResourceSyncs>().0.insert(TypeId::of::<T>());
 
                 let Some(resource) = world.get_resource::<T>().cloned() else {
                     warn!("Cannot initialize dioxus-bevy sync for {} as this resource does not exist at the time of this sync request.", type_name::<T>());
-                    return
+                    return;
                 };
 
                 let driver = WriterDriver::new(resource.clone());
-                let signal = QueuedSignal::from_parts(driver.queued_state.clone(), driver.command_tx.clone());
+                let signal = QueuedSignal::from_parts(
+                    driver.queued_state.clone(),
+                    driver.add_tx.clone(),
+                    driver.set_tx.clone(),
+                    driver.set_value_tx.clone(), 
+                );
                 world.insert_resource(ResourceWriteDriver(Mutex::new(driver)));
 
                 // tick the resources 60 times a second (If uninitialized) by default to match standard FPS settings.
                 world.get_resource_or_insert_with(|| ResourceSyncTickRate(Duration::from_millis(16)));
 
                 add_systems_through_world(world, Update, drive_signal::<T>);
+                // Also add the authoritative sync system, but **after** command processing.
+                add_systems_through_world(world, PostUpdate, sync_mirror_to_resource::<T>.run_if(resource_changed::<T>));
+                add_systems_through_world(world, PostUpdate, sync_resource_to_mirror::<T>.run_if(not(resource_changed::<T>)));
                 let mut map = world.get_resource_or_init::<RegisteredResourceSyncs>();
-
                 map.0.insert(TypeId::of::<T>());
                 world.insert_resource(ResourceQueuedSignalMirror(signal.clone()));
                 signal
@@ -65,11 +75,37 @@ impl<T: Resource + Clone + Send + Sync + 'static> Command for RequestBevyResourc
     }
 }
 
-/// Minimum time to pass til queued mutations from QueuedSignal are published. The time to publish may be longer then this duration, but no shorter then this duration.
+/// Minimum time to pass til queued mutations from QueuedSignal are published.
+/// The time to publish may be longer then this duration, but no shorter then this duration.
 #[derive(Resource)]
 pub struct ResourceSyncTickRate(Duration);
 
-fn drive_signal<T: Clone + Send + Sync + 'static>(
+/// System that synchronises the authoritative Bevy resource into the signal mirror.
+/// It uses `set_value`, which results in exactly two clones (one into the operation,
+/// one for the second internal buffer).
+pub fn sync_mirror_to_resource<T: ResourceDioxusSync>(
+    resource: Res<T>,
+    mut mirror: ResMut<ResourceQueuedSignalMirror<T>>,
+) {
+    if resource.is_changed() {
+        // 1 clone: Bevy resource -> new_value
+        let new_value = resource.clone();
+        // send authoritative full replacement (2nd clone happens internally)
+        mirror.bypass_change_detection().0.set_value(new_value.into());
+        
+    }
+}
+
+pub fn sync_resource_to_mirror<T: ResourceDioxusSync>(
+    mut resource: ResMut<T>,
+    mirror: Res<ResourceQueuedSignalMirror<T>>,
+) {
+    let new_value = mirror.0.read().as_ref().clone();
+    *resource.bypass_change_detection() = new_value
+}
+
+
+fn drive_signal<T: ResourceDioxusSync>(
     driver: Res<ResourceWriteDriver<T>>,
     tick_rate: Res<ResourceSyncTickRate>,
 ) {
@@ -85,13 +121,12 @@ pub fn add_systems_through_world<T>(
 ) {
     let mut schedules = world.get_resource_mut::<Schedules>().unwrap();
     let schedule = schedules.entry(schedule);
-
     schedule.add_systems(systems);
 }
 
 pub fn use_bevy_resource<T>() -> QueuedSignalHandle<T>
 where
-    T: Resource + Clone + Send + Sync + 'static,
+    T: ResourceDioxusSync,
 {
     let ctx = use_context::<CommandQueueSender>();
     let signal = use_hook(|| {

@@ -60,7 +60,7 @@ queued_signal = {path = "./"}
 left-right = "0.11.7"
 
 [workspace]
-members = ["./crates/*", "crates/dioxus_bevy_signals", "examples/bevy_signal_test"]
+members = ["./crates/*", "crates/dioxus_bevy_signals", "examples/*"]
 
 # [dev-dependencies]
 # dioxus_bevy_signals = {path = "crates/dioxus_bevy_signals"}
