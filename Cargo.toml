@@ -62,5 +62,8 @@ left-right = "0.11.7"
 [workspace]
 members = ["./crates/*", "crates/dioxus_bevy_signals", "examples/*"]
 
-# [dev-dependencies]
-# dioxus_bevy_signals = {path = "crates/dioxus_bevy_signals"}
+[dev-dependencies]
+bevy_signal_tests = { path = "./examples/bevy_signal_tests", features = ["resource_tests"] }
+
+[[example]]
+name = "resource_signal"
