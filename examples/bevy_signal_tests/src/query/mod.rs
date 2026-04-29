@@ -9,7 +9,7 @@ use dioxus_signals::{ReadableExt, WritableExt};
 
 use crate::DioxusTestPlugin;
 
-#[derive(Component, Clone, Default)]
+#[derive(Component, Clone, Default, PartialEq, PartialOrd, Eq, Ord, Debug)]
 pub struct Greets {
     value: i32
 }
@@ -85,6 +85,16 @@ pub fn add_ten_names(
     );
 }
 
+/// test removing names from query to see if they reflect in QueryMirror
+pub fn remove_names(
+    mut commands: Commands,
+    names: Query<(Entity, &Name, &Greets), ()>
+) {
+    for (entity, ..) in names {
+        commands.entity(entity).despawn();
+    }
+}
+
 pub fn print_mirrors(
     mut timer: ResMut<DebugPrintTimer>,
 
@@ -141,13 +151,25 @@ pub fn TenNamesQuery() -> Element {
     let mut names_list_str = use_signal(|| "".to_string());
 
     let onclick = move |evt | {
-        println!("names total: {:#?}", names.iter().size_hint());
         *names_list_str.write() = "".to_string();
+        let mut new_str_list = Vec::new();
         for (e, name, greet) in names.iter() {
-            *names_list_str.write() += name.value.read().as_ref();
+            greet.value.mutate(|n| n.value += 1);
+
+            let name_arc = name.value.read().clone();
+            let greet_arc = greet.value.read().clone();
+
+            new_str_list.push((name_arc, greet_arc))
         }
+        let mut new_str_list = new_str_list.iter().map(|n| (n.0.as_ref(), n.1.as_ref())).collect::<Vec<_>>();
+        new_str_list.sort();
+        *names_list_str.write() += &format!("{:#?}", new_str_list);
+
     };
     rsx! {
+        h1 {
+            "bevy query <-> dioxus sync test"
+        }
         h1 {
             "names list:"
         }
