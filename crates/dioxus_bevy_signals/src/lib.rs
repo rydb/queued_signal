@@ -5,7 +5,7 @@ use bevy_ecs::prelude::*;
 use bevy_app::{ScheduleRunnerPlugin, plugin_group, prelude::*};
 use flume::{Receiver, Sender, unbounded};
 
-// pub mod query;
+pub mod query;
 pub mod resource;
 
 pub type CommandSender = Sender<CommandQueue>;

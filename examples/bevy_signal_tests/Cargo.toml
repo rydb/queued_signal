@@ -18,4 +18,5 @@ tokio = {workspace = true}
 
 [features]
 resource_tests = []
-default = ["resource_tests"]
+query_tests = []
+default = ["resource_tests", "query_tests"]

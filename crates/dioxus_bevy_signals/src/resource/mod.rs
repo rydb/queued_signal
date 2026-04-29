@@ -4,7 +4,6 @@ use bevy_ecs::{prelude::*, schedule::ScheduleLabel, system::ScheduleSystem};
 use bevy_log::prelude::*;
 use dioxus_core::use_hook;
 use dioxus_hooks::use_context;
-use dioxus_signals::*;
 use dioxus::prelude::*;
 use flume::Sender;
 use queued_signal::signal::{HealthStatus, QueuedSignal, QueuedSignalHandle, WriterDriver, SetValueOp};
@@ -38,6 +37,7 @@ pub struct RegisteredResourceSyncs(HashSet<TypeId>);
 
 impl<T: ResourceDioxusSync> Command for RequestBevyResource<T> {
     fn apply(self, world: &mut World) {
+
         let signal_to_send = match world.get_resource::<ResourceQueuedSignalMirror<T>>() {
             Some(signal) => signal.0.clone(),
             None => {
