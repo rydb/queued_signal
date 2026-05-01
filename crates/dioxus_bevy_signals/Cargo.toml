@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bevy_ecs = {workspace = true}
+# todo, remove bevy_reflect post testing
+bevy_ecs = {workspace = true, features = ["bevy_reflect"]}
 bevy_app = {workspace = true}
 dioxus-core = {workspace = true}
 dioxus = {workspace = true}

@@ -3,6 +3,8 @@ use std::{any::{type_name, type_name_of_val}, time::Duration};
 use bevy_ecs::{schedule::{IntoScheduleConfigs, ScheduleLabel, Schedules}, system::ScheduleSystem, world::{CommandQueue, World}};
 use bevy_ecs::prelude::*;
 use bevy_app::{ScheduleRunnerPlugin, plugin_group, prelude::*};
+use dioxus_hooks::use_context;
+use dioxus_signals::{ReadableExt, Signal};
 use flume::{Receiver, Sender, unbounded};
 
 pub mod query;
@@ -38,6 +40,7 @@ pub fn process_commands(
     }
 }
 
+/// command queue to send commands to bevy
 #[derive(Clone, Resource)]
 pub struct CommandQueueSender {
     pub tx: CommandSender,
@@ -93,4 +96,33 @@ impl Plugin for DioxusBevyMirrorPlugin {
         ;
         ;
     }
+}
+
+/// Dioxus accessible command queue for bevy commands
+#[derive(Clone, Copy)]
+pub struct BevyCommandsSignal {
+    pub command_queue_sender: Signal<CommandQueueSender>,
+}
+
+/// Macro to ergonomically push and send a group of bevy commands to bevy
+/// 
+/// Usage:
+/// ```rust
+/// push_and_send!(bevy_command_signal: BevyCommandsSignal, (command1_, command_2, .. command_n))
+/// ```
+#[macro_export]
+macro_rules! push_and_send {
+    ($signal:expr, ($($cmd:expr),* $(,)?)) => {{
+        let mut q = CommandQueue::default();
+        let tx = $signal.command_queue_sender.clone();
+        $( q.push($cmd); )*
+        let _ = tx.read().tx.send(q).inspect_err(|err| println!("couldn't send command_queue to bevy {}", err));
+    }};
+}
+
+/// signal to get a convienience struct for sending commands
+pub fn use_bevy_command_queue() -> BevyCommandsSignal {
+    let command_queue = use_context::<CommandQueueSender>();
+
+    BevyCommandsSignal { command_queue_sender: Signal::new(command_queue) }
 }

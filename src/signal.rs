@@ -6,6 +6,7 @@ use flume::{Receiver, Sender};
 use left_right::{Absorb, ReadHandle, WriteHandle};
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -21,6 +22,7 @@ pub enum HealthStatus {
     Stalled { pinned_buffers: usize },
 }
 
+#[derive(Debug)]
 struct ReaderRegistry {
     readers: Mutex<HashMap<u64, Instant>>,
     next_id: AtomicU64,
@@ -73,17 +75,31 @@ type MutationOp<T> = Arc<dyn Fn(&mut T) + Send + Sync>;
 #[derive(Clone)]
 pub struct SetValueOp<T>(pub Arc<T>);
 
-/// Unified operation for left‑right – always operates on `Arc<T>` inside `Absorbable`.
+/// Unified operation for left‑right always operates on `Arc<T>` inside `Absorbable`.
 #[derive(Clone)]
 enum SignalOp<T: Clone + Send + Sync> {
     Fn(MutationOp<T>),
     Set(SetValueOp<T>),
 }
 
-/// 
+impl<T: Debug + Clone + Send + Sync> Debug for SignalOp<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fn(_arg0) => f.debug_tuple("Fn").field(&"{annoymous function}").finish(),
+            Self::Set(_arg0) => f.debug_tuple("Set").field(&"{annoymous function}").finish(),
+        }
+    }
+}
+
 #[derive(Clone)]
 #[repr(transparent)]
 pub struct Absorbable<T: Clone>(pub Arc<T>);
+
+impl<T: Clone + Debug> Debug for Absorbable<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Absorbable").field(&self.0).finish()
+    }
+}
 
 impl<T: Clone> Deref for Absorbable<T> {
     type Target = Arc<T>;
@@ -129,6 +145,12 @@ pub struct QueuedState<T: Clone + Send + Sync> {
     notify_rx: watch::Receiver<()>,
     health_rx: watch::Receiver<HealthStatus>,
     registry: Arc<ReaderRegistry>,
+}
+
+impl<T: Clone + Send + Sync> Debug for QueuedState<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueuedState").field("read_handle", &self.read_handle).field("notify_rx", &self.notify_rx).field("health_rx", &self.health_rx).field("registry", &self.registry).finish()
+    }
 }
 
 impl<T: Clone + Send + Sync> Clone for QueuedState<T> {
@@ -192,7 +214,15 @@ pub struct WriterDriver<T: Clone + Send + Sync> {
     pub set_tx: Sender<MutationOp<T>>,
     pub add_tx: Sender<MutationOp<T>>,
     pub queued_state: QueuedState<T>,
+    publish_counter: Option<Arc<AtomicU64>>,
 }
+
+impl<T: Debug + Clone + Send + Sync> Debug for WriterDriver<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WriterDriver").field("write_handle", &self.write_handle).field("set_value_rx", &self.set_value_rx).field("set_rx", &self.set_rx).field("add_rx", &self.add_rx).field("abs_slot", &self.abs_slot).field("notify_tx", &self.notify_tx).field("health_tx", &self.health_tx).field("registry", &self.registry).field("watchdog_timeout", &self.watchdog_timeout).field("last_publish", &self.last_publish).field("set_value_tx", &self.set_value_tx).field("set_tx", &self.set_tx).field("add_tx", &self.add_tx).field("queued_state", &self.queued_state).finish()
+    }
+}
+
 
 impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
     pub fn new(initial: T) -> Self {
@@ -231,7 +261,12 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
             set_tx: set_tx.clone(),
             add_tx: add_tx.clone(),
             queued_state: state,
+            publish_counter: None,
         }
+    }
+
+    pub fn set_publish_counter(&mut self, counter: Arc<AtomicU64>) {
+        self.publish_counter = Some(counter);
     }
 
     /// Absolute override – drains all buffers and replaces with the given `T`.
@@ -279,6 +314,9 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
             self.write_handle.publish();
             self.last_publish = Instant::now();
             let _ = self.notify_tx.send(());
+            if let Some(ref counter) = self.publish_counter {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         self.update_health();
@@ -305,6 +343,12 @@ pub struct QueuedSignal<T: Clone + Send + Sync> {
     add_tx: Sender<MutationOp<T>>,
     set_tx: Sender<MutationOp<T>>,
     set_value_tx: Sender<SetValueOp<T>>,
+}
+
+impl<T: Clone + Send + Sync + Debug> Debug for QueuedSignal<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueuedSignal").field("state", &self.state).field("add_tx", &self.add_tx).field("set_tx", &self.set_tx).field("set_value_tx", &self.set_value_tx).finish()
+    }
 }
 
 impl<T: Clone + Send + Sync + 'static> QueuedSignal<T> {
