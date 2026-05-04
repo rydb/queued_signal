@@ -216,8 +216,10 @@ pub fn TenNamesQuery() -> Element {
     });
     
     let greet_button_onclick = move |_evt | {
+        println!("sending greet");
+
         for (_e, _n, greet) in names.read().iter() {
-            println!("sending greet");
+            println!("greeting");
             greet.value.mutate(|n| n.value += 1);
         }
     };

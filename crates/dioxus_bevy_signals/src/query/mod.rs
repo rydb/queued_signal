@@ -1,6 +1,6 @@
 use std::{any::{TypeId, type_name, type_name_of_val}, collections::{HashMap, HashSet}, fmt::Debug, marker::PhantomData, sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}}, time::Duration};
 
-use bevy_app::{PostUpdate, Update};
+use bevy_app::{Last, PostUpdate, Update};
 use bevy_ecs::{component::Mutable, prelude::*, query::{QueryData, QueryFilter}, world::CommandQueue};
 use bevy_log::warn;
 use dioxus_core::use_hook;
@@ -171,39 +171,10 @@ pub fn sync_mirror_to_component<T: DioxusComponentSync>(
 
 ) {
      for (value,  mirror) in &mut components {
-        println!("change recieved for t, sending set value for mirror:");
-        // let _ = mirror.bypass_change_detection().value.set_value(value.clone()).inspect_err(|err| warn!("{err}"));
         let _ = mirror.value.set_value(value.clone().into());
-        // mirror.set_changed();
 
     }
 }
-
-/// Returns `true` if the two maps differ by **at least one key**.
-/// Stops early as soon as a difference is found.
-/// Runs in O(min(n, m)) worst case, but often much faster.
-fn differ_by_at_least_one_key<K, V>(
-    map1: &HashMap<K, V>,
-    map2: &HashMap<K, V>,
-) -> bool
-where
-    K: Eq + std::hash::Hash,
-{
-    // Different sizes → definitely differ (early return)
-    if map1.len() != map2.len() {
-        return true;
-    }
-
-    // Same size: iterate over the smaller (or either) map
-    // Use the smaller to minimize work, but here sizes are equal.
-    for key in map1.keys() {
-        if !map2.contains_key(key) {
-            return true; // Found a missing key → difference
-        }
-    }
-    false // All keys matched
-}
-
 ///increment any new tracking queries on relevant DioxusMirrors
 pub fn increment_tracking_queries<T: DioxusQuerySync + 'static, F: QueryFilter + 'static>(
     mut mirror_components: Query<T::TrackingQueriesQuerydataMut, F>,
@@ -214,13 +185,41 @@ pub fn increment_tracking_queries<T: DioxusQuerySync + 'static, F: QueryFilter +
     }
 }
 
+#[derive(Resource)]
+pub struct QueryMirrorInitailized<Q: QueryData, F: QueryFilter> {
+    initialized: bool,
+    _querydata: fn() -> PhantomData<Q>,
+    _filter: fn() -> PhantomData<F>,
+}
+
 pub fn sync_query_mirror_to_signal<T: DioxusQuerySync + 'static, F: QueryFilter + 'static>(
     components_without_signals: Query<T, (F, T::MirrorSignalsWithoutFilter)>,
     mirror_components: Query<T::MirrorSignalsQueryDataImMut, F>,
     changed_mirror_components: Query<T::MirrorSignalsQueryDataImMut, T::MirrorSignalsChangedFilter>,
     mirror_signal: ResMut<MirrorQuerySignal<T, F>>,
     mut commands: Commands,
+    mut init_status: ResMut<QueryMirrorInitailized<T, F>>,
 ) {
+
+
+    if components_without_signals.count() <= 0 {
+        // if the map has not been initailized yet, force a full sync in order to get it up to data
+        if init_status.initialized == false {
+            let current_map = mirror_components.iter()
+            .map(|item| {
+                (T::get_mirror_entity(&item), T::clone_dioxus_signals(&item))
+            }).collect::<HashMap<_, _>>();
+            mirror_signal.0.set_value(
+                Arc::new(
+                MirrorQuery {
+                    value: current_map,
+                    _marker: PhantomData::default()
+            }));
+            init_status.initialized = true;
+            println!("finished initializing component mirror to: {}", mirror_components.iter().count());
+            return;
+        }
+    }
 
     for item in components_without_signals {
         println!("componenet without signal found");
@@ -229,37 +228,44 @@ pub fn sync_query_mirror_to_signal<T: DioxusQuerySync + 'static, F: QueryFilter 
         commands.entity(entity).insert_if_new(bundle);
     }
 
-    let new_values: HashMap<Entity, T::MirrorItemHandles> = mirror_components
-        .iter()
-        .map(|item| {
-            let entity = T::get_mirror_entity(&item);
-            (entity, T::clone_dioxus_signals(&item))
-        })
-        .collect();
+    let mut add_map = HashMap::new();
+    let mut remove_list = Vec::new();
 
-    // force sync if any mirrored components have changed
-    // TODO: so apparently size_hint().1 returns the upper bound of the query ignoring non-archetypal query filters e.g; Changed<T>.
-    // So in the meantime, .count() must be used instead in order to not count unchanged components as changed...
-    let mut sync_change = changed_mirror_components.iter().count() >= 1;
 
-    // println!("sync change post change detection: {}", sync_change);
-    // check to see if entities are added/removed if nothing has changed
-    if !sync_change {
-        // don't update map unless at least one entity is different
-        let current_values = &mirror_signal.0.read().value;
-    
-        let one_dif = differ_by_at_least_one_key(current_values, &new_values);
+    let last_map = &mirror_signal.0.read().value;
 
-        sync_change = one_dif;
-
+    for (key, _value) in last_map.iter() {
+        if mirror_components.contains(*key) == false {
+            remove_list.push(key)
+        }
     }
 
-    if sync_change {
-        println!("sync change detected");
-        mirror_signal.0.set_value(Arc::new(MirrorQuery {
-            value: new_values,
-            _marker: PhantomData,
-        }));
+    // TODO: so apparently size_hint().1 returns the upper bound of the query ignoring non-archetypal query filters e.g; Changed<T>.
+    // So in the meantime, .count() must be used instead in order to not count unchanged components as changed...
+    if changed_mirror_components.iter().count() >= 1 {
+        for value in &changed_mirror_components {
+            let entity = T::get_mirror_entity(&value);
+
+            add_map.insert(entity, value);
+        }
+    }
+    
+    if remove_list.len() > 0 || add_map.len() > 0 {
+        let remove_list = remove_list.iter().map(|n| **n).collect::<Vec<_>>();
+
+        let add_map = add_map.iter()
+        .map(|item| {
+            (item.0.clone(), T::clone_dioxus_signals(item.1))
+        }).collect::<HashMap<_, _>>();
+
+        mirror_signal.0.mutate_set(move |n| {
+            let map = &mut n.value;
+
+            for item in remove_list.clone() {
+                map.remove(&item);
+            }
+            map.extend(add_map.clone());
+        });
     }
 }
 
@@ -308,12 +314,17 @@ impl<T: DioxusQuerySync + 'static, F: QueryFilter> Command for RequestQueryMirro
                 let query_driver = WriterDriver::new(MirrorQuery::default());
                 add_systems_through_world(world, Update, drive_query_signal::<T, F>);
                 add_systems_through_world(world, PostUpdate, increment_tracking_queries::<T, F>);
-                add_systems_through_world(world, PostUpdate, sync_query_mirror_to_signal::<T, F>);
+                add_systems_through_world(world, Last, sync_query_mirror_to_signal::<T, F>);
                 let signal = QueuedSignal::from_parts(query_driver.queued_state.clone(), query_driver.add_tx.clone(), query_driver.set_tx.clone(), query_driver.set_value_tx.clone());
                 
                 world.insert_resource(MirrorQueryWriteDriver(Mutex::new(query_driver)));
-                world.insert_resource(QuerySyncTickRate(Duration::from_millis(16)));
+                world.insert_resource(QuerySyncTickRate(Duration::ZERO));
                 world.insert_resource(MirrorQuerySignal(signal.clone()));
+                world.insert_resource(QueryMirrorInitailized::<T, F> {
+                    initialized: false,
+                    _querydata: || PhantomData::default(),
+                    _filter: || PhantomData::default(),
+                });
                 signal
 
 
@@ -321,16 +332,6 @@ impl<T: DioxusQuerySync + 'static, F: QueryFilter> Command for RequestQueryMirro
         };
 
         let _ = self.response_tx.send(signal_to_send);
-
-        // if !world.contains_resource::<MirrorQuerySignal::<T, F>>() {
-        //     T::register_mirror_sync_systems::<F>(world)
-        // }
-
-
-        // let mirrored_query = world.get_resource_or_insert_with(|| {
-        //     MirrorQuerySignal::<T, F>(QueuedSignal::new(MirrorQuery::default(), 1000))
-        // });
-
     }
 }
 
