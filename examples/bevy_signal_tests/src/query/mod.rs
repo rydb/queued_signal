@@ -1,9 +1,9 @@
-use std::time::Instant;
+use std::{fmt::Display, time::Instant};
 
 use bevy_app::prelude::*;
 use bevy_ecs::{prelude::*, world::CommandQueue};
 use dioxus::{desktop::wry::cookie::time::Duration, prelude::*};
-use dioxus_bevy_signals::{CommandQueueSender, push_and_send, query::{DioxusComponentSync, DioxusMirror, use_bevy_query}, use_bevy_command_queue};
+use dioxus_bevy_signals::{CommandQueueSender, push_and_send, query::{DioxusComponentSync, DioxusMirror, MirrorQueryData, use_bevy_query}, use_bevy_command_queue};
 use dioxus_hooks::{use_context, use_memo, use_signal};
 use dioxus_signals::{ReadableExt, WritableExt};
 
@@ -14,16 +14,28 @@ pub struct Greets {
     value: i32
 }
 
+impl Display for Greets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.value)
+    }
+}
+
 #[derive(Resource)]
 pub struct DebugPrintTimer {
     last_tick: Instant
 }
 
+#[derive(Resource)]
+pub struct ToggleQueryDebugTimer {
+    last_tick: Instant,
+}
+
 #[derive(Component)]
 pub struct Examined;
 
-#[derive(Component)]
-pub struct Marker;
+/// marks entity as a part of the query toggle on/off test for query artifact cleanup
+#[derive(Component, Clone)]
+pub struct ToggleTestMarker;
 
 pub struct AddTenNames;
 
@@ -87,8 +99,9 @@ impl Command for AddTenNames {
         );
         world.commands().spawn(
             (
-                Name::new("Name10"),
-                Greets::default()
+                Name::new("Name10_toogle_test"),
+                Greets::default(),
+                ToggleTestMarker,
             )
         );
     }
@@ -127,7 +140,6 @@ pub fn print_mirrors(
     query: Query<(&DioxusMirror<Name>, &DioxusMirror<Greets>), With<Examined>>
 ) {
     if timer.last_tick.elapsed() >= core::time::Duration::from_millis(1000) {
-        // println!("matching query entries for mirrors: {}", query.iter().len());
         timer.last_tick = Instant::now();   
 
         let Some((a, b)) = query.iter().next() else {
@@ -147,8 +159,11 @@ impl Plugin for TenNamesTestPlugin {
         .insert_resource(DebugPrintTimer {
             last_tick: Instant::now()
         })
+        .insert_resource(ToggleQueryDebugTimer {
+            last_tick: Instant::now()
+        })
         .add_systems(PostUpdate, print_mirrors)
-        // .add_systems(PostUpdate, debug_dioxus_mirror_changed::<Name, Greets>);
+        .add_systems(PostUpdate, toggleable_query_mirror_output)
         ;
     }
 }
@@ -176,13 +191,46 @@ impl DioxusTestPlugin for QueryTestsPlugin {
     }
 }
 
+type ToggleableQueryData = (Entity, &'static mut Name, &'static mut ToggleTestMarker);
+type ToggleableQueryFilter = ();
+
+pub fn toggleable_query_mirror_output(
+    query: Query<<ToggleableQueryData as MirrorQueryData>::MirrorSignalsQueryDataImMut, ToggleableQueryFilter>,
+    mut timer: ResMut<ToggleQueryDebugTimer>,
+) {
+    if timer.last_tick.elapsed() >= core::time::Duration::from_millis(1000) {
+        timer.last_tick = Instant::now();   
+
+        println!("toggleable query dioxus mirrors: {}", query.count())
+    }
+}
+
 #[component]
 pub fn ToggleableQuery() -> Element {
-    let second_query = use_bevy_query::<(Entity, &mut Name, &mut Greets), ()>();
+    let second_query = use_bevy_query::<ToggleableQueryData, ToggleableQueryFilter>();
+    let second_query = use_signal(|| second_query.clone());
+
+    let second_query_str = use_memo(move || {
+        let mut value = "".to_owned();
+        let Some((_e, 
+            name, 
+            _
+        )) = second_query.read().iter().next() else {
+            return value
+        };
+        value = format!("Name: {}", **name.read());
+        value
+    });
 
     rsx! {
         h1 {
             "second query active"
+        }
+        h2 {
+            "query: "
+        }
+        h3 {
+            {second_query_str}
         }
     }
 }
@@ -203,11 +251,9 @@ pub fn TenNamesQuery() -> Element {
 
         println!("changed names list str");
         let mut new_str_list = Vec::new();
-        for (e, name, greet) in names.read().iter() {
-            let name_arc = name.value. read().clone();
-            let greet_arc = greet.value.read().clone();
 
-            new_str_list.push((name_arc, greet_arc))
+        for (e, name, greets) in names.read().iter() {
+            new_str_list.push((name.read().clone(), greets.read().clone()))
         }
         let mut new_str_list = new_str_list.iter().map(|n| (n.0.as_ref(), n.1.as_ref())).collect::<Vec<_>>();
         new_str_list.sort();
@@ -262,8 +308,19 @@ pub fn TenNamesQuery() -> Element {
             "toggle conditional query",
         }
         div {
-            hidden: conditional_query_hidden,
-            ToggleableQuery {}
+            {
+                if *conditional_query_hidden.read() {
+                    rsx! {
+                        div {
+                            
+                        }
+                    }
+                } else {
+                    rsx! {
+                        ToggleableQuery {}
+                    }
+                }
+            }
         }
     }
 

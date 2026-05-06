@@ -345,6 +345,14 @@ pub struct QueuedSignal<T: Clone + Send + Sync> {
     set_value_tx: Sender<SetValueOp<T>>,
 }
 
+impl<T: Clone + Send + Sync> Deref for QueuedSignal<T> {
+    type Target = QueuedState<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
 impl<T: Clone + Send + Sync + Debug> Debug for QueuedSignal<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QueuedSignal").field("state", &self.state).field("add_tx", &self.add_tx).field("set_tx", &self.set_tx).field("set_value_tx", &self.set_value_tx).finish()

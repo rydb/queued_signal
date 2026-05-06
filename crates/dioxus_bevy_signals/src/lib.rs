@@ -94,7 +94,7 @@ impl Plugin for DioxusBevyMirrorPlugin {
         .insert_resource(CommandQueueSender { tx: self.bevy_command_txrx.tx.clone()})
         .add_systems(PreUpdate, process_commands)
         ;
-        ;
+        
     }
 }
 
