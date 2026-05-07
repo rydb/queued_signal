@@ -6,6 +6,7 @@ use dioxus_bevy_signals::{BevyCommandChannels, CommandQueueSender, DioxusBevyMir
 use dioxus_core::Element;
 use dioxus_hooks::{use_context, use_context_provider};
 
+use crate::asset::AssetTestPlugin;
 #[cfg(feature = "query_tests")]
 use crate::query::QueryTestsPlugin;
 #[cfg(feature = "resource_tests")]
@@ -16,6 +17,9 @@ pub mod resource;
 
 #[cfg(feature = "query_tests")]
 pub mod query;
+
+#[cfg(feature = "asset_tests")]
+pub mod asset;
 
 /// plugin that also includes a dioxus ui element relative to it
 pub trait DioxusTestPlugin: Plugin + 'static {
@@ -49,6 +53,7 @@ impl Default for SignalTestsPlugin {
                 #[cfg(feature = "query_tests")]
                 list.push(Box::new(QueryTestsPlugin::default()));
 
+                list.push(Box::new(AssetTestPlugin::default()));
                 list
             },
         }

@@ -49,6 +49,9 @@ parking_lot = "0.12.5"
 flashmap = "0.2"
 bevy_ecs = {version = "0.17"}
 bevy_app = {version = "0.17"}
+bevy_asset = {version = "0.17"}
+bevy_color = {version = "0.17"}
+bevy_pbr = {version = "0.17"}
 bevy_transform = {version = "0.17"}
 bevy_log = {version = "0.17"}
 glam = {version = "0.30"}
@@ -61,6 +64,7 @@ left-right = "0.11.7"
 [features]
 resource_example = ["bevy_signal_tests/resource_tests"]
 query_example   = ["bevy_signal_tests/query_tests"]
+asset_example = ["bevy_signal_tests/asset_tests"]
 
 [workspace]
 members = ["./crates/*", "crates/dioxus_bevy_signals", "examples/*"]
@@ -75,3 +79,7 @@ required-features = ["resource_example"]
 [[example]]
 name = "query_signal"
 required-features = ["query_example"]
+
+[[example]]
+name = "asset_signal"
+required-features = ["asset_example"]

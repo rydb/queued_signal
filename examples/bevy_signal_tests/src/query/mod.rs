@@ -205,6 +205,18 @@ pub fn toggleable_query_mirror_output(
     }
 }
 
+/// component for testing cleanup for components that leaks memory, and to see if:
+/// 1. the leak is caught and identified
+/// 2. the component is shutdown
+#[component]
+pub fn BadComponentTest() -> Element {
+    rsx ! {
+        ErrorBoundary {
+            
+        }
+    }
+}
+
 #[component]
 pub fn ToggleableQuery() -> Element {
     let second_query = use_bevy_query::<ToggleableQueryData, ToggleableQueryFilter>();

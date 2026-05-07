@@ -7,6 +7,7 @@ edition = "2024"
 # todo, remove bevy_reflect post testing
 bevy_ecs = {workspace = true, features = ["bevy_reflect"]}
 bevy_app = {workspace = true}
+bevy_asset = {workspace = true}
 dioxus-core = {workspace = true}
 dioxus = {workspace = true}
 dioxus-hooks = {workspace = true}

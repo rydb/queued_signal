@@ -21,8 +21,6 @@ trait_set! {
     pub trait DioxusQuerySync = MirrorQueryData + Send + Sync;
 }
 
-// #[derive(Resource)]
-// pub struct ComponentWriteDrivers<T: Clone + Send + Sync + 'static>(pub Mutex<WriterDriver<T>>);
 
 /// Minimum time to pass til queued mutations from QueuedSignal are published. The time to publish may be longer then this duration, but no shorter then this duration.
 #[derive(Resource)]
@@ -602,12 +600,6 @@ impl<A: DioxusComponentSync, B: DioxusComponentSync> MirrorQueryData for (Entity
             item.2.tracking_counts.remove(&id);
         }
     }
-
-
-    // fn increment_tracking_queries<'w, 's>(mut item: <Self::TrackingQueriesQuerydataMut as QueryData>::Item<'w, 's>) {
-    //     item.1.bypass_change_detection().tracking_queries.insert(query_to_tracking_id::<Self>());
-    //     item.2.bypass_change_detection().tracking_queries.insert(query_to_tracking_id::<Self>());
-    // }
     
 }
 // // registry of the latest dioxus clones of the matching query

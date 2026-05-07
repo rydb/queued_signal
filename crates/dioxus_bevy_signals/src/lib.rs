@@ -9,6 +9,7 @@ use flume::{Receiver, Sender, unbounded};
 
 pub mod query;
 pub mod resource;
+pub mod asset;
 
 pub type CommandSender = Sender<CommandQueue>;
 pub type CommandReceiver = Receiver<CommandQueue>;
