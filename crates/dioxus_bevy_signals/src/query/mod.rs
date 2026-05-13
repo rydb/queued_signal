@@ -732,7 +732,6 @@ pub fn use_bevy_query<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>() 
         let _ = r.tx.send(queue);
     });
 
-    // The rest remains the same.
     let signal = use_hook(|| {
         println!("sending signal");
         ctx.send_command(|tx| {

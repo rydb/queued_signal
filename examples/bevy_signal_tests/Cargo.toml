@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 bevy_app = {workspace = true}
-bevy_ecs = {workspace = true}
+bevy_ecs = {workspace = true, features = ["trace"]}
 bevy_log = {workspace = true}
 bevy_color = {workspace = true}
 bevy_pbr = {workspace = true}
@@ -18,9 +18,10 @@ flume = {workspace = true}
 queued_signal = {workspace = true}
 dioxus_bevy_signals = {workspace = true}
 tokio = {workspace = true}
+cfg-if = {workspace = true}
 
 [features]
-resource_tests = []
-query_tests = []
-asset_tests = []
+resource_tests = ["dioxus_bevy_signals/resource"]
+query_tests = ["dioxus_bevy_signals/query"]
+asset_tests = ["dioxus_bevy_signals/asset"]
 default = ["resource_tests", "query_tests", "asset_tests"]

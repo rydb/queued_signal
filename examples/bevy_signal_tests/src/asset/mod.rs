@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use bevy_app::ctrlc::Signal;
 use bevy_app::prelude::*;
-use bevy_asset::{Assets, Handle};
+use bevy_asset::{AssetApp, AssetPlugin, Assets, Handle};
 use bevy_color::palettes::basic::RED;
 use bevy_color::palettes::css::GREEN;
 use bevy_color::{Color, LinearRgba};
@@ -42,7 +42,12 @@ pub struct AssetTestPlugin;
 
 impl Plugin for AssetTestPlugin {
     fn build(&self, app: &mut App) {
+        if !app.is_plugin_added::<AssetPlugin>() {
+            app.add_plugins(AssetPlugin::default());
+        }
         app
+        
+        .init_asset::<StandardMaterial>()
         .add_systems(Startup, spawn_color_entity);
 
     }
@@ -63,61 +68,41 @@ impl DioxusTestPlugin for AssetTestPlugin {
 #[component]
 pub fn AssetColorPicker() -> Element {
     let colors = use_bevy_query::<(Entity, &mut MeshMaterial3d<StandardMaterial>, &mut Marker), ()>();
-    let colors = use_signal(|| colors);
 
-    let mut material = use_signal(|| None);
-
-    let color_text = use_memo(move || {
-        let mut color_text = "".to_owned();
-        let Some((e, handle, ..)) = colors.read().iter().next() else {
-            warn!("no color found for colors");
-            return color_text;
-        };
-
-        let handle = handle.read().0.clone();
-        let color = use_bevy_asset(handle);
-
-        *material.write() = Some(color.clone());
-
-        let color = color.get();
-        let color = color.as_ref().clone();
-        let text = match color {
-            Ok(color) => format!("{:?}", color.base_color),
-            Err(_) => "Loading...".to_owned(),
-        };
-        color_text += &text;
-        color_text
+    // Derive the optional handle reactively – use_memo to prevent re‑grabbing the signal too often
+    let handle = use_memo(move || {
+        colors.iter().next().map(|(_, mat, _)| mat.read().0.clone())
     });
 
-    let on_click_white = move |_evt | {
-        let binding = material.read();
-        let Some(material) = binding.as_ref() else {
-            return
-        };
-        material.mutate(|mat| mat.base_color = Color::WHITE);
-    };
+    let material = use_bevy_asset::<StandardMaterial>((handle.read()).clone());
 
-    let on_click_green = move |_evt| {
-        let binding = material.read();
-        let Some(material) = binding.as_ref() else {
-            return
+    // Now we use the reactive signal: `material()` returns Option<Arc<Result<…>>>
+    let r = material.clone();
+    let color_text = use_memo(move || {
+        let mut text = "material uninitialized".to_owned();
+        let Some(mat) = r() else {
+            return text
         };
-        material.mutate(|mat| mat.base_color = GREEN.into());
-    };
+        text = match mat.as_ref() {
+            Ok(asset) => format!("{:?}", asset.base_color),
+            Err(_) => "Loading…".to_owned(),
+        };
+        text
+    });
+
+    // Button handlers unchanged – they use material.mutate()
+    let r = material.clone();
+    let on_click_white = move |_| r.mutate(|m| m.base_color = Color::WHITE);
+    let r = material.clone();
+    let on_click_green = move |_| r.mutate(|m| m.base_color = GREEN.into());
 
     rsx! {
         div {
             style: "border: 2px solid black; padding: 16px; margin: 8px;",
             h2 { "Asset Mirror Demo" }
             p { "Material base color: {color_text}" }
-            button {
-                onclick: on_click_white,
-                "Set White"
-            }
-            button {
-                onclick: on_click_green,
-                "Set Green"
-            }
+            button { onclick: on_click_white, "Set White" }
+            button { onclick: on_click_green, "Set Green" }
         }
     }
 }

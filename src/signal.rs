@@ -69,7 +69,7 @@ impl ReaderRegistry {
 }
 
 /// Closure mutation (used by Dioxus `mutate` and `mutate_set`)
-type MutationOp<T> = Arc<dyn Fn(&mut T) + Send + Sync>;
+pub type MutationOp<T> = Arc<dyn Fn(&mut T) + Send + Sync>;
 
 /// Full-value replacement op
 #[derive(Clone)]
@@ -339,7 +339,7 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
 // -----------------------------------------------------------------------------
 #[derive(Clone)]
 pub struct QueuedSignal<T: Clone + Send + Sync> {
-    state: QueuedState<T>,
+    pub state: QueuedState<T>,
     add_tx: Sender<MutationOp<T>>,
     set_tx: Sender<MutationOp<T>>,
     set_value_tx: Sender<SetValueOp<T>>,

@@ -7,8 +7,13 @@ use dioxus_hooks::use_context;
 use dioxus_signals::{ReadableExt, Signal};
 use flume::{Receiver, Sender, unbounded};
 
+#[cfg(feature = "query")]
 pub mod query;
+
+#[cfg(feature = "resource")]
 pub mod resource;
+
+#[cfg(feature = "asset")]
 pub mod asset;
 
 pub type CommandSender = Sender<CommandQueue>;

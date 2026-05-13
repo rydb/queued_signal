@@ -30,7 +30,7 @@ parking_lot = {workspace = true}
 anyhow = {workspace = true}
 
 [workspace.dependencies]
-dioxus_bevy_signals = {path = "crates/dioxus_bevy_signals"}
+dioxus_bevy_signals = {path = "crates/dioxus_bevy_signals", default-features = false}
 dioxus = {version = "0.7.4", default-features = false}
 dioxus-core = {version = "0.7.4"}
 dioxus-signals = {version = "0.7.4"}
@@ -60,6 +60,7 @@ bytemuck = {version = "1.25", features = ["derive"]}
 variadics_please = "1.1.0"
 queued_signal = {path = "./"}
 left-right = "0.11.7"
+cfg-if = "1.0"
 
 [features]
 resource_example = ["bevy_signal_tests/resource_tests"]

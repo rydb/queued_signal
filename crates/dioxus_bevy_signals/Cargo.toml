@@ -16,3 +16,9 @@ flume = {workspace = true}
 queued_signal = {workspace = true}
 trait-set = {workspace = true}
 bevy_log = {workspace = true}
+
+[features]
+asset = []
+query = []
+resource = []
+default = ["asset", "query", "resource"]

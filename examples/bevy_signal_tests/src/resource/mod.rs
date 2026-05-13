@@ -46,7 +46,7 @@ impl Plugin for CounterResourceTestPlugin {
         app
         .add_systems(Update, bevy_tick_counter)
         .insert_resource(Counter { value: 0 })
-        .insert_resource(TickTimer::default());   // <
+        .insert_resource(TickTimer::default());
     }
 }
 
