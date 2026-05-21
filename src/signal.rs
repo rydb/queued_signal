@@ -419,14 +419,15 @@ pub fn use_queued_signal<T: Clone + Send + Sync + 'static>(
             loop {
                 tokio::select! {
                     Ok(()) = notify_rx.changed() => {
+                        let current_version = *notify_rx.borrow();
+
                         let guard = read_handle.enter().unwrap();
                         let reader_id = registry.register();
                         registry.heartbeat(reader_id);
-                        // Clone the Arc<T>, not T itself - just a refcount bump.
+
+                        // Clone the Arc<T>, not T itself. Just a refcount bump.
                         value_signal.set(Some(guard.0.clone()));
                         registry.unregister(reader_id);
-                        // Wake Dioxus so the UI re-renders and polls this future again
-                        dioxus::core::needs_update();
                     }
                     Ok(()) = health_rx.changed() => {
                         health_signal.set(*health_rx.borrow());

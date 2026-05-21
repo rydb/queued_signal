@@ -89,24 +89,18 @@ impl DioxusTestPlugin for AssetTestPlugin {
 #[component]
 pub fn AssetColorPicker() -> Element {
     let colors = use_bevy_query::<(Entity, &mut MeshMaterial3d<StandardMaterial>, &mut Marker), ()>();
-    // let materials = use_bevy_assets::<StandardMaterial>();
 
     // Reactive handle to the first material (if any)
     let handle = use_memo(move || {
         colors.iter().next().map(|(_, mat, _)| mat.read().0.clone())
     });
 
-    // Extract the asset ID from the handle
     let asset_id = use_memo(move || handle.read().as_ref().map(|h| h.id()));
-
-    // Subscribe to the asset's state – this signal updates automatically
     let asset_state = use_bevy_asset(asset_id);
 
     // Derive the colour text reactively
     let color_text = use_memo(move || {
         asset_state.with_asset(|n| {
-        println!("asset state UPDATED! {:#?}", n);
-
             match n {
                 Some(mat) => format!("{:?}", mat.base_color),
                 None => "Loading…".to_string(),
@@ -116,20 +110,14 @@ pub fn AssetColorPicker() -> Element {
 
     // Mutation callbacks (same as before)
     let on_click_white = move |_| {
-        asset_state.with_asset(|n: Option<&StandardMaterial>| {
-            asset_state.mutate(|n| n.base_color = Color::WHITE);
-        });
+        asset_state.mutate(|n| n.base_color = Color::srgb(1.0, 1.0, 1.0));
     };
     let make_more_green = move |_| {
-        asset_state.with_asset(|n| {
-            if let Some(mat) = n {
-                asset_state.mutate(|n| {
-                    let color_srgb = n.base_color.to_srgba();
-                    let new_green = color_srgb.green + 10.0;
-                    n.base_color = Color::Srgba(Srgba::rgb(color_srgb.red, new_green, color_srgb.blue))
-                });
-            }
-        })
+        asset_state.mutate(|n| {
+            let color_srgb = n.base_color.to_srgba();
+            let new_green = color_srgb.green + 10.0;
+            n.base_color = Color::Srgba(Srgba::rgb(color_srgb.red, new_green, color_srgb.blue))
+        });
     };
 
     rsx! {
