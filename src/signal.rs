@@ -1,5 +1,6 @@
 use bevy_log::tracing;
 use dioxus::prelude::*;
+use dioxus_core::needs_update;
 use dioxus_signals::*;
 use dioxus_hooks::*;
 use flume::{Receiver, Sender};
@@ -77,7 +78,7 @@ pub struct SetValueOp<T>(pub Arc<T>);
 
 /// Unified operation for left‑right always operates on `Arc<T>` inside `Absorbable`.
 #[derive(Clone)]
-enum SignalOp<T: Clone + Send + Sync> {
+pub enum SignalOp<T: Clone + Send + Sync> {
     Fn(MutationOp<T>),
     Set(SetValueOp<T>),
 }
@@ -142,7 +143,7 @@ impl<T: Clone + Send + Sync> Absorb<SignalOp<T>> for Absorbable<T> {
 /// Inner state of QueuedSignal
 pub struct QueuedState<T: Clone + Send + Sync> {
     read_handle: ReadHandle<Absorbable<T>>,
-    notify_rx: watch::Receiver<()>,
+    notify_rx: watch::Receiver<u64>,
     health_rx: watch::Receiver<HealthStatus>,
     registry: Arc<ReaderRegistry>,
 }
@@ -171,7 +172,7 @@ impl<T: Clone + Send + Sync> QueuedState<T> {
         TrackedReadGuard::new(guard, self.registry.clone())
     }
     pub fn health(&self) -> HealthStatus { *self.health_rx.borrow() }
-    fn notify_rx(&self) -> watch::Receiver<()> { self.notify_rx.clone() }
+    fn notify_rx(&self) -> watch::Receiver<u64> { self.notify_rx.clone() }
 }
 
 /// QueuedSignal Read guard. 
@@ -205,7 +206,8 @@ pub struct WriterDriver<T: Clone + Send + Sync> {
     set_rx: Receiver<MutationOp<T>>,
     add_rx: Receiver<MutationOp<T>>,
     abs_slot: Arc<Mutex<Option<Arc<T>>>>, 
-    notify_tx: watch::Sender<()>,
+    notify_tx: watch::Sender<u64>,   // was Sender<()>
+    version: u64,                    // new field
     health_tx: watch::Sender<HealthStatus>,
     registry: Arc<ReaderRegistry>,
     watchdog_timeout: Duration,
@@ -230,7 +232,7 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
         let (write_handle, read_handle) =
             left_right::new_from_empty::<Absorbable<T>, SignalOp<T>>(initial_wrapped);
 
-        let (notify_tx, notify_rx) = watch::channel(());
+        let (notify_tx, notify_rx) = watch::channel(0u64);
         let (health_tx, health_rx) = watch::channel(HealthStatus::Healthy);
 
         let (set_value_tx, set_value_rx) = flume::unbounded();
@@ -262,9 +264,12 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
             add_tx: add_tx.clone(),
             queued_state: state,
             publish_counter: None,
+            version: 0,
         }
     }
-
+    pub fn append(&mut self, op: SignalOp<T>) {
+        self.write_handle.append(op);
+    }
     pub fn set_publish_counter(&mut self, counter: Arc<AtomicU64>) {
         self.publish_counter = Some(counter);
     }
@@ -313,7 +318,8 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
         if did_work && self.last_publish.elapsed() >= publish_interval {
             self.write_handle.publish();
             self.last_publish = Instant::now();
-            let _ = self.notify_tx.send(());
+            self.version += 1;      
+            let _ = self.notify_tx.send(self.version);
             if let Some(ref counter) = self.publish_counter {
                 counter.fetch_add(1, Ordering::Relaxed);
             }
@@ -416,9 +422,11 @@ pub fn use_queued_signal<T: Clone + Send + Sync + 'static>(
                         let guard = read_handle.enter().unwrap();
                         let reader_id = registry.register();
                         registry.heartbeat(reader_id);
-                        // Clone the Arc<T>, not T itself – just a refcount bump.
+                        // Clone the Arc<T>, not T itself - just a refcount bump.
                         value_signal.set(Some(guard.0.clone()));
                         registry.unregister(reader_id);
+                        // Wake Dioxus so the UI re-renders and polls this future again
+                        dioxus::core::needs_update();
                     }
                     Ok(()) = health_rx.changed() => {
                         health_signal.set(*health_rx.borrow());

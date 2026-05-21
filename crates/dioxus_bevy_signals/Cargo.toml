@@ -12,10 +12,13 @@ dioxus-core = {workspace = true}
 dioxus = {workspace = true}
 dioxus-hooks = {workspace = true}
 dioxus-signals = {workspace = true}
+generational-box = {workspace = true}
 flume = {workspace = true}
 queued_signal = {workspace = true}
 trait-set = {workspace = true}
 bevy_log = {workspace = true}
+linked_hash_set = {workspace = true}
+
 
 [features]
 asset = []

@@ -23,14 +23,38 @@ pub type CommandReceiver = Receiver<CommandQueue>;
 pub struct CommandQueueReciever {
     pub rx: CommandReceiver,
 }
-
+/// Adds system to bevy through &mut World instead of &mut App
+/// 
+/// !!! Do not add systems that run before Pre-Update via this method or they wont run !!!
 pub fn add_systems_through_world<T>(
     world: &mut World,
     schedule: impl ScheduleLabel,
     systems: impl IntoScheduleConfigs<ScheduleSystem, T>,
 ) {
-    let type_name = type_name_of_val(&schedule);
     let mut schedules = world.get_resource_mut::<Schedules>().unwrap();
+   
+    // schedules that don't work when added via world. 
+    let schedule_blacklist = [format!("{:#?}", PreUpdate), format!("{:#?}", PreStartup)];
+    
+    for bad_schedule in schedule_blacklist {
+        if format!("{:#?}", schedule) == bad_schedule {
+            panic!("
+                Systems that run before update do not run when added through world. 
+                Re-structure your command plugin to not use systems that run before update in the mean time. 
+                TODO: fix this
+                
+                Offending Schedule:
+                {:#?}
+
+                Offending system set:
+                {:#?}
+                ",
+                bad_schedule,
+                type_name_of_val(&systems)
+            );
+        };
+    }
+
     let schedule = schedules.entry(schedule);
 
     schedule.add_systems(systems);

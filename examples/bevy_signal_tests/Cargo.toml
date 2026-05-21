@@ -23,5 +23,5 @@ cfg-if = {workspace = true}
 [features]
 resource_tests = ["dioxus_bevy_signals/resource"]
 query_tests = ["dioxus_bevy_signals/query"]
-asset_tests = ["dioxus_bevy_signals/asset"]
+asset_tests = ["dioxus_bevy_signals/asset", "dioxus_bevy_signals/query"]
 default = ["resource_tests", "query_tests", "asset_tests"]

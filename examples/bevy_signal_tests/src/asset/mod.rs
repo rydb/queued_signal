@@ -5,12 +5,14 @@ use bevy_app::prelude::*;
 use bevy_asset::{AssetApp, AssetPlugin, Assets, Handle};
 use bevy_color::palettes::basic::RED;
 use bevy_color::palettes::css::GREEN;
-use bevy_color::{Color, LinearRgba};
+use bevy_color::{Color, LinearRgba, Srgba};
 use bevy_ecs::prelude::*;
 use bevy_log::warn;
 use bevy_pbr::{MeshMaterial3d, StandardMaterial};
+use dioxus::desktop::wry::cookie::time::Duration;
 use dioxus::prelude::*;
-use dioxus_bevy_signals::asset::use_bevy_asset;
+use dioxus_bevy_signals::asset::{AssetState, use_bevy_asset};
+// use dioxus_bevy_signals::asset::use_bevy_asset;
 use dioxus_bevy_signals::query::use_bevy_query;
 use dioxus_bevy_signals::{CommandQueueSender, push_and_send};
 use dioxus_hooks::{use_memo, use_signal};
@@ -18,6 +20,8 @@ use dioxus_signals::{ReadableExt, WritableExt};
 
 use crate::DioxusTestPlugin;
 
+#[derive(Resource)]
+pub struct AssetDebugTimer(Instant);
 
 #[derive(Component, Clone)]
 pub struct Marker;
@@ -36,6 +40,22 @@ pub fn spawn_color_entity(
         )
     );
 }
+pub fn color_value_print(
+    mats: Res<Assets<StandardMaterial>>,
+    colors: Query<&MeshMaterial3d<StandardMaterial>>,
+    mut timer: ResMut<AssetDebugTimer>
+) {
+    if timer.0.elapsed() >= core::time::Duration::from_millis(1000) {
+        timer.0 = Instant::now();
+        for color in colors {
+            let Some(color) = mats.get(&color.0) else {
+                println!("handle but no asset?");
+                continue
+            };
+            // println!("current color is: {:#?}", color.base_color)
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct AssetTestPlugin;
@@ -46,9 +66,10 @@ impl Plugin for AssetTestPlugin {
             app.add_plugins(AssetPlugin::default());
         }
         app
-        
+        .insert_resource(AssetDebugTimer(Instant::now()))
         .init_asset::<StandardMaterial>()
-        .add_systems(Startup, spawn_color_entity);
+        .add_systems(Startup, spawn_color_entity)
+        .add_systems(Update, color_value_print);
 
     }
 }
@@ -68,33 +89,48 @@ impl DioxusTestPlugin for AssetTestPlugin {
 #[component]
 pub fn AssetColorPicker() -> Element {
     let colors = use_bevy_query::<(Entity, &mut MeshMaterial3d<StandardMaterial>, &mut Marker), ()>();
+    // let materials = use_bevy_assets::<StandardMaterial>();
 
-    // Derive the optional handle reactively – use_memo to prevent re‑grabbing the signal too often
+    // Reactive handle to the first material (if any)
     let handle = use_memo(move || {
         colors.iter().next().map(|(_, mat, _)| mat.read().0.clone())
     });
 
-    let material = use_bevy_asset::<StandardMaterial>((handle.read()).clone());
+    // Extract the asset ID from the handle
+    let asset_id = use_memo(move || handle.read().as_ref().map(|h| h.id()));
 
-    // Now we use the reactive signal: `material()` returns Option<Arc<Result<…>>>
-    let r = material.clone();
+    // Subscribe to the asset's state – this signal updates automatically
+    let asset_state = use_bevy_asset(asset_id);
+
+    // Derive the colour text reactively
     let color_text = use_memo(move || {
-        let mut text = "material uninitialized".to_owned();
-        let Some(mat) = r() else {
-            return text
-        };
-        text = match mat.as_ref() {
-            Ok(asset) => format!("{:?}", asset.base_color),
-            Err(_) => "Loading…".to_owned(),
-        };
-        text
+        asset_state.with_asset(|n| {
+        println!("asset state UPDATED! {:#?}", n);
+
+            match n {
+                Some(mat) => format!("{:?}", mat.base_color),
+                None => "Loading…".to_string(),
+            }
+        })
     });
 
-    // Button handlers unchanged – they use material.mutate()
-    let r = material.clone();
-    let on_click_white = move |_| r.mutate(|m| m.base_color = Color::WHITE);
-    let r = material.clone();
-    let on_click_green = move |_| r.mutate(|m| m.base_color = GREEN.into());
+    // Mutation callbacks (same as before)
+    let on_click_white = move |_| {
+        asset_state.with_asset(|n: Option<&StandardMaterial>| {
+            asset_state.mutate(|n| n.base_color = Color::WHITE);
+        });
+    };
+    let make_more_green = move |_| {
+        asset_state.with_asset(|n| {
+            if let Some(mat) = n {
+                asset_state.mutate(|n| {
+                    let color_srgb = n.base_color.to_srgba();
+                    let new_green = color_srgb.green + 10.0;
+                    n.base_color = Color::Srgba(Srgba::rgb(color_srgb.red, new_green, color_srgb.blue))
+                });
+            }
+        })
+    };
 
     rsx! {
         div {
@@ -102,7 +138,7 @@ pub fn AssetColorPicker() -> Element {
             h2 { "Asset Mirror Demo" }
             p { "Material base color: {color_text}" }
             button { onclick: on_click_white, "Set White" }
-            button { onclick: on_click_green, "Set Green" }
+            button { onclick: make_more_green, "Make more green" }
         }
     }
 }
