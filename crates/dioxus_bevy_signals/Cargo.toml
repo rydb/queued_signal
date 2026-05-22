@@ -12,6 +12,7 @@ dioxus-core = {workspace = true}
 dioxus = {workspace = true}
 dioxus-hooks = {workspace = true}
 dioxus-signals = {workspace = true}
+bytemuck = {workspace = true}
 generational-box = {workspace = true}
 flume = {workspace = true}
 queued_signal = {workspace = true}
