@@ -109,13 +109,12 @@ pub fn ToggleableAsset() -> Element {
     let color = use_bevy_asset(handle);
 
     let status_string = use_memo(move || {
-        let text = "Loading...".to_owned();
+        let mut text = "Loading...".to_owned();
 
-        let Some(text) = color.with_asset(move |n| {
-            format!("{:?}", n.base_color)
-        }) else {
+        let Ok(color) = &*color.read() else {
             return text
         };
+        text = format!("{:?}", color.base_color);
         text
     });
 
@@ -165,14 +164,14 @@ pub fn AssetColorPicker() -> Element {
 
     // Derive the colour text reactively
     let color_text = use_memo(move || {
-        let Some(text) = asset_state.with_asset(|n| {
-            format!("{:#?}", n.base_color)
-        }) else { return "loading".into()};
+        let mut text = "Loading...".to_string();
+        let Ok(color) = &*asset_state.read() else {
+           return text
+        };
+        let text = format!("{:?}", color.base_color);
         text
-    });
-                // Some(mat) => format!("{:?}", mat.base_color),
 
-    // Mutation callbacks (same as before)
+    });
     let on_click_white = move |_| {
         asset_state.mutate(|n| n.base_color = Color::srgb(1.0, 1.0, 1.0));
     };
@@ -186,7 +185,7 @@ pub fn AssetColorPicker() -> Element {
 
     rsx! {
         div {
-            h2 { "sync test" }
+            h2 { "bevy asset <-> dioxus" }
             p { "Material base color: {color_text}" }
             button { onclick: on_click_white, "Set White" }
             button { onclick: make_more_green, "Make more green" }
