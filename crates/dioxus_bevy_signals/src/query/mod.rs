@@ -207,14 +207,14 @@ pub fn sync_mirror_to_component<T: DioxusComponentSync>(
 
 /// Accumulates tracking delta requests for batch processing.
 #[derive(Resource)]
-struct PendingTrackingDeltas<Q: MirrorQueryData, F: QueryFilter> { 
+struct PendingQueryTrackingDeltas<Q: MirrorQueryData, F: QueryFilter> { 
     /// cummulative tracking delta
     pending: i32,
     _querydata: fn() -> PhantomData<Q>,
     _filter: fn() -> PhantomData<F>
 }
 
-impl<Q: MirrorQueryData, F: QueryFilter> Default for PendingTrackingDeltas<Q, F> {
+impl<Q: MirrorQueryData, F: QueryFilter> Default for PendingQueryTrackingDeltas<Q, F> {
     fn default() -> Self {
         Self { pending: Default::default(), _querydata: || Default::default(), _filter: || Default::default() }
     }
@@ -227,7 +227,7 @@ pub struct UpdateTrackingQueries<Q: DioxusQuerySync, F: QueryFilter> {
 
 impl<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static> Command for UpdateTrackingQueries<Q, F> {
     fn apply(self, world: &mut World) -> () {
-        let mut pending_delta = world.get_resource_or_init::<PendingTrackingDeltas<Q, F>>();
+        let mut pending_delta = world.get_resource_or_init::<PendingQueryTrackingDeltas<Q, F>>();
         pending_delta.pending += self.delta;
     }
 }
@@ -235,7 +235,7 @@ impl<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static> Command for UpdateT
 ///apply any new tracking queries increment/decrement deltas on relevant DioxusMirrors
 fn apply_tracking_queries_delta<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>(
     mirror_components: Query<Q::TrackingQueriesQuerydataMut, F>,
-    mut pending_tracking_delta: ResMut<PendingTrackingDeltas<Q, F>>,
+    mut pending_tracking_delta: ResMut<PendingQueryTrackingDeltas<Q, F>>,
     mut handle_count: ResMut<MirrorQueryHandleCount<Q, F>>,
     mut active: ResMut<MirrorQueryActive<Q, F>>,
 ) {
@@ -379,7 +379,7 @@ impl<T: DioxusQuerySync + 'static, F: QueryFilter> Command for RequestQueryMirro
 
                 let query_driver = WriterDriver::new(MirrorQuery::default());
                 add_systems_through_world(world, Update, drive_query_signal::<T, F>);
-                add_systems_through_world(world, PostUpdate, apply_tracking_queries_delta::<T, F>.run_if(resource_changed::<PendingTrackingDeltas::<T, F>>));
+                add_systems_through_world(world, PostUpdate, apply_tracking_queries_delta::<T, F>.run_if(resource_changed::<PendingQueryTrackingDeltas::<T, F>>));
                 add_systems_through_world(world, Last, sync_query_mirror_to_signal::<T, F>.run_if(resource_equals(MirrorQueryActive::<T, F> {
                     active: true,
                     _phantom: || PhantomData::default(),
@@ -402,7 +402,7 @@ impl<T: DioxusQuerySync + 'static, F: QueryFilter> Command for RequestQueryMirro
                     count: 0,
                     _phantom: || PhantomData::default()
                 });
-                world.init_resource::<PendingTrackingDeltas::<T, F>>();
+                world.init_resource::<PendingQueryTrackingDeltas::<T, F>>();
                 signal
 
 

@@ -14,7 +14,7 @@ use bevy_ecs::{prelude::*, world::CommandQueue};
 use bevy_log::warn;
 use bytemuck::{TransparentWrapper, TransparentWrapperAlloc};
 use dioxus::html::g::seed;
-use dioxus_core::{needs_update, use_hook};
+use dioxus_core::{needs_update, use_drop, use_hook};
 use dioxus_hooks::{use_context, use_effect, use_future, use_memo, use_signal};
 use dioxus_signals::{Memo, Readable, ReadableExt, Signal, WritableExt};
 use flume::{Receiver, Sender};
@@ -89,8 +89,6 @@ impl<A: DioxusAssetSync> AssetFetch<A> {
 #[repr(transparent)]
 pub struct AssetMaybeMirrorState<A: DioxusAssetSync> {
     state: Result<A, AssetNoneState>,
-    // changed_sender: Sender<AssetId<A>>,
-    // asset_id: AssetId<A>
 }
 
 impl<A: DioxusAssetSync> Deref for AssetMaybeMirrorState<A> {
@@ -118,7 +116,12 @@ pub struct AssetMaybeMirror<A: DioxusAssetSync> {
     /// kept seperate to not clone channels on update, and to allow transparent wrapper condense if let somes with arc transmute
     pub extra_update_info: QueuedSignal<AssetUpdateExtraInfo<A>>,
     state_driver: Mutex<WriterDriver<AssetMaybeMirrorState<A>>>,
-    extra_update_info_driver: Mutex<WriterDriver<AssetUpdateExtraInfo<A>>>
+    extra_update_info_driver: Mutex<WriterDriver<AssetUpdateExtraInfo<A>>>,
+    /// number of signals that are actively reading this asset mirror.
+    /// 
+    /// once this hits zero(last dioxus component reading this is dropped), the asset mirror map clears this entry from it self.
+    tracking_signals: i32
+
 }
 
 #[derive(Resource)]
@@ -287,15 +290,12 @@ pub fn collect_changed_ids<A: DioxusAssetSync>(
 }
 
 pub fn clear_changed_flags<A: DioxusAssetSync>(mut changed: ResMut<ChangedAssetMirrors<A>>) {
-    // if changed.0.len() > 0 {
-    //     println!("cleared changed: {:#?}", changed.0);
-    // }
+
     changed.0.clear();
 }
 
 pub struct AssetInitResponse<A: DioxusAssetSync> {
     signal: QueuedSignal<AssetMaybeMirrorState<A>>,
-    // signal_id: AssetSignalId,
 }
 
 #[derive(Resource)]
@@ -382,6 +382,7 @@ pub struct AssetMirrorRequestResponse<A: DioxusAssetSync> {
     initialize_request_tx: Sender<InitializeSignalAssetIdRequest<A>>,
 }
 
+
 pub struct RequestBevyAssetMirror<A: DioxusAssetSync> {
     response_tx: Sender<AssetMirrorRequestResponse<A>>,
     asset_id: AssetId<A>
@@ -404,7 +405,7 @@ impl<A: DioxusAssetSync> Command for RequestBevyAssetMirror<A> {
                 world.insert_resource(ChangedIdsSender::<A>(changed_tx));
                 world.insert_resource(UpdateAssetSignalReciever::<A> {rx: initialize_asset_id_rx });
                 world.insert_resource(UpdateAssetSignalSender::<A> {tx: initialize_asset_id_tx });
-
+                world.insert_resource(PendingAssetTrackingDeltas::<A>::default());
                 world.insert_resource(RegisteredAssetSignals::<A>::default());
 
                 add_systems_through_world(world, Update, collect_changed_ids::<A>);
@@ -412,8 +413,9 @@ impl<A: DioxusAssetSync> Command for RequestBevyAssetMirror<A> {
                 add_systems_through_world(world, Update, update_signals_with_initialized_ids::<A>);
                 add_systems_through_world(world, PostUpdate, init_requested_asset_mirrors::<A>);
                 add_systems_through_world(world, PostUpdate, sync_mirrors_to_assets::<A>);
-                add_systems_through_world(world, PostUpdate, sync_assets_to_mirrors::<A>);
-                add_systems_through_world(world, Last, clear_changed_flags::<A>);
+                add_systems_through_world(world, PostUpdate, sync_assets_to_mirrors::<A>.run_if(resource_changed::<ChangedAssetMirrors<A>>));
+                add_systems_through_world(world, PostUpdate, apply_tracking_queries_delta::<A>.run_if(resource_changed::<PendingAssetTrackingDeltas<A>>));
+                add_systems_through_world(world, Last, clear_changed_flags::<A>.run_if(resource_changed::<ChangedAssetMirrors<A>>));
                 add_systems_through_world(world, Last, clear_asset_init_requests::<A>);
 
                 world.insert_resource(AssetSyncInitialized {
@@ -458,6 +460,7 @@ impl<A: DioxusAssetSync> Command for RequestBevyAssetMirror<A> {
                     state_driver: Mutex::new(asset_state_driver),
                     extra_update_info: extra_info.clone(),
                     extra_update_info_driver: Mutex::new(extra_info_driver),
+                    tracking_signals: 1,
                 };
                 let latest_ticket_id = map.asset_id_initialize_tickets.back().unwrap_or(&RequestAssetIdTicket { ticket_id: 0 });
                 ticket_id = Some(RequestAssetIdTicket {ticket_id: latest_ticket_id.ticket_id + 1 });
@@ -477,6 +480,58 @@ impl<A: DioxusAssetSync> Command for RequestBevyAssetMirror<A> {
             initialize_request_tx: initialize_request_tx.tx.clone(),
             extra_info,
         });
+    }
+}
+
+#[derive(Resource)]
+pub struct PendingAssetTrackingDeltas<A: DioxusAssetSync> {
+    pending: Vec<(AssetId<A>, i32)>,
+    _phantom: PhantomData<A>
+}
+
+impl<A: DioxusAssetSync> Default for PendingAssetTrackingDeltas<A> {
+    fn default() -> Self {
+        Self { pending: Default::default(), _phantom: Default::default() }
+    }
+}
+
+fn apply_tracking_queries_delta<A: DioxusAssetSync>(
+    mut mirrors: ResMut<AssetMirrorMap<A>>,
+    tracking_delta: ResMut<PendingAssetTrackingDeltas<A>>
+) {
+    for (id, delta) in &tracking_delta.pending {
+        let clear = {
+                let Some(entry) = mirrors.assets.get_mut(id) else {
+                println!("delta change request recieved by asset doesn't exist in map? How did this happen?");
+                continue
+            };
+            entry.tracking_signals += delta;
+
+            if entry.tracking_signals <= 0 {
+                true
+            } else {
+                false
+            }
+        };
+        if clear {
+            println!("last signal referencing {}, dropped. removing un-used asset mirror from map", id);
+            mirrors.assets.remove(id);
+        }
+    }
+}
+
+/// update number of signals tracking an asset(for cleanup on un-monitored assets)
+pub struct UpdateTrackingAssets<A: DioxusAssetSync> {
+    delta: i32,
+    asset_id: AssetId<A>,
+    _phantom: PhantomData<A>
+}
+
+impl<A: DioxusAssetSync> Command for UpdateTrackingAssets<A> {
+    fn apply(self, world: &mut World) -> () {
+        let mut pending_delta = world.get_resource_or_init::<PendingAssetTrackingDeltas<A>>();
+        pending_delta.pending.push((self.asset_id, self.delta));
+        // pending_delta.pending += self.delta
     }
 }
 
@@ -557,6 +612,39 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
         }).unwrap();
         signal
         
+    });
+
+
+    let r = ctx.clone();
+    let extra_info_r = response.extra_info.clone();
+    use_effect(move || {
+        let asset_id = extra_info_r.read().asset_id;
+
+        println!("ASSET SIGNAL MOUNTED, SENDING INCREMENT COMMAND");
+        let mut queue = CommandQueue::default();
+        queue.push(UpdateTrackingAssets::<A> {
+            delta: 1,
+            asset_id: asset_id,
+            _phantom: PhantomData::default()
+        });
+        let _ = r.tx.send(queue);
+    });
+
+    // Cleanup: decrement when component unmounts.
+    let r = ctx.clone();
+    let extra_info_r = response.extra_info.clone();
+
+    use_drop(move || {
+        let asset_id = extra_info_r.read().asset_id;
+
+        println!("ASSET SIGNAL DROPPED, SENDING DECREMENT COMMAND");
+        let mut queue = CommandQueue::default();
+        queue.push(UpdateTrackingAssets::<A> {
+            delta: -1,
+            asset_id: asset_id,
+            _phantom: PhantomData::default()
+        });
+        let _ = r.tx.send(queue);
     });
 
     // update the AssetId<A> of the signal if it has been changed
