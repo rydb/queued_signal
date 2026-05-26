@@ -56,14 +56,25 @@ impl Default for SignalTestsPlugin {
                 let mut list: Vec<Box<dyn DioxusTestPlugin>> = Vec::default();
                 
                 #[cfg(feature = "resource_tests")]
-                list.push(Box::new(ResourceTestsPlugin::default()));
+                {
+                    println!("resource tests added");
+                    list.push(Box::new(ResourceTestsPlugin::default()));
+                }
 
                 #[cfg(feature = "query_tests")]
-                list.push(Box::new(QueryTestsPlugin::default()));
+                {
+                    println!("query tests added");
+                    list.push(Box::new(QueryTestsPlugin::default()));
+
+                }
 
                 #[cfg(feature = "asset_tests")]
-                list.push(Box::new(AssetTestPlugin::default()));
+                {
+                    println!("asset_tests added");
+                    list.push(Box::new(AssetTestPlugin::default()));
+                }
                 list
+
             },
         }
     }

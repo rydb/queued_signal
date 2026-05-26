@@ -627,7 +627,7 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
             asset_id: asset_id,
             _phantom: PhantomData::default()
         });
-        let _ = r.tx.send(queue);
+        let _ = r.tx.send(queue).inspect_err(|err| println!("{err}"));
     });
 
     // Cleanup: decrement when component unmounts.
@@ -644,7 +644,7 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
             asset_id: asset_id,
             _phantom: PhantomData::default()
         });
-        let _ = r.tx.send(queue);
+        let _ = r.tx.send(queue).inspect_err(|err| println!("{err}"));
     });
 
     // update the AssetId<A> of the signal if it has been changed

@@ -206,9 +206,10 @@ pub struct WriterDriver<T: Clone + Send + Sync> {
     set_rx: Receiver<MutationOp<T>>,
     add_rx: Receiver<MutationOp<T>>,
     abs_slot: Arc<Mutex<Option<Arc<T>>>>, 
-    notify_tx: watch::Sender<u64>,   // was Sender<()>
-    version: u64,                    // new field
+    notify_tx: watch::Sender<u64>,
+    version: u64, 
     health_tx: watch::Sender<HealthStatus>,
+    last_health: HealthStatus, 
     registry: Arc<ReaderRegistry>,
     watchdog_timeout: Duration,
     last_publish: Instant,
@@ -228,6 +229,7 @@ impl<T: Debug + Clone + Send + Sync> Debug for WriterDriver<T> {
 
 impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
     pub fn new(initial: T) -> Self {
+        let initial_health = HealthStatus::Healthy;
         let initial_wrapped = Absorbable(Arc::new(initial));
         let (write_handle, read_handle) =
             left_right::new_from_empty::<Absorbable<T>, SignalOp<T>>(initial_wrapped);
@@ -265,6 +267,7 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
             queued_state: state,
             publish_counter: None,
             version: 0,
+            last_health: initial_health,
         }
     }
     pub fn append(&mut self, op: SignalOp<T>) {
@@ -328,7 +331,7 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
         self.update_health();
     }
 
-    fn update_health(&self) {
+    fn update_health(&mut self) {
         let stalled = self.registry.check_stalled(self.watchdog_timeout);
         let pinned = stalled.len();
         let status = match pinned {
@@ -336,7 +339,11 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
             1 => HealthStatus::Degraded { pinned_buffers: pinned },
             _ => HealthStatus::Stalled { pinned_buffers: pinned },
         };
-        let _ = self.health_tx.send(status);
+        // don't starve future by updating health every frame when no new changes are made
+        if status != self.last_health {
+            self.last_health = status;
+            let _ = self.health_tx.send(status);
+        }
     }
 }
 
@@ -419,7 +426,7 @@ pub fn use_queued_signal<T: Clone + Send + Sync + 'static>(
             loop {
                 tokio::select! {
                     Ok(()) = notify_rx.changed() => {
-                        let current_version = *notify_rx.borrow();
+                        // let current_version = *notify_rx.borrow();
 
                         let guard = read_handle.enter().unwrap();
                         let reader_id = registry.register();
@@ -434,44 +441,12 @@ pub fn use_queued_signal<T: Clone + Send + Sync + 'static>(
                     }
                     else => break,
                 }
+                tokio::task::yield_now().await;
             }
         }
     });
 
     (value_signal, health_signal)
-}
-
-/// Handle to underyling QueuedSignal, made reactive for Dioxus.
-#[derive(Clone)]
-pub struct QueuedSignalHandle<T: Clone + Send + Sync + 'static> {
-    pub signal: Signal<Option<Arc<T>>>,
-    pub health: Signal<HealthStatus>,
-    pub writer: QueuedSignal<T>,
-}
-
-impl<T: Clone + Send + Sync + 'static> QueuedSignalHandle<T> {
-    pub fn mutate<F>(&self, f: F)
-    where F: Fn(&mut T) + Send + Sync + 'static
-    {
-        self.writer.mutate(f);
-    }
-
-    pub fn mutate_set<F>(&self, f: F)
-    where F: Fn(&mut T) + Send + Sync + 'static
-    {
-        self.writer.mutate_set(f);
-    }
-
-    pub fn set_value(&self, value: Arc<T>) {
-        self.writer.set_value(value);
-    }
-
-    pub fn health(&self) -> HealthStatus { *self.health.read() }
-}
-
-impl<T: Clone + Send + Sync + 'static> Deref for QueuedSignalHandle<T> {
-    type Target = Signal<Option<Arc<T>>>;
-    fn deref(&self) -> &Self::Target { &self.signal }
 }
 
 unsafe impl<T: Clone + Send + Sync> Send for Absorbable<T> {}

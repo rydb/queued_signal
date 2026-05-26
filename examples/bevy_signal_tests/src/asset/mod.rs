@@ -168,7 +168,7 @@ pub fn AssetColorPicker() -> Element {
         let Ok(color) = &*asset_state.read() else {
            return text
         };
-        let text = format!("{:?}", color.base_color);
+        text = format!("{:?}", color.base_color);
         text
 
     });

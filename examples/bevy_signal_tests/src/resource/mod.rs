@@ -3,6 +3,8 @@ use bevy_ecs::prelude::*;
 use dioxus_bevy_signals::resource::use_bevy_resource;
 use dioxus_core::Element;
 use dioxus::prelude::*;
+use dioxus_hooks::use_memo;
+use dioxus_signals::ReadableExt;
 use queued_signal::signal::HealthStatus;
 use std::time::{Duration, Instant};
 
@@ -86,7 +88,11 @@ impl DioxusTestPlugin for ResourceTestsPlugin {
 pub fn CounterResource() -> Element {
     let counter = use_bevy_resource::<Counter>();
 
-    let value = counter().map(|c| c.value).unwrap_or(0);
+    let value = use_memo(move || {
+        let value = counter.read().map(|c| c.value).unwrap_or(0);
+        value
+    });
+
     let health = counter.health();
     let health_text = match health {
         HealthStatus::Healthy => "Healthy",
@@ -111,6 +117,7 @@ pub fn CounterResource() -> Element {
             }
         }
     }
+
 }
 
 #[component]

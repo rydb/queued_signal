@@ -3,17 +3,19 @@ use bevy_ecs::world::CommandQueue;
 use bevy_ecs::{prelude::*, schedule::ScheduleLabel, system::ScheduleSystem};
 use bevy_log::prelude::*;
 use dioxus_core::use_hook;
-use dioxus_hooks::use_context;
+use dioxus_hooks::{use_context, use_signal};
 use dioxus::prelude::*;
+use dioxus_signals::{ReadableExt, Signal};
 use flume::Sender;
-use queued_signal::signal::{HealthStatus, QueuedSignal, QueuedSignalHandle, WriterDriver, SetValueOp};
+use queued_signal::signal::{HealthStatus, QueuedSignal, WriterDriver, SetValueOp};
 use std::any::{TypeId, type_name};
 use std::collections::HashSet;
-use std::sync::Mutex;
+use std::ops::Deref;
+use std::sync::{Arc, Mutex};
 use trait_set::trait_set;
 use std::time::Duration;
 
-use crate::CommandQueueSender;
+use crate::{CommandQueueSender, add_systems_through_world};
 
 pub type Result<T, E> = std::result::Result<T, E>;
 
@@ -114,17 +116,49 @@ fn drive_signal<T: ResourceDioxusSync>(
     }
 }
 
-pub fn add_systems_through_world<T>(
-    world: &mut World,
-    schedule: impl ScheduleLabel,
-    systems: impl IntoScheduleConfigs<ScheduleSystem, T>,
-) {
-    let mut schedules = world.get_resource_mut::<Schedules>().unwrap();
-    let schedule = schedules.entry(schedule);
-    schedule.add_systems(systems);
+/// Dioxus signal for managing bevy resource <-> dioxus interop.
+#[derive(Clone)]
+pub struct ResourceMirrorSignal<R: Clone + Send + Sync + 'static> {
+    pub signal: Signal<Option<Arc<R>>>,
+    pub health: Signal<HealthStatus>,
+    pub writer: Signal<QueuedSignal<R>>,
 }
 
-pub fn use_bevy_resource<T>() -> QueuedSignalHandle<T>
+impl<R: Clone + Send + Sync + 'static> Copy for ResourceMirrorSignal<R> {}
+
+impl<R: Clone + Send + Sync + 'static> ResourceMirrorSignal<R> {
+    pub fn mutate<F>(&self, f: F)
+    where F: Fn(&mut R) + Send + Sync + 'static
+    {
+        self.writer.read().mutate(f);
+    }
+
+    pub fn mutate_set<F>(&self, f: F)
+    where F: Fn(&mut R) + Send + Sync + 'static
+    {
+        self.writer.read().mutate_set(f);
+    }
+
+    pub fn set_value(&self, value: Arc<R>) {
+        self.writer.read().set_value(value);
+    }
+
+    pub fn health(&self) -> HealthStatus { *self.health.read() }
+
+    pub fn read(&self) -> Option<Arc<R>> {
+        let value = self.signal.deref();
+    
+        let value = value();
+        value
+    }
+}
+
+impl<T: Clone + Send + Sync + 'static> Deref for ResourceMirrorSignal<T> {
+    type Target = Signal<Option<Arc<T>>>;
+    fn deref(&self) -> &Self::Target { &self.signal }
+}
+
+pub fn use_bevy_resource<T>() -> ResourceMirrorSignal<T>
 where
     T: ResourceDioxusSync,
 {
@@ -141,7 +175,8 @@ where
 
     let (value_signal, health_signal) = signal.use_hook();
 
-    QueuedSignalHandle {
+    let signal = use_signal(|| signal);
+    ResourceMirrorSignal {
         signal: value_signal,
         health: health_signal,
         writer: signal,
