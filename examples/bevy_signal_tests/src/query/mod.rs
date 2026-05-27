@@ -294,46 +294,50 @@ pub fn TenNamesQuery() -> Element {
     };
 
     rsx! {
-        h1 {
-            "bevy query <-> dioxus sync test"
-        }
-        h1 {
-            "names list:"
-        }
-        h2 {
-            {"current names:".to_string() + &names_list_str.read()}
-        }
-        button {
-            onclick: greet_button_onclick,
-            "greet"
-        }
-        button {
-            onclick: add_names_onclick,
-            "add ten names"
-        }
-        button {
-            onclick: remove_names_on_click,
-            "remove names"
-        }
-        button {
-            onclick: toggle_conditional_query,
-            "toggle conditional query",
-        }
         div {
-            {
-                if *conditional_query_hidden.read() {
-                    rsx! {
-                        div {
-                            
+            style: "border: 2px solid black; background-color: #f0f0f0; padding: 16px; border-radius: 8px;",
+            h1 {
+                "bevy query <-> dioxus sync test"
+            }
+            h1 {
+                "names list:"
+            }
+            h2 {
+                {"current names:".to_string() + &names_list_str.read()}
+            }
+            button {
+                onclick: greet_button_onclick,
+                "greet"
+            }
+            button {
+                onclick: add_names_onclick,
+                "add ten names"
+            }
+            button {
+                onclick: remove_names_on_click,
+                "remove names"
+            }
+            button {
+                onclick: toggle_conditional_query,
+                "toggle conditional query",
+            }
+            div {
+                {
+                    if *conditional_query_hidden.read() {
+                        rsx! {
+                            div {
+                                
+                            }
                         }
-                    }
-                } else {
-                    rsx! {
-                        ToggleableQuery {}
+                    } else {
+                        rsx! {
+                            ToggleableQuery {}
+                        }
                     }
                 }
             }
         }
+
     }
 
 }

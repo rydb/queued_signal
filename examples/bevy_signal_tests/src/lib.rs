@@ -3,7 +3,7 @@ use std::thread;
 use bevy_app::{App, Plugin};
 use dioxus::{LaunchBuilder, prelude::rsx};
 use dioxus_bevy_signals::{BevyCommandChannels, CommandQueueSender, DioxusBevyMirrorPlugin};
-use dioxus_core::Element;
+use dioxus::prelude::*;
 use dioxus_hooks::{use_context, use_context_provider};
 
 cfg_if::cfg_if! {
@@ -109,7 +109,16 @@ pub fn signal_tests_app() -> Element{
     for plugin in (tests_plguin.test_plugin_list)(){
         elements.push(plugin.included_element());
     }
+    let force_rerender = |_| {
+        dioxus_core::needs_update();
+    };
     rsx! { 
+        div {
+            button { 
+                onclick: force_rerender,
+                "force re-render "
+            }
+        }
         for element in elements {
             {element}
         }

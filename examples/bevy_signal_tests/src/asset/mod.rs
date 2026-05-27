@@ -89,7 +89,7 @@ impl Plugin for AssetTestPlugin {
 impl DioxusTestPlugin for AssetTestPlugin {
     fn included_element(&self) -> Element {
         rsx! {
-            AssetColorPicker {}
+            AssetDemos {}
         }
     }
 
@@ -170,8 +170,8 @@ pub fn AssetColorPicker() -> Element {
         };
         text = format!("{:?}", color.base_color);
         text
-
     });
+    
     let on_click_white = move |_| {
         asset_state.mutate(|n| n.base_color = Color::srgb(1.0, 1.0, 1.0));
     };
@@ -200,7 +200,7 @@ pub fn AssetDemos() -> Element {
 
     rsx! {
         div {
-            style: "border: 2px solid black; padding: 16px; margin: 8px;",
+            style: "border: 2px solid black; background-color: #f0f0f0; padding: 16px; border-radius: 8px;",
             h2 {
                 "Bevy Asset <-> Dioxus sync demos"
             }
