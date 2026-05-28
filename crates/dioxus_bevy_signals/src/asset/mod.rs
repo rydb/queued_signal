@@ -3,13 +3,13 @@ pub use std::{
     any::{type_name, TypeId},
     collections::{HashMap, HashSet},
     marker::PhantomData,
-    sync::{Arc, Mutex},
+    sync::{Arc},
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
 use bevy_app::{Last, PostUpdate, Update};
-use bevy_asset::{Asset, AssetEvent, AssetId, AssetServer, Assets, Handle, LoadState};
+use bevy_asset::{Asset, AssetEvent, AssetId, AssetServer, Assets, Handle, LoadState, uuid::Uuid};
 use bevy_ecs::{prelude::*, world::CommandQueue};
 use bevy_log::warn;
 use bytemuck::{TransparentWrapper, TransparentWrapperAlloc};
@@ -20,6 +20,7 @@ use dioxus_signals::{Memo, Readable, ReadableExt, Signal, WritableExt};
 use flume::{Receiver, Sender};
 use generational_box::GenerationalRef;
 use linked_hash_set::LinkedHashSet;
+use parking_lot::Mutex;
 use queued_signal::signal::{HealthStatus, QueuedSignal, TrackedReadGuard, WriterDriver};
 use trait_set::trait_set;
 
@@ -115,8 +116,8 @@ pub struct AssetMaybeMirror<A: DioxusAssetSync> {
     /// second signal for extra info needed for updating assets (change detection, asset id, etc..)
     /// kept seperate to not clone channels on update, and to allow transparent wrapper condense if let somes with arc transmute
     pub extra_update_info: QueuedSignal<AssetUpdateExtraInfo<A>>,
-    state_driver: Mutex<WriterDriver<AssetMaybeMirrorState<A>>>,
-    extra_update_info_driver: Mutex<WriterDriver<AssetUpdateExtraInfo<A>>>,
+    state_driver: Arc<Mutex<WriterDriver<AssetMaybeMirrorState<A>>>>,
+    extra_update_info_driver: Arc<Mutex<WriterDriver<AssetUpdateExtraInfo<A>>>>,
     /// number of signals that are actively reading this asset mirror.
     /// 
     /// once this hits zero(last dioxus component reading this is dropped), the asset mirror map clears this entry from it self.
@@ -156,13 +157,13 @@ pub struct ChangedIdsSender<A: DioxusAssetSync>(Sender<AssetId<A>>);
 pub fn drive_maybe_assets<A: DioxusAssetSync>(
     mut mirrors: ResMut<AssetMirrorMap<A>>,
 ) {
-    for (id, asset) in &mut mirrors.assets {
-        if let Ok(mut guard) = asset.state_driver.lock().inspect_err(|err| warn!("UNABLE TO AQUIRE LOCK FOR {} FOR {}: {}", id, type_name::<A>(), err)) {
-            guard.tick(Duration::ZERO);
-        }
-        if let Ok(mut guard) = asset.extra_update_info_driver.lock().inspect_err(|err| warn!("UNABLE TO AQUIRE LOCK FOR {} FOR {}: {}", id, type_name::<A>(), err)) {
-            guard.tick(Duration::ZERO);
-        }
+    for (_id, asset) in &mut mirrors.assets {
+        let mut guard = asset.state_driver.lock();
+        guard.tick(Duration::ZERO);
+
+        let mut guard = asset.extra_update_info_driver.lock();
+        guard.tick(Duration::ZERO);
+
     }
 }
 
@@ -448,29 +449,50 @@ impl<A: DioxusAssetSync> Command for RequestBevyAssetMirror<A> {
                     state: Err(AssetNoneState::Fetching),
 
                 });
+
+
+                let set_value_tx = asset_state_driver.set_value_tx.clone();
+                let set_tx = asset_state_driver.set_tx.clone();
+                let add_tx = asset_state_driver.add_tx.clone();
+                let queued_state = asset_state_driver.queued_state.clone();
+
+
+                let asset_state_driver_arc = Arc::new(Mutex::new(asset_state_driver));
+
+
+                let asset_state = QueuedSignal::from_parts(
+                    queued_state,
+                    Some(asset_state_driver_arc.clone()),
+                    add_tx,
+                    set_tx,
+                    set_value_tx,
+                );
+
                 let extra_info_driver = WriterDriver::new(AssetUpdateExtraInfo {
                     changed_sender: changed_tx,
                     asset_id: self.asset_id,
                 });
 
-                let asset_state = QueuedSignal::from_parts(
-                    asset_state_driver.queued_state.clone(),
-                    asset_state_driver.add_tx.clone(),
-                    asset_state_driver.set_tx.clone(),
-                    asset_state_driver.set_value_tx.clone(),
-                );
+                let set_value_tx = extra_info_driver.set_value_tx.clone();
+                let set_tx = extra_info_driver.set_tx.clone();
+                let add_tx = extra_info_driver.add_tx.clone();
+                let queued_state = extra_info_driver.queued_state.clone();
+
+
+                let extra_info_driver_arc = Arc::new(Mutex::new(extra_info_driver));
 
                 let extra_info = QueuedSignal::from_parts(
-                    extra_info_driver.queued_state.clone(),
-                    extra_info_driver.add_tx.clone(),
-                    extra_info_driver.set_tx.clone(),
-                    extra_info_driver.set_value_tx.clone(),
+                    queued_state,
+                    Some(extra_info_driver_arc.clone()),
+                    add_tx,
+                    set_tx,
+                    set_value_tx,
                 );
                 let mirror = AssetMaybeMirror {
                     state: asset_state.clone(),
-                    state_driver: Mutex::new(asset_state_driver),
+                    state_driver: asset_state_driver_arc,
                     extra_update_info: extra_info.clone(),
-                    extra_update_info_driver: Mutex::new(extra_info_driver),
+                    extra_update_info_driver: extra_info_driver_arc,
                     tracking_signals: 0,
                 };
                 // let latest_ticket_id = map.asset_id_initialize_tickets.back().unwrap_or(&RequestAssetIdTicket { ticket_id: 0 });
@@ -613,14 +635,16 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
 ) -> AssetMaybeMirrorSignal<A> {
     let ctx = use_context::<CommandQueueSender>();
 
-    // ── 1. Create mirror once (stable hook) ──
     let response = use_hook(|| {
-        let initial_id = *id.read();
+        let initial_id = id.read().unwrap_or_else(|| {
+            let random_uuid = Uuid::new_v4();
+            AssetId::<A>::from(random_uuid)
+        });
         ctx.send_command(|tx| {
             let mut queue = CommandQueue::default();
             queue.push(RequestBevyAssetMirror::<A> {
                 response_tx: tx,
-                asset_id: initial_id.unwrap_or_default(),
+                asset_id: initial_id,
             });
             queue
         }).unwrap()
@@ -629,7 +653,6 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
     let (asset_value_signal, health) = response.asset_state.clone().use_hook();
     let (extra_info_signal, _) = response.extra_info.clone().use_hook();
 
-    // ── 2. Local copy of current asset ID, kept in sync ──
     let mut current_asset_id = use_signal(|| response.extra_info.read().asset_id);
     use_memo(move || {
         if let Some(info) = extra_info_signal.read().as_ref() {
@@ -637,7 +660,6 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
         }
     });
 
-    // ── 3. Mount: send +1 for the current asset ID at mount time ──
     let ctx_clone = ctx.clone();
     use_effect(move || {
         let asset_id = response.extra_info.read().asset_id;
@@ -651,7 +673,6 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
         let _ = ctx_clone.tx.send(queue);
     });
 
-    // ── 4. Unmount: send -1 for the current asset ID ──
     let r = ctx.clone();
     use_drop(move || {
         let asset_id = *current_asset_id.read();
@@ -665,7 +686,6 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
         let _ = r.tx.send(queue);
     });
 
-    // ── 5. ID change: move mirror when wanted ID changes ──
     let mut last_requested_id = use_signal(|| *id.read());
     use_effect(move || {
         let wanted = *id.read();

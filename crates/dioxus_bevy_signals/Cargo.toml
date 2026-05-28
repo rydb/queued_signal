@@ -14,6 +14,7 @@ dioxus-hooks = {workspace = true}
 dioxus-signals = {workspace = true}
 bytemuck = {workspace = true}
 generational-box = {workspace = true}
+parking_lot = {workspace = true}
 flume = {workspace = true}
 queued_signal = {workspace = true}
 trait-set = {workspace = true}

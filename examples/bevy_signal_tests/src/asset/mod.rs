@@ -118,9 +118,29 @@ pub fn ToggleableAsset() -> Element {
         text
     });
 
+    let make_white = move |_| {
+        color.mutate(|n| n.base_color = Color::srgb(1.0, 1.0, 1.0));
+    };
+    let make_more_green = move |_| {
+        color.mutate(|n| {
+            let color_srgb = n.base_color.to_srgba();
+            let new_green = color_srgb.green + 10.0;
+            n.base_color = Color::Srgba(Srgba::rgb(color_srgb.red, new_green, color_srgb.blue))
+        });
+    };
+
+
     rsx! {
         div {
             h2 { {format!("current toggle color: {}", status_string.read())}}
+            button {
+                onclick: make_more_green,
+                "make more green"
+            }
+            button {
+                onclick: make_white,
+                "make white"
+            }
         }
     }
 }
@@ -132,6 +152,7 @@ pub fn AssetCleanupDemo() -> Element {
     let _toggle_handle = move |_| {
         *color_toggled.write() ^= true;
     };
+
     rsx! {
         h2 {
             "unwatched assets cleanup test:"

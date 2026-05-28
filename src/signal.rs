@@ -353,6 +353,8 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
 #[derive(Clone)]
 pub struct QueuedSignal<T: Clone + Send + Sync> {
     pub state: QueuedState<T>,
+    // keep the writer alive as long as this signal exists
+    _driver: Option<Arc<Mutex<WriterDriver<T>>>>,
     add_tx: Sender<MutationOp<T>>,
     set_tx: Sender<MutationOp<T>>,
     set_value_tx: Sender<SetValueOp<T>>,
@@ -375,11 +377,12 @@ impl<T: Clone + Send + Sync + Debug> Debug for QueuedSignal<T> {
 impl<T: Clone + Send + Sync + 'static> QueuedSignal<T> {
     pub fn from_parts(
         state: QueuedState<T>,
+        driver: Option<Arc<Mutex<WriterDriver<T>>>>,
         add_tx: Sender<MutationOp<T>>,
         set_tx: Sender<MutationOp<T>>,
         set_value_tx: Sender<SetValueOp<T>>,
     ) -> Self {
-        Self { state, add_tx, set_tx, set_value_tx }
+        Self { state, _driver: driver, add_tx, set_tx, set_value_tx }
     }
 
     pub fn read(&self) -> TrackedReadGuard<'_, T> { self.state.read() }
@@ -428,7 +431,9 @@ pub fn use_queued_signal<T: Clone + Send + Sync + 'static>(
                     Ok(()) = notify_rx.changed() => {
                         // let current_version = *notify_rx.borrow();
 
-                        let guard = read_handle.enter().unwrap();
+                        let Some(guard) = read_handle.enter() else {
+                            break
+                        };
                         let reader_id = registry.register();
                         registry.heartbeat(reader_id);
 

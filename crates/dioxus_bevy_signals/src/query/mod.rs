@@ -1,4 +1,4 @@
-use std::{any::{TypeId, type_name, type_name_of_val}, collections::{HashMap, HashSet}, fmt::Debug, marker::PhantomData, ops::Deref, sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}}, time::Duration};
+use std::{any::{TypeId, type_name, type_name_of_val}, collections::{HashMap, HashSet}, fmt::Debug, marker::PhantomData, ops::Deref, sync::{Arc, atomic::{AtomicU64, Ordering}}, time::Duration};
 
 use bevy_app::{Last, PostUpdate, Update};
 use bevy_ecs::{component::Mutable, prelude::*, query::{QueryData, QueryFilter}, world::CommandQueue};
@@ -7,6 +7,7 @@ use dioxus_core::{use_drop, use_hook};
 use dioxus_hooks::{use_context, use_effect, use_on_unmount};
 use dioxus_signals::{ReadableExt, Signal};
 use flume::Sender;
+use parking_lot::Mutex;
 use queued_signal::signal::{HealthStatus, QueuedSignal, WriterDriver};
 use trait_set::trait_set;
 
@@ -31,9 +32,8 @@ fn drive_component_signals<T: DioxusComponentSync>(
     tick_rate: Res<ComponentSyncTickRate>,
 ) {
     for component in components {
-        if let Ok(mut guard) = component.driver.lock().inspect_err(|err| warn!("UNABLE TO AQUIRE LOCK FOR {}, : {}", type_name::<T>(), err)) {
-            guard.tick(tick_rate.0);
-        }
+        let mut guard = component.driver.lock();
+        guard.tick(tick_rate.0);
     }
 }
 
@@ -44,9 +44,8 @@ fn drive_query_signal<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>(
     driver: ResMut<MirrorQueryWriteDriver<Q, F>>,
     tick_rate: Res<QuerySyncTickRate>,
 ) {
-    if let Ok(mut guard) = driver.0.lock().inspect_err(|err| warn!("UNABLE TO AQUIRE LOCK FOR {}, : {}", type_name::<Q>().to_owned() + type_name::<F>(), err)) {
-        guard.tick(tick_rate.0);
-    }
+    let mut guard = driver.0.lock();
+    guard.tick(tick_rate.0);
 }
 
 /// mirrored version of bevy component + infastructure for queries
@@ -55,7 +54,7 @@ pub struct DioxusMirror<T: DioxusComponentSync> {
     pub value: QueuedSignal<T>,
 
     /// driver for this component to make signal associated with it tick
-    pub(crate) driver: Mutex<WriterDriver<T>>,
+    pub(crate) driver: Arc<Mutex<WriterDriver<T>>>,
 
     pub version: Arc<AtomicU64>,
 }
@@ -134,16 +133,30 @@ impl<T: DioxusComponentSync> DioxusMirror<T> {
     /// initialize DioxusMirror and decompose it into its other dependent components (for impl Bundle)
     pub fn init_and_decompose<Q: DioxusQuerySync, F: QueryFilter + 'static>(value: T) -> (Self, DioxusTrackingQueries<T>) {
         
+
+        
         let mut driver = WriterDriver::new(value.clone());
+
+        let set_value_tx = driver.set_value_tx.clone();
+        let set_tx = driver.set_tx.clone();
+        let add_tx = driver.add_tx.clone();
+        let queued_state = driver.queued_state.clone();
+
         let version = Arc::new(AtomicU64::new(0));
         driver.set_publish_counter(version.clone());
+
+        let driver_arc = Arc::new(Mutex::new(driver));
+
+
+        
+
         
         let mut map = HashMap::new();
         map.insert(query_to_tracking_id::<Q, F>(), 0);
         (
             Self {
-            value: QueuedSignal::from_parts(driver.queued_state.clone(), driver.add_tx.clone(), driver.set_tx.clone(), driver.set_value_tx.clone()),
-            driver: Mutex::new(driver),
+            value: QueuedSignal::from_parts(queued_state, Some(driver_arc.clone()), add_tx, set_tx, set_value_tx),
+            driver: driver_arc,
             version
         },
         DioxusTrackingQueries {
@@ -384,9 +397,19 @@ impl<T: DioxusQuerySync + 'static, F: QueryFilter> Command for RequestQueryMirro
                     active: true,
                     _phantom: || PhantomData::default(),
                 })));
-                let signal = QueuedSignal::from_parts(query_driver.queued_state.clone(), query_driver.add_tx.clone(), query_driver.set_tx.clone(), query_driver.set_value_tx.clone());
+
+
+                let set_value_tx = query_driver.set_value_tx.clone();
+                let set_tx = query_driver.set_tx.clone();
+                let add_tx = query_driver.add_tx.clone();
+                let queued_state = query_driver.queued_state.clone();
+
+                let driver_arc = Arc::new(Mutex::new(query_driver));
+
+
+                let signal = QueuedSignal::from_parts(queued_state, Some(driver_arc.clone()), add_tx, set_tx, set_value_tx);
                 
-                world.insert_resource(MirrorQueryWriteDriver(Mutex::new(query_driver)));
+                world.insert_resource(MirrorQueryWriteDriver(driver_arc));
                 world.insert_resource(QuerySyncTickRate(Duration::ZERO));
                 world.insert_resource(MirrorQuerySignal(signal.clone()));
                 world.insert_resource(QueryMirrorInitailized::<T, F> {
@@ -653,7 +676,7 @@ pub struct MirrorQuerySignal<Q: MirrorQueryData, F: QueryFilter>(QueuedSignal<Mi
 
 /// write driver to make query updates tick for QuerySignal
 #[derive(Resource)]
-pub struct MirrorQueryWriteDriver<Q: DioxusQuerySync, F: QueryFilter>(Mutex<WriterDriver<MirrorQuery<Q, F>>>);
+pub struct MirrorQueryWriteDriver<Q: DioxusQuerySync, F: QueryFilter>(Arc<Mutex<WriterDriver<MirrorQuery<Q, F>>>>);
 
 /// Handle to mirror version fo bevy query, that can be used from dioxus.
 pub struct MirrorQuerySignalHandle<Q: MirrorQueryData, F: QueryFilter> {

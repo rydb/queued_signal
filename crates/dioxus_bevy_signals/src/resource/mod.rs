@@ -7,11 +7,12 @@ use dioxus_hooks::{use_context, use_signal};
 use dioxus::prelude::*;
 use dioxus_signals::{ReadableExt, Signal};
 use flume::Sender;
+use parking_lot::Mutex;
 use queued_signal::signal::{HealthStatus, QueuedSignal, WriterDriver, SetValueOp};
 use std::any::{TypeId, type_name};
 use std::collections::HashSet;
 use std::ops::Deref;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc};
 use trait_set::trait_set;
 use std::time::Duration;
 
@@ -25,7 +26,7 @@ trait_set! {
 }
 
 #[derive(Resource)]
-pub struct ResourceWriteDriver<T: ResourceDioxusSync>(pub Mutex<WriterDriver<T>>);
+pub struct ResourceWriteDriver<T: ResourceDioxusSync>(pub Arc<Mutex<WriterDriver<T>>>);
 
 struct RequestBevyResource<T: ResourceDioxusSync> {
     response_tx: Sender<QueuedSignal<T>>,
@@ -52,13 +53,21 @@ impl<T: ResourceDioxusSync> Command for RequestBevyResource<T> {
                 };
 
                 let driver = WriterDriver::new(resource.clone());
+                let set_value_tx = driver.set_value_tx.clone();
+                let set_tx = driver.set_tx.clone();
+                let add_tx = driver.add_tx.clone();
+                let queued_state = driver.queued_state.clone();
+
+                let driver_arc = Arc::new(Mutex::new(driver));
+
                 let signal = QueuedSignal::from_parts(
-                    driver.queued_state.clone(),
-                    driver.add_tx.clone(),
-                    driver.set_tx.clone(),
-                    driver.set_value_tx.clone(), 
+                    queued_state,
+                    Some(driver_arc.clone()),
+                    add_tx,
+                    set_tx,
+                    set_value_tx, 
                 );
-                world.insert_resource(ResourceWriteDriver(Mutex::new(driver)));
+                world.insert_resource(ResourceWriteDriver(driver_arc));
 
                 // tick the resources 60 times a second (If uninitialized) by default to match standard FPS settings.
                 world.get_resource_or_insert_with(|| ResourceSyncTickRate(Duration::from_millis(16)));
@@ -111,9 +120,8 @@ fn drive_signal<T: ResourceDioxusSync>(
     driver: Res<ResourceWriteDriver<T>>,
     tick_rate: Res<ResourceSyncTickRate>,
 ) {
-    if let Ok(mut guard) = driver.0.lock().inspect_err(|err| warn!("UNABLE TO AQUIRE LOCK: {}", err)) {
-        guard.tick(tick_rate.0);
-    }
+    let mut guard = driver.0.lock();
+    guard.tick(tick_rate.0);
 }
 
 /// Dioxus signal for managing bevy resource <-> dioxus interop.
