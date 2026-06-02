@@ -1,27 +1,41 @@
-use std::{any::{TypeId, type_name, type_name_of_val}, collections::{HashMap, HashSet}, fmt::Debug, marker::PhantomData, ops::Deref, sync::{Arc, atomic::{AtomicU64, Ordering}}, time::Duration};
+use std::{
+    any::TypeId,
+    collections::{HashMap, HashSet},
+    fmt::Debug,
+    marker::PhantomData,
+    ops::Deref,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
+pub(crate) use crate::macros::*;
 use bevy_app::{Last, PostUpdate, Update};
-use bevy_ecs::{component::Mutable, prelude::*, query::{QueryData, QueryFilter}, world::CommandQueue};
+use bevy_ecs::{
+    component::Mutable,
+    prelude::*,
+    query::{QueryData, QueryFilter},
+    world::CommandQueue,
+};
 use dioxus_core::{use_drop, use_hook};
-use dioxus_hooks::{use_context, use_effect, use_on_unmount};
+use dioxus_hooks::{use_context, use_effect};
 use dioxus_signals::{ReadableExt, Signal};
 use flume::Sender;
 use parking_lot::Mutex;
-use queued_signal::{signal::{HealthStatus, QueuedSignal, WriterDriver}};
+use queued_signal::signal::{HealthStatus, QueuedSignal, WriterDriver};
 use trait_set::trait_set;
-pub(crate) use crate::macros::*;
 
 use crate::{CommandQueueSender, add_systems_through_world};
 
-
 trait_set! {
     /// Component that is syncable with dioxus
-    /// 
+    ///
     /// TODO: support immutable components as well
     pub trait DioxusComponentSync = Component<Mutability = Mutable> + Clone + 'static;
     pub trait DioxusQuerySync = MirrorQueryData + Send + Sync;
 }
-
 
 /// Minimum time to pass til queued mutations from QueuedSignal are published. The time to publish may be longer then this duration, but no shorter then this duration.
 #[derive(Resource)]
@@ -61,19 +75,24 @@ pub struct DioxusMirror<T: DioxusComponentSync> {
 
 #[derive(Component)]
 pub struct DioxusTrackingQueries<T: DioxusComponentSync> {
-    pub tracking_counts: HashMap<(TypeId, TypeId), i32>,    
+    pub tracking_counts: HashMap<(TypeId, TypeId), i32>,
     _component: PhantomData<T>,
 }
 
 impl<T: DioxusComponentSync + Debug> Debug for DioxusMirror<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DioxusMirror").field("value", &self.value).field("driver", &self.driver).finish()
+        f.debug_struct("DioxusMirror")
+            .field("value", &self.value)
+            .field("driver", &self.driver)
+            .finish()
     }
 }
 
-impl<T: DioxusComponentSync> DioxusMirror<T>{
+impl<T: DioxusComponentSync> DioxusMirror<T> {
     pub fn handle(&self) -> DioxusMirrorHandle<T> {
-        DioxusMirrorHandle { value: self.value.clone()}
+        DioxusMirrorHandle {
+            value: self.value.clone(),
+        }
     }
 }
 
@@ -92,7 +111,10 @@ pub struct MirrorQueryHandleCount<Q: MirrorQueryData, F: QueryFilter> {
 
 impl<Q: MirrorQueryData, F: QueryFilter> Default for MirrorQueryHandleCount<Q, F> {
     fn default() -> Self {
-        Self { count: Default::default(), _phantom: || Default::default() }
+        Self {
+            count: Default::default(),
+            _phantom: || Default::default(),
+        }
     }
 }
 
@@ -111,7 +133,10 @@ impl<Q: MirrorQueryData, F: QueryFilter> PartialEq for MirrorQueryActive<Q, F> {
 
 impl<Q: MirrorQueryData, F: QueryFilter> Default for MirrorQueryActive<Q, F> {
     fn default() -> Self {
-        Self { active: Default::default(), _phantom: || Default::default() }
+        Self {
+            active: Default::default(),
+            _phantom: || Default::default(),
+        }
     }
 }
 
@@ -131,10 +156,9 @@ fn query_to_tracking_id<Q: DioxusQuerySync, F: QueryFilter + 'static>() -> (Type
 
 impl<T: DioxusComponentSync> DioxusMirror<T> {
     /// initialize DioxusMirror and decompose it into its other dependent components (for impl Bundle)
-    pub fn init_and_decompose<Q: DioxusQuerySync, F: QueryFilter + 'static>(value: T) -> (Self, DioxusTrackingQueries<T>) {
-        
-
-        
+    pub fn init_and_decompose<Q: DioxusQuerySync, F: QueryFilter + 'static>(
+        value: T,
+    ) -> (Self, DioxusTrackingQueries<T>) {
         let mut driver = WriterDriver::new(value.clone());
 
         let set_value_tx = driver.set_value_tx.clone();
@@ -147,28 +171,27 @@ impl<T: DioxusComponentSync> DioxusMirror<T> {
 
         let driver_arc = Arc::new(Mutex::new(driver));
 
-
-        
-
-        
         let mut map = HashMap::new();
         map.insert(query_to_tracking_id::<Q, F>(), 0);
         (
             Self {
-            value: QueuedSignal::from_parts(queued_state, Some(driver_arc.clone()), add_tx, set_tx, set_value_tx),
-            driver: driver_arc,
-            version
-        },
-        DioxusTrackingQueries {
-            tracking_counts: map,
-            _component: PhantomData
-        }
+                value: QueuedSignal::from_parts(
+                    queued_state,
+                    Some(driver_arc.clone()),
+                    add_tx,
+                    set_tx,
+                    set_value_tx,
+                ),
+                driver: driver_arc,
+                version,
+            },
+            DioxusTrackingQueries {
+                tracking_counts: map,
+                _component: PhantomData,
+            },
         )
     }
 }
-
-
-
 
 /// Copies the current value of a Dioxus‑side signal back into the Bevy component,
 /// but only when the signal has been updated since the last sync for that entity.
@@ -198,7 +221,8 @@ pub fn delete_unused_mirrors<T: DioxusComponentSync>(
     for (entity, tracker) in &trackers {
         // println!("current tracker values: {}", tracker.tracking_counts);
         if tracker.tracking_counts.is_empty() {
-            commands.entity(entity)
+            commands
+                .entity(entity)
                 .remove::<DioxusMirror<T>>()
                 .remove::<DioxusTrackingQueries<T>>();
         }
@@ -207,29 +231,29 @@ pub fn delete_unused_mirrors<T: DioxusComponentSync>(
 
 /// sync components to their changed mirrors
 pub fn sync_mirror_to_component<T: DioxusComponentSync>(
-	mut components: Query<(&T, &DioxusMirror<T>), Changed<T>>
-
+    mut components: Query<(&T, &DioxusMirror<T>), Changed<T>>,
 ) {
-     for (value,  mirror) in &mut components {
+    for (value, mirror) in &mut components {
         let _ = mirror.value.set_value(value.clone().into());
-
     }
 }
 
-
-
 /// Accumulates tracking delta requests for batch processing.
 #[derive(Resource)]
-struct PendingQueryTrackingDeltas<Q: MirrorQueryData, F: QueryFilter> { 
+struct PendingQueryTrackingDeltas<Q: MirrorQueryData, F: QueryFilter> {
     /// cummulative tracking delta
     pending: i32,
     _querydata: fn() -> PhantomData<Q>,
-    _filter: fn() -> PhantomData<F>
+    _filter: fn() -> PhantomData<F>,
 }
 
 impl<Q: MirrorQueryData, F: QueryFilter> Default for PendingQueryTrackingDeltas<Q, F> {
     fn default() -> Self {
-        Self { pending: Default::default(), _querydata: || Default::default(), _filter: || Default::default() }
+        Self {
+            pending: Default::default(),
+            _querydata: || Default::default(),
+            _filter: || Default::default(),
+        }
     }
 }
 
@@ -238,7 +262,9 @@ pub struct UpdateTrackingQueries<Q: DioxusQuerySync, F: QueryFilter> {
     _phantom: fn() -> PhantomData<(Q, F)>,
 }
 
-impl<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static> Command for UpdateTrackingQueries<Q, F> {
+impl<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static> Command
+    for UpdateTrackingQueries<Q, F>
+{
     fn apply(self, world: &mut World) -> () {
         let mut pending_delta = world.get_resource_or_init::<PendingQueryTrackingDeltas<Q, F>>();
         pending_delta.pending += self.delta;
@@ -279,23 +305,23 @@ pub fn sync_query_mirror_to_signal<T: DioxusQuerySync + 'static, F: QueryFilter 
     mut commands: Commands,
     mut init_status: ResMut<QueryMirrorInitailized<T, F>>,
 ) {
-
     // wait until all components have been synced (that are visible to this query), before running a full sync
     if components_without_signals.count() <= 0 {
         // if the map has not been initailized yet, force a full sync in order to get it up to data
         if init_status.initialized == false {
-            let current_map = mirror_components.iter()
-            .map(|item| {
-                (T::get_mirror_entity(&item), T::clone_dioxus_signals(&item))
-            }).collect::<HashMap<_, _>>();
-            mirror_signal.0.set_value(
-                Arc::new(
-                MirrorQuery {
-                    value: current_map,
-                    _marker: PhantomData::default()
+            let current_map = mirror_components
+                .iter()
+                .map(|item| (T::get_mirror_entity(&item), T::clone_dioxus_signals(&item)))
+                .collect::<HashMap<_, _>>();
+            mirror_signal.0.set_value(Arc::new(MirrorQuery {
+                value: current_map,
+                _marker: PhantomData::default(),
             }));
             init_status.initialized = true;
-            trace!("finished initializing component mirror to: {}", mirror_components.iter().count());
+            trace!(
+                "finished initializing component mirror to: {}",
+                mirror_components.iter().count()
+            );
             return;
         }
     }
@@ -309,7 +335,6 @@ pub fn sync_query_mirror_to_signal<T: DioxusQuerySync + 'static, F: QueryFilter 
 
     let mut add_map = HashMap::new();
     let mut remove_list = Vec::new();
-
 
     let last_map = &mirror_signal.0.read().value;
 
@@ -328,14 +353,14 @@ pub fn sync_query_mirror_to_signal<T: DioxusQuerySync + 'static, F: QueryFilter 
             add_map.insert(entity, value);
         }
     }
-    
+
     if remove_list.len() > 0 || add_map.len() > 0 {
         let remove_list = remove_list.iter().map(|n| **n).collect::<Vec<_>>();
 
-        let add_map = add_map.iter()
-        .map(|item| {
-            (item.0.clone(), T::clone_dioxus_signals(item.1))
-        }).collect::<HashMap<_, _>>();
+        let add_map = add_map
+            .iter()
+            .map(|item| (item.0.clone(), T::clone_dioxus_signals(item.1)))
+            .collect::<HashMap<_, _>>();
 
         mirror_signal.0.mutate_set(move |n| {
             let map = &mut n.value;
@@ -348,17 +373,18 @@ pub fn sync_query_mirror_to_signal<T: DioxusQuerySync + 'static, F: QueryFilter 
     }
 }
 
-
 #[derive(Resource, Default)]
 pub struct MirroredComponents(HashSet<TypeId>);
 
 pub struct RequestComponentsMirror<T: DioxusComponentSync> {
-    _marker: PhantomData<T>
+    _marker: PhantomData<T>,
 }
 
 impl<T: DioxusComponentSync> Default for RequestComponentsMirror<T> {
     fn default() -> Self {
-        Self { _marker: Default::default() }
+        Self {
+            _marker: Default::default(),
+        }
     }
 }
 
@@ -369,7 +395,7 @@ impl<T: DioxusComponentSync> Command for RequestComponentsMirror<T> {
             new_map.0.insert(TypeId::of::<T>());
             new_map
         });
-        if !mirrored_components.0.contains(&TypeId::of::<T>()) {      
+        if !mirrored_components.0.contains(&TypeId::of::<T>()) {
             add_systems_through_world(world, Update, drive_component_signals::<T>);
             add_systems_through_world(world, PostUpdate, sync_component_to_mirror::<T>);
             add_systems_through_world(world, PostUpdate, sync_mirror_to_component::<T>);
@@ -385,52 +411,66 @@ pub struct RequestQueryMirror<T: DioxusQuerySync, F: QueryFilter + 'static> {
 
 impl<T: DioxusQuerySync + 'static, F: QueryFilter> Command for RequestQueryMirror<T, F> {
     fn apply(self, world: &mut World) -> () {
-        let signal_to_send: QueuedSignal<MirrorQuery<T, F>> = match world.get_resource::<MirrorQuerySignal<T, F>>() {
-            Some(signal) => signal.0.clone(),
-            None => {
-                T::register_mirror_sync_systems::<F>(world);
+        let signal_to_send: QueuedSignal<MirrorQuery<T, F>> =
+            match world.get_resource::<MirrorQuerySignal<T, F>>() {
+                Some(signal) => signal.0.clone(),
+                None => {
+                    T::register_mirror_sync_systems::<F>(world);
 
-                let query_driver = WriterDriver::new(MirrorQuery::default());
-                add_systems_through_world(world, Update, drive_query_signal::<T, F>);
-                add_systems_through_world(world, PostUpdate, apply_tracking_queries_delta::<T, F>.run_if(resource_changed::<PendingQueryTrackingDeltas::<T, F>>));
-                add_systems_through_world(world, Last, sync_query_mirror_to_signal::<T, F>.run_if(resource_equals(MirrorQueryActive::<T, F> {
-                    active: true,
-                    _phantom: || PhantomData::default(),
-                })));
+                    let query_driver = WriterDriver::new(MirrorQuery::default());
+                    add_systems_through_world(world, Update, drive_query_signal::<T, F>);
+                    add_systems_through_world(
+                        world,
+                        PostUpdate,
+                        apply_tracking_queries_delta::<T, F>
+                            .run_if(resource_changed::<PendingQueryTrackingDeltas<T, F>>),
+                    );
+                    add_systems_through_world(
+                        world,
+                        Last,
+                        sync_query_mirror_to_signal::<T, F>.run_if(resource_equals(
+                            MirrorQueryActive::<T, F> {
+                                active: true,
+                                _phantom: || PhantomData::default(),
+                            },
+                        )),
+                    );
 
+                    let set_value_tx = query_driver.set_value_tx.clone();
+                    let set_tx = query_driver.set_tx.clone();
+                    let add_tx = query_driver.add_tx.clone();
+                    let queued_state = query_driver.queued_state.clone();
 
-                let set_value_tx = query_driver.set_value_tx.clone();
-                let set_tx = query_driver.set_tx.clone();
-                let add_tx = query_driver.add_tx.clone();
-                let queued_state = query_driver.queued_state.clone();
+                    let driver_arc = Arc::new(Mutex::new(query_driver));
 
-                let driver_arc = Arc::new(Mutex::new(query_driver));
+                    let signal = QueuedSignal::from_parts(
+                        queued_state,
+                        Some(driver_arc.clone()),
+                        add_tx,
+                        set_tx,
+                        set_value_tx,
+                    );
 
-
-                let signal = QueuedSignal::from_parts(queued_state, Some(driver_arc.clone()), add_tx, set_tx, set_value_tx);
-                
-                world.insert_resource(MirrorQueryWriteDriver(driver_arc));
-                world.insert_resource(QuerySyncTickRate(Duration::ZERO));
-                world.insert_resource(MirrorQuerySignal(signal.clone()));
-                world.insert_resource(QueryMirrorInitailized::<T, F> {
-                    initialized: false,
-                    _querydata: || PhantomData::default(),
-                    _filter: || PhantomData::default(),
-                });
-                world.insert_resource(MirrorQueryActive::<T, F> {
-                    active: false,
-                    _phantom: || PhantomData::default()
-                });
-                world.insert_resource(MirrorQueryHandleCount::<T, F> {
-                    count: 0,
-                    _phantom: || PhantomData::default()
-                });
-                world.init_resource::<PendingQueryTrackingDeltas::<T, F>>();
-                signal
-
-
-            },
-        };
+                    world.insert_resource(MirrorQueryWriteDriver(driver_arc));
+                    world.insert_resource(QuerySyncTickRate(Duration::ZERO));
+                    world.insert_resource(MirrorQuerySignal(signal.clone()));
+                    world.insert_resource(QueryMirrorInitailized::<T, F> {
+                        initialized: false,
+                        _querydata: || PhantomData::default(),
+                        _filter: || PhantomData::default(),
+                    });
+                    world.insert_resource(MirrorQueryActive::<T, F> {
+                        active: false,
+                        _phantom: || PhantomData::default(),
+                    });
+                    world.insert_resource(MirrorQueryHandleCount::<T, F> {
+                        count: 0,
+                        _phantom: || PhantomData::default(),
+                    });
+                    world.init_resource::<PendingQueryTrackingDeltas<T, F>>();
+                    signal
+                }
+            };
 
         let _ = self.response_tx.send(signal_to_send);
     }
@@ -441,15 +481,14 @@ impl<T: DioxusQuerySync + 'static, F: QueryFilter> Command for RequestQueryMirro
 /// let signal = MirrorQuery<(Entity, &mut A, &mut B)> -> Query<(Entity, &mut DioxusMirror<A>, &mut DioxusMirror<B>)> -> HashMap<Entity, (Entity, DioxusMirror<A>, DioxusMirror<B>)> -> QueuedQuerySignal
 /// ```
 pub trait MirrorQueryData: QueryData {
-    
     /// query item results for mirror items of query;
-    /// 
+    ///
     /// E.G;
     type MirrorItem: Send + Sync + 'static;
 
     /// query item handles to the results for mirror items of query,
-    /// 
-    /// E.G; if `MirrorItem` is 
+    ///
+    /// E.G; if `MirrorItem` is
     /// ```rust
     /// (Entity, DioxusMirror<A>, DioxusMirror<A>)
     /// ```
@@ -460,19 +499,19 @@ pub trait MirrorQueryData: QueryData {
     type MirrorItemHandles: Clone + Send + Sync + 'static;
 
     /// query as its DioxusMirror<T> encapsulated variant.
-    /// 
-    /// E.G; if MirrorQueryData is 
-    /// 
+    ///
+    /// E.G; if MirrorQueryData is
+    ///
     /// ```rust
     /// Query<(Entity, &mut A, &mut B)>
     /// ```
-    /// 
+    ///
     /// This would be:
-    /// 
+    ///
     /// ```rust
     /// Query<(Entity, &mut DioxusMirror<A>, &mut DioxusMirror<B>)>
     /// ```
-    /// 
+    ///
     // type MirrorSignalsQueryDataMut: QueryData;
 
     /// immutable version of [`MirrorSignalsQueryDataMut`]
@@ -481,83 +520,91 @@ pub trait MirrorQueryData: QueryData {
     /// Query filter version of query data signals to check for components which DON'T, have DioxusMirrors attached which should.
     type MirrorSignalsWithoutFilter: QueryFilter;
 
-    /// the max number of entries this query is allowed to track. 
-    /// 
+    /// the max number of entries this query is allowed to track.
+    ///
     /// if there exists more matches then this number, then query is cleared and no longer tracked.
-    /// 
+    ///
     /// This exists in order to prevent un-optimized queries from marking every single world component to sync.
-    /// 
-    /// E.G: 
+    ///
+    /// E.G:
     /// ```rust
     /// QueryMirror<Entity, &mut A> // -> 2 million entities with A -> 2 million A(s) marked for sync on update.
     /// ```
-    /// 
-    /// 
+    ///
+    ///
     /// vs
-    /// 
+    ///
     /// ```rust
     /// QueryMirror<Entity, &mut A, With<Marker>> //-> 20 entries with A + marker -> 20 A(s) marked for sync on update.
     /// ```
-    /// 
+    ///
     /// entities in a query iter are un-ordered, so its not possible to make a "shallow iterator" that could go from x..y range of entries
-    /// 
+    ///
     /// What can be garunteed though, is that there are x or less number of entries. So this exists as a stop-gap for optimization.
-    /// 
+    ///
     /// TODO: Implement a better solution
     const MAX_TRACKED_COUNT: usize = 2000;
 
     /// filter for entities with changed MirrorComponents.
-    /// 
+    ///
     /// used for query sync to only sync when work has been done
     type MirrorSignalsChangedFilter: QueryFilter;
 
-    /// queries that are tracking the components in [`MirrorItem`], e.g; 
-    /// 
+    /// queries that are tracking the components in [`MirrorItem`], e.g;
+    ///
     /// if query is:
-    /// 
+    ///
     /// ```rust
     /// Query<(Entity, &mut A, &mut B)>
     /// ```
     ///
-    /// 
+    ///
     /// this will be
     /// ```rust
     /// Query<(Entity, &mut DioxusTrackingQueries<A>, &mut DioxusTrackingQueries<B>)>
     /// ```
     type TrackingQueriesQuerydataMut: QueryData;
 
-    /// queues commands for dioxus mirror <-> bevy value sync setup 
+    /// queues commands for dioxus mirror <-> bevy value sync setup
     fn register_mirror_sync_systems<F: QueryFilter>(world: &mut World);
 
     /// get the entity of the mirror version of the bevy query
-    /// 
+    ///
     /// E.G, for:
-    /// 
+    ///
     /// Query<(Entity, &mut DioxusMirror<A>, &mut DioxusMirror<B>)>
     fn get_mirror_entity<'w, 's>(
         // item: &<<Self as MirrorQueryData>::MirrorSignalsQueryDataImMut as QueryData>::Item<'w, 's>,
-        item: &<<Self::MirrorSignalsQueryDataImMut as QueryData>::ReadOnly as QueryData>::Item<'w, 's>
+        item: &<<Self::MirrorSignalsQueryDataImMut as QueryData>::ReadOnly as QueryData>::Item<
+            'w,
+            's,
+        >,
     ) -> Entity;
     /// get the entity of the original bevy query:
-    /// 
+    ///
     /// E.G, for:
     /// QueryMirror<(Entity, &mut A, &mut B)>
-    fn get_query_entity<'w, 's>(
-        item: &Self::Item<'w, 's>
-    ) -> Entity;
+    fn get_query_entity<'w, 's>(item: &Self::Item<'w, 's>) -> Entity;
 
     /// get the mirrored components as an insertable bundle
-    fn get_mirror_bundle<'w, 's, F: QueryFilter + 'static>(item: Self::Item<'w, 's>) -> impl Bundle;
+    fn get_mirror_bundle<'w, 's, F: QueryFilter + 'static>(item: Self::Item<'w, 's>)
+    -> impl Bundle;
 
     // /// increment/decrement the number of tracking queries per mirror item
     // fn increment_tracking_queries<'w, 's>(item: <Self::TrackingQueriesQuerydataMut as QueryData>::Item<'w, 's>, delta: u32);
 
     /// increment/decrement the number of tracking queries per mirror item
-    fn apply_tracking_delta<'w, 's, F: QueryFilter + 'static>(item: <Self::TrackingQueriesQuerydataMut as QueryData>::Item<'w, 's>, delta: i32);
+    fn apply_tracking_delta<'w, 's, F: QueryFilter + 'static>(
+        item: <Self::TrackingQueriesQuerydataMut as QueryData>::Item<'w, 's>,
+        delta: i32,
+    );
 
     /// clone `Query<(&mut DioxusMirror<A>, ...)>::Item<'w, 's>`(borrowed `MirrorItem`) to owned `MirrorItem`
     fn clone_dioxus_signals<'w, 's>(
-        item: &<<Self::MirrorSignalsQueryDataImMut as QueryData>::ReadOnly as QueryData>::Item<'w, 's>,
+        item: &<<Self::MirrorSignalsQueryDataImMut as QueryData>::ReadOnly as QueryData>::Item<
+            'w,
+            's,
+        >,
     ) -> Self::MirrorItemHandles;
 }
 
@@ -574,41 +621,62 @@ impl<A: DioxusComponentSync, B: DioxusComponentSync> MirrorQueryData for (Entity
 
     type MirrorSignalsChangedFilter = Or<(Changed<DioxusMirror<A>>, Changed<DioxusMirror<B>>)>;
 
-    type TrackingQueriesQuerydataMut = (Entity, &'static mut DioxusTrackingQueries<A>, &'static mut DioxusTrackingQueries<B>) ;
+    type TrackingQueriesQuerydataMut = (
+        Entity,
+        &'static mut DioxusTrackingQueries<A>,
+        &'static mut DioxusTrackingQueries<B>,
+    );
 
     fn register_mirror_sync_systems<F: QueryFilter>(world: &mut World) {
-        world.commands().queue(RequestComponentsMirror::<A>::default());
-        world.commands().queue(RequestComponentsMirror::<B>::default());
-
+        world
+            .commands()
+            .queue(RequestComponentsMirror::<A>::default());
+        world
+            .commands()
+            .queue(RequestComponentsMirror::<B>::default());
     }
 
     fn get_mirror_entity<'w, 's>(
-        item: &<<Self::MirrorSignalsQueryDataImMut as QueryData>::ReadOnly as QueryData>::Item<'w, 's>,
+        item: &<<Self::MirrorSignalsQueryDataImMut as QueryData>::ReadOnly as QueryData>::Item<
+            'w,
+            's,
+        >,
     ) -> Entity {
         item.0
     }
 
-    fn get_mirror_bundle<'w, 's, F: QueryFilter + 'static>(item: Self::Item<'w, 's>) -> impl Bundle {
-        (DioxusMirror::init_and_decompose::<Self, F>(item.1.clone()), DioxusMirror::init_and_decompose::<Self, F>(item.2.clone()))
+    fn get_mirror_bundle<'w, 's, F: QueryFilter + 'static>(
+        item: Self::Item<'w, 's>,
+    ) -> impl Bundle {
+        (
+            DioxusMirror::init_and_decompose::<Self, F>(item.1.clone()),
+            DioxusMirror::init_and_decompose::<Self, F>(item.2.clone()),
+        )
     }
 
     fn clone_dioxus_signals<'w, 's>(
-        item: &<<Self::MirrorSignalsQueryDataImMut as QueryData>::ReadOnly as QueryData>::Item<'w, 's>,
+        item: &<<Self::MirrorSignalsQueryDataImMut as QueryData>::ReadOnly as QueryData>::Item<
+            'w,
+            's,
+        >,
     ) -> Self::MirrorItemHandles {
         (item.0, item.1.handle(), item.2.handle())
     }
-    
-    fn get_query_entity<'w, 's>(
-        item: &Self::Item<'w, 's>
-    ) -> Entity {
+
+    fn get_query_entity<'w, 's>(item: &Self::Item<'w, 's>) -> Entity {
         item.0
     }
-    
-    fn apply_tracking_delta<'w, 's, F: QueryFilter + 'static>(mut item: <Self::TrackingQueriesQuerydataMut as QueryData>::Item<'w, 's>, delta: i32) {
-        
-        
+
+    fn apply_tracking_delta<'w, 's, F: QueryFilter + 'static>(
+        mut item: <Self::TrackingQueriesQuerydataMut as QueryData>::Item<'w, 's>,
+        delta: i32,
+    ) {
         let id = query_to_tracking_id::<Self, F>();
-        let current_delta = item.1.tracking_counts.entry(query_to_tracking_id::<Self, F>()).or_insert(0);
+        let current_delta = item
+            .1
+            .tracking_counts
+            .entry(query_to_tracking_id::<Self, F>())
+            .or_insert(0);
         *current_delta += delta;
 
         if current_delta <= &mut 0 {
@@ -616,25 +684,31 @@ impl<A: DioxusComponentSync, B: DioxusComponentSync> MirrorQueryData for (Entity
         }
 
         let id = query_to_tracking_id::<Self, F>();
-        let current_delta = item.2.tracking_counts.entry(query_to_tracking_id::<Self, F>()).or_insert(0);
+        let current_delta = item
+            .2
+            .tracking_counts
+            .entry(query_to_tracking_id::<Self, F>())
+            .or_insert(0);
         *current_delta += delta;
 
         if current_delta <= &mut 0 {
             item.2.tracking_counts.remove(&id);
         }
     }
-    
 }
 // // registry of the latest dioxus clones of the matching query
 // #[derive(Resource)]
 pub struct MirrorQuery<Q: MirrorQueryData, F: QueryFilter> {
     value: HashMap<Entity, Q::MirrorItemHandles>,
-    _marker: PhantomData<fn() ->F>
+    _marker: PhantomData<fn() -> F>,
 }
 
 impl<Q: MirrorQueryData, F: QueryFilter> Clone for MirrorQuery<Q, F> {
     fn clone(&self) -> Self {
-        Self { value: self.value.clone(), _marker: self._marker.clone() }
+        Self {
+            value: self.value.clone(),
+            _marker: self._marker.clone(),
+        }
     }
 }
 
@@ -667,7 +741,10 @@ where
 
 impl<T: MirrorQueryData, F: QueryFilter> Default for MirrorQuery<T, F> {
     fn default() -> Self {
-        Self { value: Default::default(), _marker: Default::default() }
+        Self {
+            value: Default::default(),
+            _marker: Default::default(),
+        }
     }
 }
 /// A mirror version of bevy query, that holds `QueuedSignal<T>` of matching components
@@ -676,7 +753,9 @@ pub struct MirrorQuerySignal<Q: MirrorQueryData, F: QueryFilter>(QueuedSignal<Mi
 
 /// write driver to make query updates tick for QuerySignal
 #[derive(Resource)]
-pub struct MirrorQueryWriteDriver<Q: DioxusQuerySync, F: QueryFilter>(Arc<Mutex<WriterDriver<MirrorQuery<Q, F>>>>);
+pub struct MirrorQueryWriteDriver<Q: DioxusQuerySync, F: QueryFilter>(
+    Arc<Mutex<WriterDriver<MirrorQuery<Q, F>>>>,
+);
 
 /// Handle to mirror version fo bevy query, that can be used from dioxus.
 pub struct MirrorQuerySignalHandle<Q: MirrorQueryData, F: QueryFilter> {
@@ -688,16 +767,19 @@ pub struct MirrorQuerySignalHandle<Q: MirrorQueryData, F: QueryFilter> {
 
 impl<Q: MirrorQueryData, F: QueryFilter> Clone for MirrorQuerySignalHandle<Q, F> {
     fn clone(&self) -> Self {
-        Self { signal: self.signal.clone(), health: self.health.clone(), writer: self.writer.clone(), _filter: self._filter.clone() }
+        Self {
+            signal: self.signal.clone(),
+            health: self.health.clone(),
+            writer: self.writer.clone(),
+            _filter: self._filter.clone(),
+        }
     }
 }
 
 pub struct MirrorQueryIter<Q: MirrorQueryData, F: QueryFilter> {
     items: std::vec::IntoIter<Q::MirrorItemHandles>,
-    _filter: PhantomData<F>
+    _filter: PhantomData<F>,
 }
-
-
 
 impl<Q: MirrorQueryData, F: QueryFilter> Iterator for MirrorQueryIter<Q, F> {
     type Item = Q::MirrorItemHandles;
@@ -713,11 +795,12 @@ impl<Q: MirrorQueryData, F: QueryFilter> Iterator for MirrorQueryIter<Q, F> {
 
 impl<Q: MirrorQueryData + 'static, F: QueryFilter + 'static> MirrorQuerySignalHandle<Q, F> {
     pub fn iter(&self) -> MirrorQueryIter<Q, F> {
-        let items = self.signal
+        let items = self
+            .signal
             .read()
             .as_ref()
             .map(|arc| arc.value.values().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();       // empty Vec if not initialized
+            .unwrap_or_default(); // empty Vec if not initialized
 
         MirrorQueryIter {
             items: items.into_iter(),
@@ -726,9 +809,9 @@ impl<Q: MirrorQueryData + 'static, F: QueryFilter + 'static> MirrorQuerySignalHa
     }
 }
 
-
 /// Create or fetch a [`MirrorQuery`] signal of mirrored components that can be edited to reflect changes to and read from the bevy world.
-pub fn use_bevy_query<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>() -> MirrorQuerySignalHandle<Q, F> {
+pub fn use_bevy_query<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>()
+-> MirrorQuerySignalHandle<Q, F> {
     let ctx = use_context::<CommandQueueSender>();
 
     // Increment tracking when the component mounts.
@@ -738,7 +821,7 @@ pub fn use_bevy_query<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>() 
         let mut queue = CommandQueue::default();
         queue.push(UpdateTrackingQueries::<Q, F> {
             delta: 1,
-            _phantom: || PhantomData
+            _phantom: || PhantomData,
         });
         let _ = r.tx.send(queue);
     });
@@ -750,7 +833,7 @@ pub fn use_bevy_query<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>() 
         let mut queue = CommandQueue::default();
         queue.push(UpdateTrackingQueries::<Q, F> {
             delta: -1,
-            _phantom: || PhantomData
+            _phantom: || PhantomData,
         });
         let _ = r.tx.send(queue);
     });
@@ -762,8 +845,10 @@ pub fn use_bevy_query<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>() 
             let command = RequestQueryMirror::<Q, F> { response_tx: tx };
             command_queue.push(command);
             command_queue
-        }).inspect_err(|err| warn!("{}", err))
-    }).unwrap();
+        })
+        .inspect_err(|err| warn!("{}", err))
+    })
+    .unwrap();
 
     let (value_signal, health) = signal.use_hook();
 

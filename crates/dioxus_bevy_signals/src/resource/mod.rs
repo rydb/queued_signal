@@ -1,21 +1,20 @@
+pub(crate) use crate::macros::*;
 use bevy_app::prelude::*;
 use bevy_ecs::world::CommandQueue;
-use bevy_ecs::{prelude::*, schedule::ScheduleLabel, system::ScheduleSystem};
+use bevy_ecs::prelude::*;
+use dioxus::prelude::*;
 use dioxus_core::use_hook;
 use dioxus_hooks::{use_context, use_signal};
-use dioxus::prelude::*;
 use dioxus_signals::{ReadableExt, Signal};
 use flume::Sender;
 use parking_lot::Mutex;
-use queued_signal::signal::{HealthStatus, QueuedSignal, WriterDriver, SetValueOp};
+use queued_signal::signal::{HealthStatus, QueuedSignal, WriterDriver};
 use std::any::{TypeId, type_name};
 use std::collections::HashSet;
 use std::ops::Deref;
-use std::sync::{Arc};
-use trait_set::trait_set;
+use std::sync::Arc;
 use std::time::Duration;
-pub(crate) use crate::macros::*;
-
+use trait_set::trait_set;
 
 use crate::{CommandQueueSender, add_systems_through_world};
 
@@ -41,15 +40,20 @@ pub struct RegisteredResourceSyncs(HashSet<TypeId>);
 
 impl<T: ResourceDioxusSync> Command for RequestBevyResource<T> {
     fn apply(self, world: &mut World) {
-
         let signal_to_send = match world.get_resource::<ResourceQueuedSignalMirror<T>>() {
             Some(signal) => signal.0.clone(),
             None => {
                 // put synced resources in registry for tracking
-                world.get_resource_or_init::<RegisteredResourceSyncs>().0.insert(TypeId::of::<T>());
+                world
+                    .get_resource_or_init::<RegisteredResourceSyncs>()
+                    .0
+                    .insert(TypeId::of::<T>());
 
                 let Some(resource) = world.get_resource::<T>().cloned() else {
-                    warn!("Cannot initialize dioxus-bevy sync for {} as this resource does not exist at the time of this sync request.", type_name::<T>());
+                    warn!(
+                        "Cannot initialize dioxus-bevy sync for {} as this resource does not exist at the time of this sync request.",
+                        type_name::<T>()
+                    );
                     return;
                 };
 
@@ -66,17 +70,27 @@ impl<T: ResourceDioxusSync> Command for RequestBevyResource<T> {
                     Some(driver_arc.clone()),
                     add_tx,
                     set_tx,
-                    set_value_tx, 
+                    set_value_tx,
                 );
                 world.insert_resource(ResourceWriteDriver(driver_arc));
 
                 // tick the resources 60 times a second (If uninitialized) by default to match standard FPS settings.
-                world.get_resource_or_insert_with(|| ResourceSyncTickRate(Duration::from_millis(16)));
+                world.get_resource_or_insert_with(|| {
+                    ResourceSyncTickRate(Duration::from_millis(16))
+                });
 
                 add_systems_through_world(world, Update, drive_signal::<T>);
                 // Also add the authoritative sync system, but **after** command processing.
-                add_systems_through_world(world, PostUpdate, sync_mirror_to_resource::<T>.run_if(resource_changed::<T>));
-                add_systems_through_world(world, PostUpdate, sync_resource_to_mirror::<T>.run_if(not(resource_changed::<T>)));
+                add_systems_through_world(
+                    world,
+                    PostUpdate,
+                    sync_mirror_to_resource::<T>.run_if(resource_changed::<T>),
+                );
+                add_systems_through_world(
+                    world,
+                    PostUpdate,
+                    sync_resource_to_mirror::<T>.run_if(not(resource_changed::<T>)),
+                );
                 let mut map = world.get_resource_or_init::<RegisteredResourceSyncs>();
                 map.0.insert(TypeId::of::<T>());
                 world.insert_resource(ResourceQueuedSignalMirror(signal.clone()));
@@ -103,8 +117,10 @@ pub fn sync_mirror_to_resource<T: ResourceDioxusSync>(
         // 1 clone: Bevy resource -> new_value
         let new_value = resource.clone();
         // send authoritative full replacement (2nd clone happens internally)
-        mirror.bypass_change_detection().0.set_value(new_value.into());
-        
+        mirror
+            .bypass_change_detection()
+            .0
+            .set_value(new_value.into());
     }
 }
 
@@ -115,7 +131,6 @@ pub fn sync_resource_to_mirror<T: ResourceDioxusSync>(
     let new_value = mirror.0.read().as_ref().clone();
     *resource.bypass_change_detection() = new_value
 }
-
 
 fn drive_signal<T: ResourceDioxusSync>(
     driver: Res<ResourceWriteDriver<T>>,
@@ -137,13 +152,15 @@ impl<R: Clone + Send + Sync + 'static> Copy for ResourceMirrorSignal<R> {}
 
 impl<R: Clone + Send + Sync + 'static> ResourceMirrorSignal<R> {
     pub fn mutate<F>(&self, f: F)
-    where F: Fn(&mut R) + Send + Sync + 'static
+    where
+        F: Fn(&mut R) + Send + Sync + 'static,
     {
         self.writer.read().mutate(f);
     }
 
     pub fn mutate_set<F>(&self, f: F)
-    where F: Fn(&mut R) + Send + Sync + 'static
+    where
+        F: Fn(&mut R) + Send + Sync + 'static,
     {
         self.writer.read().mutate_set(f);
     }
@@ -152,11 +169,13 @@ impl<R: Clone + Send + Sync + 'static> ResourceMirrorSignal<R> {
         self.writer.read().set_value(value);
     }
 
-    pub fn health(&self) -> HealthStatus { *self.health.read() }
+    pub fn health(&self) -> HealthStatus {
+        *self.health.read()
+    }
 
     pub fn read(&self) -> Option<Arc<R>> {
         let value = self.signal.deref();
-    
+
         let value = value();
         value
     }
@@ -164,7 +183,9 @@ impl<R: Clone + Send + Sync + 'static> ResourceMirrorSignal<R> {
 
 impl<T: Clone + Send + Sync + 'static> Deref for ResourceMirrorSignal<T> {
     type Target = Signal<Option<Arc<T>>>;
-    fn deref(&self) -> &Self::Target { &self.signal }
+    fn deref(&self) -> &Self::Target {
+        &self.signal
+    }
 }
 
 pub fn use_bevy_resource<T>() -> ResourceMirrorSignal<T>
@@ -179,8 +200,10 @@ where
             let command = RequestBevyResource::<T> { response_tx: tx };
             command_queue.push(command);
             command_queue
-        }).inspect_err(|err| warn!("{}", err))
-    }).unwrap();
+        })
+        .inspect_err(|err| warn!("{}", err))
+    })
+    .unwrap();
 
     let (value_signal, health_signal) = signal.use_hook();
 

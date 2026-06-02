@@ -1,21 +1,16 @@
-use std::sync::Arc;
 use std::time::Instant;
 
-use bevy_app::ctrlc::Signal;
 use bevy_app::prelude::*;
-use bevy_asset::{AssetApp, AssetPlugin, Assets, Handle};
+use bevy_asset::{AssetApp, AssetPlugin, Assets};
 use bevy_color::palettes::basic::RED;
-use bevy_color::palettes::css::{BLUE, GREEN};
-use bevy_color::{Color, LinearRgba, Srgba};
+use bevy_color::palettes::css::BLUE;
+use bevy_color::{Color, Srgba};
 use bevy_ecs::prelude::*;
-use bevy_log::warn;
 use bevy_pbr::{MeshMaterial3d, StandardMaterial};
-use dioxus::desktop::wry::cookie::time::Duration;
 use dioxus::prelude::*;
-use dioxus_bevy_signals::asset::{AssetState, use_bevy_asset};
+use dioxus_bevy_signals::asset::use_bevy_asset;
 // use dioxus_bevy_signals::asset::use_bevy_asset;
 use dioxus_bevy_signals::query::use_bevy_query;
-use dioxus_bevy_signals::{CommandQueueSender, push_and_send};
 use dioxus_hooks::{use_memo, use_signal};
 use dioxus_signals::{ReadableExt, WritableExt};
 
@@ -30,40 +25,33 @@ pub struct Marker;
 #[derive(Component, Clone)]
 pub struct ToggleMarker;
 
-pub fn spawn_color_entity(
-    mut commands: Commands,
-    mut materials: ResMut<Assets<StandardMaterial>>
-) {
-    commands.spawn(
-        (
-            Marker,
-            MeshMaterial3d(materials.add(StandardMaterial {
-                base_color: RED.into(),
-                ..Default::default()
-            }))
-        )
-    );
-    commands.spawn(
-        (
-            ToggleMarker,
-            MeshMaterial3d(materials.add(StandardMaterial {
-                base_color: BLUE.into(),
-                ..Default::default()
-            }))
-        )
-    );
+pub fn spawn_color_entity(mut commands: Commands, mut materials: ResMut<Assets<StandardMaterial>>) {
+    commands.spawn((
+        Marker,
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: RED.into(),
+            ..Default::default()
+        })),
+    ));
+    commands.spawn((
+        ToggleMarker,
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: BLUE.into(),
+            ..Default::default()
+        })),
+    ));
 }
 pub fn color_value_print(
     mats: Res<Assets<StandardMaterial>>,
     colors: Query<&MeshMaterial3d<StandardMaterial>>,
-    mut timer: ResMut<AssetDebugTimer>
+    mut timer: ResMut<AssetDebugTimer>,
 ) {
     if timer.0.elapsed() >= core::time::Duration::from_millis(1000) {
         timer.0 = Instant::now();
         for color in colors {
-            let Some(color) = mats.get(&color.0) else {
+            let Some(_color) = mats.get(&color.0) else {
                 println!("handle but no asset?");
-                continue
+                continue;
             };
         }
     }
@@ -77,12 +65,10 @@ impl Plugin for AssetTestPlugin {
         if !app.is_plugin_added::<AssetPlugin>() {
             app.add_plugins(AssetPlugin::default());
         }
-        app
-        .insert_resource(AssetDebugTimer(Instant::now()))
-        .init_asset::<StandardMaterial>()
-        .add_systems(Startup, spawn_color_entity)
-        .add_systems(Update, color_value_print);
-
+        app.insert_resource(AssetDebugTimer(Instant::now()))
+            .init_asset::<StandardMaterial>()
+            .add_systems(Startup, spawn_color_entity)
+            .add_systems(Update, color_value_print);
     }
 }
 
@@ -100,11 +86,16 @@ impl DioxusTestPlugin for AssetTestPlugin {
 
 #[component]
 pub fn ToggleableAsset() -> Element {
-    let colors = use_bevy_query::<(Entity, &mut MeshMaterial3d<StandardMaterial>, &mut ToggleMarker), ()>();
-    
-    let handle = use_memo(move || {
-        colors.iter().next().map(|n| n.1.read().0.clone().id())
-    });
+    let colors = use_bevy_query::<
+        (
+            Entity,
+            &mut MeshMaterial3d<StandardMaterial>,
+            &mut ToggleMarker,
+        ),
+        (),
+    >();
+
+    let handle = use_memo(move || colors.iter().next().map(|n| n.1.read().0.clone().id()));
 
     let color = use_bevy_asset(handle);
 
@@ -112,7 +103,7 @@ pub fn ToggleableAsset() -> Element {
         let mut text = "Loading...".to_owned();
 
         let Ok(color) = &*color.read() else {
-            return text
+            return text;
         };
         text = format!("{:?}", color.base_color);
         text
@@ -128,7 +119,6 @@ pub fn ToggleableAsset() -> Element {
             n.base_color = Color::Srgba(Srgba::rgb(color_srgb.red, new_green, color_srgb.blue))
         });
     };
-
 
     rsx! {
         div {
@@ -157,7 +147,7 @@ pub fn AssetCleanupDemo() -> Element {
         h2 {
             "unwatched assets cleanup test:"
         }
-        button {  
+        button {
             onclick: _toggle_handle,
             "toggle secondary color"
         }
@@ -173,12 +163,11 @@ pub fn AssetCleanupDemo() -> Element {
 
 #[component]
 pub fn AssetColorPicker() -> Element {
-    let colors = use_bevy_query::<(Entity, &mut MeshMaterial3d<StandardMaterial>, &mut Marker), ()>();
+    let colors =
+        use_bevy_query::<(Entity, &mut MeshMaterial3d<StandardMaterial>, &mut Marker), ()>();
 
     // Reactive handle to the first material (if any)
-    let handle = use_memo(move || {
-        colors.iter().next().map(|(_, mat, _)| mat.read().0.clone())
-    });
+    let handle = use_memo(move || colors.iter().next().map(|(_, mat, _)| mat.read().0.clone()));
 
     let asset_id = use_memo(move || handle.read().as_ref().map(|h| h.id()));
     let asset_state = use_bevy_asset(asset_id);
@@ -187,12 +176,12 @@ pub fn AssetColorPicker() -> Element {
     let color_text = use_memo(move || {
         let mut text = "Loading...".to_string();
         let Ok(color) = &*asset_state.read() else {
-           return text
+            return text;
         };
         text = format!("{:?}", color.base_color);
         text
     });
-    
+
     let on_click_white = move |_| {
         asset_state.mutate(|n| n.base_color = Color::srgb(1.0, 1.0, 1.0));
     };
@@ -217,8 +206,6 @@ pub fn AssetColorPicker() -> Element {
 /// demos to test bevy asset <-> dioxus sync
 #[component]
 pub fn AssetDemos() -> Element {
-
-
     rsx! {
         div {
             style: "border: 2px solid black; background-color: #f0f0f0; padding: 16px; border-radius: 8px;",

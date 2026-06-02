@@ -1,15 +1,12 @@
 use dioxus::prelude::*;
-use dioxus_core::needs_update;
-use dioxus_signals::*;
-use dioxus_hooks::*;
 use flume::{Receiver, Sender};
 use left_right::{Absorb, ReadHandle, WriteHandle};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
@@ -104,10 +101,14 @@ impl<T: Clone + Debug> Debug for Absorbable<T> {
 
 impl<T: Clone> Deref for Absorbable<T> {
     type Target = Arc<T>;
-    fn deref(&self) -> &Self::Target { &self.0 }
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 impl<T: Clone> DerefMut for Absorbable<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
 }
 
 impl<T: Clone + Send + Sync> Absorb<SignalOp<T>> for Absorbable<T> {
@@ -150,7 +151,12 @@ pub struct QueuedState<T: Clone + Send + Sync> {
 
 impl<T: Clone + Send + Sync> Debug for QueuedState<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("QueuedState").field("read_handle", &self.read_handle).field("notify_rx", &self.notify_rx).field("health_rx", &self.health_rx).field("registry", &self.registry).finish()
+        f.debug_struct("QueuedState")
+            .field("read_handle", &self.read_handle)
+            .field("notify_rx", &self.notify_rx)
+            .field("health_rx", &self.health_rx)
+            .field("registry", &self.registry)
+            .finish()
     }
 }
 
@@ -171,11 +177,15 @@ impl<T: Clone + Send + Sync> QueuedState<T> {
         let guard = self.read_handle.enter().unwrap();
         TrackedReadGuard::new(guard, self.registry.clone())
     }
-    pub fn health(&self) -> HealthStatus { *self.health_rx.borrow() }
-    fn notify_rx(&self) -> watch::Receiver<u64> { self.notify_rx.clone() }
+    pub fn health(&self) -> HealthStatus {
+        *self.health_rx.borrow()
+    }
+    fn notify_rx(&self) -> watch::Receiver<u64> {
+        self.notify_rx.clone()
+    }
 }
 
-/// QueuedSignal Read guard. 
+/// QueuedSignal Read guard.
 pub struct TrackedReadGuard<'a, T: Clone + Send + Sync> {
     guard: left_right::ReadGuard<'a, Absorbable<T>>,
     registry: Arc<ReaderRegistry>,
@@ -185,18 +195,28 @@ pub struct TrackedReadGuard<'a, T: Clone + Send + Sync> {
 impl<'a, T: Clone + Send + Sync> TrackedReadGuard<'a, T> {
     fn new(guard: left_right::ReadGuard<'a, Absorbable<T>>, registry: Arc<ReaderRegistry>) -> Self {
         let reader_id = registry.register();
-        Self { guard, registry, reader_id }
+        Self {
+            guard,
+            registry,
+            reader_id,
+        }
     }
-    pub fn heartbeat(&self) { self.registry.heartbeat(self.reader_id); }
+    pub fn heartbeat(&self) {
+        self.registry.heartbeat(self.reader_id);
+    }
 }
 
 impl<'a, T: Clone + Send + Sync> Drop for TrackedReadGuard<'a, T> {
-    fn drop(&mut self) { self.registry.unregister(self.reader_id); }
+    fn drop(&mut self) {
+        self.registry.unregister(self.reader_id);
+    }
 }
 
 impl<'a, T: Clone + Send + Sync> Deref for TrackedReadGuard<'a, T> {
     type Target = Arc<T>;
-    fn deref(&self) -> &Self::Target { &self.guard.0 }
+    fn deref(&self) -> &Self::Target {
+        &self.guard.0
+    }
 }
 
 /// Driver for how reads/writes are managed between QueuedSignal and a given state front end (Dioxus, and others)
@@ -205,11 +225,11 @@ pub struct WriterDriver<T: Clone + Send + Sync> {
     set_value_rx: Receiver<SetValueOp<T>>,
     set_rx: Receiver<MutationOp<T>>,
     add_rx: Receiver<MutationOp<T>>,
-    abs_slot: Arc<Mutex<Option<Arc<T>>>>, 
+    abs_slot: Arc<Mutex<Option<Arc<T>>>>,
     notify_tx: watch::Sender<u64>,
-    version: u64, 
+    version: u64,
     health_tx: watch::Sender<HealthStatus>,
-    last_health: HealthStatus, 
+    last_health: HealthStatus,
     registry: Arc<ReaderRegistry>,
     watchdog_timeout: Duration,
     last_publish: Instant,
@@ -222,10 +242,24 @@ pub struct WriterDriver<T: Clone + Send + Sync> {
 
 impl<T: Debug + Clone + Send + Sync> Debug for WriterDriver<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WriterDriver").field("write_handle", &self.write_handle).field("set_value_rx", &self.set_value_rx).field("set_rx", &self.set_rx).field("add_rx", &self.add_rx).field("abs_slot", &self.abs_slot).field("notify_tx", &self.notify_tx).field("health_tx", &self.health_tx).field("registry", &self.registry).field("watchdog_timeout", &self.watchdog_timeout).field("last_publish", &self.last_publish).field("set_value_tx", &self.set_value_tx).field("set_tx", &self.set_tx).field("add_tx", &self.add_tx).field("queued_state", &self.queued_state).finish()
+        f.debug_struct("WriterDriver")
+            .field("write_handle", &self.write_handle)
+            .field("set_value_rx", &self.set_value_rx)
+            .field("set_rx", &self.set_rx)
+            .field("add_rx", &self.add_rx)
+            .field("abs_slot", &self.abs_slot)
+            .field("notify_tx", &self.notify_tx)
+            .field("health_tx", &self.health_tx)
+            .field("registry", &self.registry)
+            .field("watchdog_timeout", &self.watchdog_timeout)
+            .field("last_publish", &self.last_publish)
+            .field("set_value_tx", &self.set_value_tx)
+            .field("set_tx", &self.set_tx)
+            .field("add_tx", &self.add_tx)
+            .field("queued_state", &self.queued_state)
+            .finish()
     }
 }
-
 
 impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
     pub fn new(initial: T) -> Self {
@@ -321,7 +355,7 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
         if did_work && self.last_publish.elapsed() >= publish_interval {
             self.write_handle.publish();
             self.last_publish = Instant::now();
-            self.version += 1;      
+            self.version += 1;
             let _ = self.notify_tx.send(self.version);
             if let Some(ref counter) = self.publish_counter {
                 counter.fetch_add(1, Ordering::Relaxed);
@@ -336,8 +370,12 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
         let pinned = stalled.len();
         let status = match pinned {
             0 => HealthStatus::Healthy,
-            1 => HealthStatus::Degraded { pinned_buffers: pinned },
-            _ => HealthStatus::Stalled { pinned_buffers: pinned },
+            1 => HealthStatus::Degraded {
+                pinned_buffers: pinned,
+            },
+            _ => HealthStatus::Stalled {
+                pinned_buffers: pinned,
+            },
         };
         // don't starve future by updating health every frame when no new changes are made
         if status != self.last_health {
@@ -370,7 +408,12 @@ impl<T: Clone + Send + Sync> Deref for QueuedSignal<T> {
 
 impl<T: Clone + Send + Sync + Debug> Debug for QueuedSignal<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("QueuedSignal").field("state", &self.state).field("add_tx", &self.add_tx).field("set_tx", &self.set_tx).field("set_value_tx", &self.set_value_tx).finish()
+        f.debug_struct("QueuedSignal")
+            .field("state", &self.state)
+            .field("add_tx", &self.add_tx)
+            .field("set_tx", &self.set_tx)
+            .field("set_value_tx", &self.set_value_tx)
+            .finish()
     }
 }
 
@@ -382,21 +425,31 @@ impl<T: Clone + Send + Sync + 'static> QueuedSignal<T> {
         set_tx: Sender<MutationOp<T>>,
         set_value_tx: Sender<SetValueOp<T>>,
     ) -> Self {
-        Self { state, _driver: driver, add_tx, set_tx, set_value_tx }
+        Self {
+            state,
+            _driver: driver,
+            add_tx,
+            set_tx,
+            set_value_tx,
+        }
     }
 
-    pub fn read(&self) -> TrackedReadGuard<'_, T> { self.state.read() }
+    pub fn read(&self) -> TrackedReadGuard<'_, T> {
+        self.state.read()
+    }
 
     /// Relative mutation. Applied after all authoritative operations.
     pub fn mutate<F>(&self, f: F)
-    where F: Fn(&mut T) + Send + Sync + 'static
+    where
+        F: Fn(&mut T) + Send + Sync + 'static,
     {
         let _ = self.add_tx.send(Arc::new(f));
     }
 
     /// Authoritative mutation (closure), may be overridden by a later `set_value`.
     pub fn mutate_set<F>(&self, f: F)
-    where F: Fn(&mut T) + Send + Sync + 'static
+    where
+        F: Fn(&mut T) + Send + Sync + 'static,
     {
         let _ = self.set_tx.send(Arc::new(f));
     }
@@ -406,7 +459,9 @@ impl<T: Clone + Send + Sync + 'static> QueuedSignal<T> {
         let _ = self.set_value_tx.send(SetValueOp(value));
     }
 
-    pub fn health(&self) -> HealthStatus { self.state.health() }
+    pub fn health(&self) -> HealthStatus {
+        self.state.health()
+    }
 
     pub fn use_hook(&self) -> (Signal<Option<Arc<T>>>, Signal<HealthStatus>) {
         use_queued_signal(self.state.clone())

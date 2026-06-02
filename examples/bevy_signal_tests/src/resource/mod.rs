@@ -1,17 +1,14 @@
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
-use bevy_log::warn;
+use dioxus::prelude::*;
 use dioxus_bevy_signals::resource::use_bevy_resource;
 use dioxus_core::Element;
-use dioxus::prelude::*;
 use dioxus_hooks::use_memo;
 use dioxus_signals::ReadableExt;
 use queued_signal::signal::HealthStatus;
 use std::time::{Duration, Instant};
 
-
 use crate::DioxusTestPlugin;
-
 
 #[derive(Resource)]
 pub struct TickTimer {
@@ -31,44 +28,37 @@ pub struct Counter {
     pub value: i32,
 }
 
-pub fn bevy_tick_counter(
-    mut counter: ResMut<Counter>,
-    mut timer: ResMut<TickTimer>,
-) {
+pub fn bevy_tick_counter(mut counter: ResMut<Counter>, mut timer: ResMut<TickTimer>) {
     if timer.last_tick.elapsed() >= Duration::from_millis(1000) {
         counter.value += 1;
-        timer.last_tick = Instant::now();   
+        timer.last_tick = Instant::now();
     }
 }
 
-/// plugin for intiailizing bevy resource <-> dioxus QueuedSignal syncronization test. 
+/// plugin for intiailizing bevy resource <-> dioxus QueuedSignal syncronization test.
 pub struct CounterResourceTestPlugin;
 
 impl Plugin for CounterResourceTestPlugin {
     fn build(&self, app: &mut App) {
-        app
-        .add_systems(Update, bevy_tick_counter)
-        .insert_resource(Counter { value: 0 })
-        .insert_resource(TickTimer::default());
+        app.add_systems(Update, bevy_tick_counter)
+            .insert_resource(Counter { value: 0 })
+            .insert_resource(TickTimer::default());
     }
 }
 
-/// setup for all resource signal interop tests 
+/// setup for all resource signal interop tests
 #[derive(Clone)]
 pub struct ResourceTestsPlugin;
 
 impl Default for ResourceTestsPlugin {
     fn default() -> Self {
-        Self {  }
+        Self {}
     }
 }
 
-
 impl Plugin for ResourceTestsPlugin {
     fn build(&self, app: &mut App) {
-        app
-        .add_plugins(CounterResourceTestPlugin)
-        ;
+        app.add_plugins(CounterResourceTestPlugin);
     }
 }
 
@@ -78,7 +68,7 @@ impl DioxusTestPlugin for ResourceTestsPlugin {
             CounterResource {  }
         }
     }
-    
+
     fn register_plugin(&self, app: &mut App) {
         app.add_plugins(self.clone());
     }
@@ -101,7 +91,7 @@ pub fn CounterResource() -> Element {
         HealthStatus::Degraded { .. } => "Degraded",
         HealthStatus::Stalled { .. } => "Stalled",
     };
-    
+
     let onclick = move |_| {
         counter.mutate(|c| c.value += 10);
     };
@@ -119,7 +109,6 @@ pub fn CounterResource() -> Element {
             }
         }
     }
-
 }
 
 #[component]

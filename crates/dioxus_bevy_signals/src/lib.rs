@@ -1,10 +1,17 @@
-use std::{any::{type_name, type_name_of_val}, time::Duration};
+use std::{
+    any::type_name_of_val,
+    time::Duration,
+};
 
-use bevy_ecs::{schedule::{IntoScheduleConfigs, ScheduleLabel, Schedules}, system::ScheduleSystem, world::{CommandQueue, World}};
+use bevy_app::{ScheduleRunnerPlugin, prelude::*};
 use bevy_ecs::prelude::*;
-use bevy_app::{ScheduleRunnerPlugin, plugin_group, prelude::*};
+use bevy_ecs::{
+    schedule::{IntoScheduleConfigs, ScheduleLabel, Schedules},
+    system::ScheduleSystem,
+    world::{CommandQueue, World},
+};
 use dioxus_hooks::use_context;
-use dioxus_signals::{ReadableExt, Signal};
+use dioxus_signals::Signal;
 use flume::{Receiver, Sender, unbounded};
 
 pub(crate) mod macros;
@@ -18,31 +25,41 @@ pub use tracing::{debug, error, info, trace, warn};
 #[cfg(not(feature = "tracing"))]
 #[macro_export]
 macro_rules! debug {
-    ($($arg:tt)*) => {()};
+    ($($arg:tt)*) => {
+        ()
+    };
 }
 
 #[cfg(not(feature = "tracing"))]
 #[macro_export]
 macro_rules! error {
-    ($($arg:tt)*) => {()};
+    ($($arg:tt)*) => {
+        ()
+    };
 }
 
 #[cfg(not(feature = "tracing"))]
 #[macro_export]
 macro_rules! info {
-    ($($arg:tt)*) => {()};
+    ($($arg:tt)*) => {
+        ()
+    };
 }
 
 #[cfg(not(feature = "tracing"))]
 #[macro_export]
 macro_rules! trace {
-    ($($arg:tt)*) => {()};
+    ($($arg:tt)*) => {
+        ()
+    };
 }
 
 #[cfg(not(feature = "tracing"))]
 #[macro_export(local_inner_macros)]
 macro_rules! warn {
-    ($($arg:tt)*) => {()};
+    ($($arg:tt)*) => {
+        ()
+    };
 }
 
 #[cfg(feature = "query")]
@@ -62,7 +79,7 @@ pub struct CommandQueueReciever {
     pub rx: CommandReceiver,
 }
 /// Adds system to bevy through &mut World instead of &mut App
-/// 
+///
 /// !!! Do not add systems that run before Pre-Update via this method or they wont run !!!
 pub fn add_systems_through_world<T>(
     world: &mut World,
@@ -70,10 +87,10 @@ pub fn add_systems_through_world<T>(
     systems: impl IntoScheduleConfigs<ScheduleSystem, T>,
 ) {
     let mut schedules = world.get_resource_mut::<Schedules>().unwrap();
-   
-    // schedules that don't work when added via world. 
+
+    // schedules that don't work when added via world.
     let schedule_blacklist = [format!("{:#?}", PreUpdate), format!("{:#?}", PreStartup)];
-    
+
     for bad_schedule in schedule_blacklist {
         if format!("{:#?}", schedule) == bad_schedule {
             panic!("
@@ -98,11 +115,7 @@ pub fn add_systems_through_world<T>(
     schedule.add_systems(systems);
 }
 
-
-pub fn process_commands(
-    command_rx: ResMut<CommandQueueReciever>,
-    mut commands: Commands,
-) {
+pub fn process_commands(command_rx: ResMut<CommandQueueReciever>, mut commands: Commands) {
     while let Ok(mut cmd) = command_rx.rx.try_recv() {
         commands.append(&mut cmd);
     }
@@ -121,8 +134,12 @@ impl CommandQueueSender {
     ) -> Result<R, String> {
         let (response_tx, response_rx) = flume::bounded(1);
         let cmd = make_command(response_tx);
-        self.tx.send(cmd).map_err(|err| format!("{}, {}, {}", err.to_string(), file!(), line!()))?;
-        response_rx.recv_timeout(Duration::from_millis(10000)).map_err(|err|  format!("{}, {}, {}", err.to_string(), file!(), line!()))
+        self.tx
+            .send(cmd)
+            .map_err(|err| format!("{}, {}, {}", err.to_string(), file!(), line!()))?;
+        response_rx
+            .recv_timeout(Duration::from_millis(10000))
+            .map_err(|err| format!("{}, {}, {}", err.to_string(), file!(), line!()))
     }
 }
 
@@ -145,24 +162,26 @@ impl BevyCommandChannels {
     }
 }
 
-
 /// plugin for mirroring state from the bevy world into the dioxus world
-pub struct DioxusBevyMirrorPlugin { pub bevy_command_txrx: BevyCommandChannels}
+pub struct DioxusBevyMirrorPlugin {
+    pub bevy_command_txrx: BevyCommandChannels,
+}
 
 impl Plugin for DioxusBevyMirrorPlugin {
-    fn build(&self, app: &mut App) {        
+    fn build(&self, app: &mut App) {
         // let (cmd_tx, cmd_rx) = unbounded::<CommandQueue>();
-        
+
         if !app.is_plugin_added::<ScheduleRunnerPlugin>() {
             app.add_plugins(ScheduleRunnerPlugin::default());
         }
 
-        app
-        .insert_resource(CommandQueueReciever {rx: self.bevy_command_txrx.rx.clone()})
-        .insert_resource(CommandQueueSender { tx: self.bevy_command_txrx.tx.clone()})
-        .add_systems(PreUpdate, process_commands)
-        ;
-        
+        app.insert_resource(CommandQueueReciever {
+            rx: self.bevy_command_txrx.rx.clone(),
+        })
+        .insert_resource(CommandQueueSender {
+            tx: self.bevy_command_txrx.tx.clone(),
+        })
+        .add_systems(PreUpdate, process_commands);
     }
 }
 
@@ -173,7 +192,7 @@ pub struct BevyCommandsSignal {
 }
 
 /// Macro to ergonomically push and send a group of bevy commands to bevy
-/// 
+///
 /// Usage:
 /// ```rust
 /// push_and_send!(bevy_command_signal: BevyCommandsSignal, (command1_, command_2, .. command_n))
@@ -192,5 +211,7 @@ macro_rules! push_and_send {
 pub fn use_bevy_command_queue() -> BevyCommandsSignal {
     let command_queue = use_context::<CommandQueueSender>();
 
-    BevyCommandsSignal { command_queue_sender: Signal::new(command_queue) }
+    BevyCommandsSignal {
+        command_queue_sender: Signal::new(command_queue),
+    }
 }

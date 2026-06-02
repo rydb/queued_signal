@@ -1,13 +1,11 @@
-use std::{io, rc::Rc, thread, time::Instant};
+use std::{rc::Rc, thread};
 
 use bevy_app::{App, Plugin};
-use bevy_log::{Level, LogPlugin, tracing, tracing_subscriber::{self, EnvFilter, Layer, Registry, fmt::{self, MakeWriter}, layer::SubscriberExt, util::SubscriberInitExt}};
+use bevy_log::debug;
+use dioxus::prelude::*;
 use dioxus::{LaunchBuilder, prelude::rsx};
 use dioxus_bevy_signals::{BevyCommandChannels, CommandQueueSender, DioxusBevyMirrorPlugin};
-use dioxus::prelude::*;
 use dioxus_hooks::{use_context, use_context_provider};
-use bevy_log::debug;
-
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "resource_tests")] {
@@ -31,14 +29,12 @@ cfg_if::cfg_if! {
     }
 }
 
-
 /// plugin that also includes a dioxus ui element relative to it
 pub trait DioxusTestPlugin: Plugin + 'static {
     fn included_element(&self) -> Element;
 
     fn register_plugin(&self, app: &mut App);
 }
-
 
 /// plugin that setups infastructure to run all tests
 #[derive(Clone)]
@@ -52,12 +48,12 @@ pub struct SignalTestsPlugin {
 
 impl Default for SignalTestsPlugin {
     fn default() -> Self {
-        let cmd_channels = BevyCommandChannels::default();        
-        Self { 
+        let cmd_channels = BevyCommandChannels::default();
+        Self {
             cmd_channels,
             test_plugin_list: || {
                 let mut list: Vec<Box<dyn DioxusTestPlugin>> = Vec::default();
-                
+
                 #[cfg(feature = "resource_tests")]
                 {
                     debug!("resource tests added");
@@ -68,17 +64,14 @@ impl Default for SignalTestsPlugin {
                 {
                     debug!("query tests added");
                     list.push(Box::new(QueryTestsPlugin::default()));
-
                 }
 
                 #[cfg(feature = "asset_tests")]
                 {
-
                     debug!("asset_tests added");
                     list.push(Box::new(AssetTestPlugin::default()));
                 }
                 list
-
             },
         }
     }
@@ -86,9 +79,9 @@ impl Default for SignalTestsPlugin {
 
 impl Plugin for SignalTestsPlugin {
     fn build(&self, app: &mut bevy_app::App) {
-        app
-        .add_plugins(DioxusBevyMirrorPlugin { bevy_command_txrx: self.cmd_channels.clone() })
-        ;
+        app.add_plugins(DioxusBevyMirrorPlugin {
+            bevy_command_txrx: self.cmd_channels.clone(),
+        });
 
         let plugins = (self.test_plugin_list)();
 
@@ -98,16 +91,13 @@ impl Plugin for SignalTestsPlugin {
     }
 }
 
-
-
 pub fn run_signal_tests() {
     let signal_tests_plguin = SignalTestsPlugin::default();
 
     let r = signal_tests_plguin.clone();
     let bevy_thread = thread::spawn(move || {
         let mut app = App::new();
-        app.add_plugins(r)
-            .run();
+        app.add_plugins(r).run();
     });
 
     LaunchBuilder::new()
@@ -146,4 +136,3 @@ pub fn signal_tests_app() -> Element {
         }
     }
 }
-
