@@ -1,4 +1,3 @@
-use bevy_log::tracing;
 use dioxus::prelude::*;
 use dioxus_core::needs_update;
 use dioxus_signals::*;
@@ -14,6 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
+use crate::macros::warn;
 
 /// Health status of QueuedSignal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,7 +282,7 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
         let arc = Arc::new(value);
         let mut slot = self.abs_slot.lock();
         if slot.is_some() {
-            tracing::warn!("Absolute value overwritten before being applied.");
+            warn!("Absolute value overwritten before being applied.");
         }
         *slot = Some(arc);
     }

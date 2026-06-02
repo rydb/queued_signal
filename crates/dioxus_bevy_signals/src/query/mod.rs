@@ -2,14 +2,14 @@ use std::{any::{TypeId, type_name, type_name_of_val}, collections::{HashMap, Has
 
 use bevy_app::{Last, PostUpdate, Update};
 use bevy_ecs::{component::Mutable, prelude::*, query::{QueryData, QueryFilter}, world::CommandQueue};
-use bevy_log::warn;
 use dioxus_core::{use_drop, use_hook};
 use dioxus_hooks::{use_context, use_effect, use_on_unmount};
 use dioxus_signals::{ReadableExt, Signal};
 use flume::Sender;
 use parking_lot::Mutex;
-use queued_signal::signal::{HealthStatus, QueuedSignal, WriterDriver};
+use queued_signal::{signal::{HealthStatus, QueuedSignal, WriterDriver}};
 use trait_set::trait_set;
+pub(crate) use crate::macros::*;
 
 use crate::{CommandQueueSender, add_systems_through_world};
 
@@ -254,7 +254,7 @@ fn apply_tracking_queries_delta<Q: DioxusQuerySync + 'static, F: QueryFilter + '
 ) {
     let delta = pending_tracking_delta.bypass_change_detection().pending;
     if delta != 0 {
-        println!("applying delta {}", delta);
+        debug!("applying delta {}", delta);
         for item in mirror_components {
             Q::apply_tracking_delta::<F>(item, delta);
         }
@@ -295,13 +295,13 @@ pub fn sync_query_mirror_to_signal<T: DioxusQuerySync + 'static, F: QueryFilter 
                     _marker: PhantomData::default()
             }));
             init_status.initialized = true;
-            println!("finished initializing component mirror to: {}", mirror_components.iter().count());
+            trace!("finished initializing component mirror to: {}", mirror_components.iter().count());
             return;
         }
     }
 
     for item in components_without_signals {
-        println!("componenet without signal found");
+        trace!("componenet without signal found");
         let entity = T::get_query_entity(&item);
         let bundle = T::get_mirror_bundle::<F>(item);
         commands.entity(entity).insert_if_new(bundle);
@@ -734,7 +734,7 @@ pub fn use_bevy_query<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>() 
     // Increment tracking when the component mounts.
     let r = ctx.clone();
     use_effect(move || {
-        println!("SIGNAL MOUNTED, SENDING INCREMENT COMMAND");
+        trace!("query signal mounted, sending increment command");
         let mut queue = CommandQueue::default();
         queue.push(UpdateTrackingQueries::<Q, F> {
             delta: 1,
@@ -746,7 +746,7 @@ pub fn use_bevy_query<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>() 
     // Cleanup: decrement when component unmounts.
     let r = ctx.clone();
     use_drop(move || {
-        println!("SIGNAL DROPPED, SENDING DECREMENT COMMAND");
+        trace!("query signal dropped, sending decrement command");
         let mut queue = CommandQueue::default();
         queue.push(UpdateTrackingQueries::<Q, F> {
             delta: -1,
@@ -756,7 +756,7 @@ pub fn use_bevy_query<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>() 
     });
 
     let signal = use_hook(|| {
-        println!("sending signal");
+        trace!("sending query signal");
         ctx.send_command(|tx| {
             let mut command_queue = CommandQueue::default();
             let command = RequestQueryMirror::<Q, F> { response_tx: tx };

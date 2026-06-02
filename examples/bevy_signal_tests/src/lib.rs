@@ -1,10 +1,13 @@
-use std::thread;
+use std::{io, rc::Rc, thread, time::Instant};
 
 use bevy_app::{App, Plugin};
+use bevy_log::{Level, LogPlugin, tracing, tracing_subscriber::{self, EnvFilter, Layer, Registry, fmt::{self, MakeWriter}, layer::SubscriberExt, util::SubscriberInitExt}};
 use dioxus::{LaunchBuilder, prelude::rsx};
 use dioxus_bevy_signals::{BevyCommandChannels, CommandQueueSender, DioxusBevyMirrorPlugin};
 use dioxus::prelude::*;
 use dioxus_hooks::{use_context, use_context_provider};
+use bevy_log::debug;
+
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "resource_tests")] {
@@ -57,20 +60,21 @@ impl Default for SignalTestsPlugin {
                 
                 #[cfg(feature = "resource_tests")]
                 {
-                    println!("resource tests added");
+                    debug!("resource tests added");
                     list.push(Box::new(ResourceTestsPlugin::default()));
                 }
 
                 #[cfg(feature = "query_tests")]
                 {
-                    println!("query tests added");
+                    debug!("query tests added");
                     list.push(Box::new(QueryTestsPlugin::default()));
 
                 }
 
                 #[cfg(feature = "asset_tests")]
                 {
-                    println!("asset_tests added");
+
+                    debug!("asset_tests added");
                     list.push(Box::new(AssetTestPlugin::default()));
                 }
                 list
@@ -94,53 +98,52 @@ impl Plugin for SignalTestsPlugin {
     }
 }
 
-pub fn signal_tests_app() -> Element{
-    let tests_plguin = use_context::<SignalTestsPlugin>();
-    
-    
-    let command_queue_sender = CommandQueueSender {
-        tx: tests_plguin.cmd_channels.clone().tx()
-    };
 
-    use_context_provider(|| command_queue_sender);
-    
-    let mut elements = Vec::new();
 
-    for plugin in (tests_plguin.test_plugin_list)(){
-        elements.push(plugin.included_element());
-    }
-    let force_rerender = |_| {
-        dioxus_core::needs_update();
-    };
-    rsx! { 
-        div {
-            button { 
-                onclick: force_rerender,
-                "force re-render "
-            }
-        }
-        for element in elements {
-            {element}
-        }
-    }
-}
-
-/// runs signal tests. Tests are enabled by example feature flags. see src for /bevy_signal_tests for test impls.
 pub fn run_signal_tests() {
     let signal_tests_plguin = SignalTestsPlugin::default();
-    
+
     let r = signal_tests_plguin.clone();
     let bevy_thread = thread::spawn(move || {
         let mut app = App::new();
-        app
-        .add_plugins(r)
-        .run();
-    } );
-
+        app.add_plugins(r)
+            .run();
+    });
 
     LaunchBuilder::new()
-    .with_context(signal_tests_plguin)
-    .launch(signal_tests_app);
+        .with_context(signal_tests_plguin)
+        .launch(signal_tests_app);
 
     bevy_thread.join().unwrap();
 }
+
+#[derive(Clone)]
+pub struct AppDocument(pub Signal<Rc<dyn dioxus_document::Document>>);
+
+pub fn signal_tests_app() -> Element {
+    let tests_plguin = use_context::<SignalTestsPlugin>();
+
+    let command_queue_sender = CommandQueueSender {
+        tx: tests_plguin.cmd_channels.clone().tx(),
+    };
+
+    let _document = use_context_provider(|| AppDocument(Signal::new(dioxus_document::document())));
+
+    use_context_provider(|| command_queue_sender);
+
+    let mut elements = Vec::new();
+    for plugin in (tests_plguin.test_plugin_list)() {
+        elements.push(plugin.included_element());
+    }
+
+    rsx! {
+        div {
+            div { style: "margin-top: 32px; padding: 16px;", // space for the fixed overlay
+                for element in elements {
+                    {element}
+                }
+            }
+        }
+    }
+}
+

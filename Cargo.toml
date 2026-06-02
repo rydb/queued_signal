@@ -19,7 +19,7 @@ flashmap = {workspace = true}
 bevy_ecs = {workspace = true}
 bevy_app = {workspace = true}
 bevy_transform = {workspace = true}
-bevy_log = {workspace = true}
+bevy_log = {workspace = true, optional = true}
 glam = {workspace = true}
 bytemuck = {workspace = true}
 variadics_please = {workspace = true}
@@ -28,12 +28,14 @@ futures = {workspace = true}
 crossbeam-epoch = {workspace = true}
 parking_lot = {workspace = true}
 anyhow = {workspace = true}
+macro-v = {workspace = true}
 
 [workspace.dependencies]
 dioxus_bevy_signals = {path = "crates/dioxus_bevy_signals", default-features = false}
 dioxus = {version = "0.7.4", default-features = false}
 dioxus-core = {version = "0.7.4"}
 dioxus-signals = {version = "0.7.4"}
+dioxus-document = {version = "0.7.4"}
 dioxus-hooks = {version = "0.7.4"}
 generational-box = {version = "0.7.4"}
 dioxus-html = {version = "0.7.4"}
@@ -60,11 +62,13 @@ variadics_please = "1.1.0"
 queued_signal = {path = "./"}
 left-right = "0.11.7"
 cfg-if = "1.0"
+macro-v = "0.1.4"
 
 [features]
 resource_example = ["bevy_signal_tests/resource_tests"]
 query_example   = ["bevy_signal_tests/query_tests"]
 asset_example = ["bevy_signal_tests/asset_tests"]
+tracing = ["bevy_log"]
 
 [workspace]
 members = ["./crates/*", "crates/dioxus_bevy_signals", "examples/*"]

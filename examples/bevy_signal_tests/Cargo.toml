@@ -12,16 +12,20 @@ bevy_pbr = {workspace = true}
 dioxus-core = {workspace = true}
 bevy_asset = {workspace = true}
 dioxus-hooks = {workspace = true}
+dioxus-document = {workspace = true}
 dioxus-signals = {workspace = true}
 dioxus = {workspace = true, features = ["lib"]}
 flume = {workspace = true}
 queued_signal = {workspace = true}
 dioxus_bevy_signals = {workspace = true}
+parking_lot = {workspace = true}
 tokio = {workspace = true}
 cfg-if = {workspace = true}
+sysinfo = "0.39.3"
 
 [features]
-resource_tests = ["dioxus_bevy_signals/resource"]
-query_tests = ["dioxus_bevy_signals/query"]
-asset_tests = ["dioxus_bevy_signals/asset", "dioxus_bevy_signals/query"]
+tracing = ["dioxus_bevy_signals/tracing"]
+resource_tests = ["dioxus_bevy_signals/resource", "tracing"]
+query_tests = ["dioxus_bevy_signals/query", "tracing"]
+asset_tests = ["dioxus_bevy_signals/asset", "dioxus_bevy_signals/query", "tracing"]
 default = ["resource_tests", "query_tests", "asset_tests"]

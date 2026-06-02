@@ -1,7 +1,6 @@
 use bevy_app::prelude::*;
 use bevy_ecs::world::CommandQueue;
 use bevy_ecs::{prelude::*, schedule::ScheduleLabel, system::ScheduleSystem};
-use bevy_log::prelude::*;
 use dioxus_core::use_hook;
 use dioxus_hooks::{use_context, use_signal};
 use dioxus::prelude::*;
@@ -15,6 +14,8 @@ use std::ops::Deref;
 use std::sync::{Arc};
 use trait_set::trait_set;
 use std::time::Duration;
+pub(crate) use crate::macros::*;
+
 
 use crate::{CommandQueueSender, add_systems_through_world};
 
@@ -172,7 +173,7 @@ where
 {
     let ctx = use_context::<CommandQueueSender>();
     let signal = use_hook(|| {
-        println!("sending signal");
+        trace!("sending signal {}", type_name::<T>());
         ctx.send_command(|tx| {
             let mut command_queue = CommandQueue::default();
             let command = RequestBevyResource::<T> { response_tx: tx };

@@ -1,5 +1,6 @@
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
+use bevy_log::warn;
 use dioxus_bevy_signals::resource::use_bevy_resource;
 use dioxus_core::Element;
 use dioxus::prelude::*;
@@ -86,6 +87,7 @@ impl DioxusTestPlugin for ResourceTestsPlugin {
 /// bevy resource <-> dioxus sync test
 #[component]
 pub fn CounterResource() -> Element {
+    bevy_log::warn!("warn success!");
     let counter = use_bevy_resource::<Counter>();
 
     let value = use_memo(move || {

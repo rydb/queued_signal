@@ -222,9 +222,6 @@ pub fn AssetDemos() -> Element {
     rsx! {
         div {
             style: "border: 2px solid black; background-color: #f0f0f0; padding: 16px; border-radius: 8px;",
-            h2 {
-                "Bevy Asset <-> Dioxus sync demos"
-            }
             AssetColorPicker {}
             AssetCleanupDemo {}
         }

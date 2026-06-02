@@ -7,6 +7,44 @@ use dioxus_hooks::use_context;
 use dioxus_signals::{ReadableExt, Signal};
 use flume::{Receiver, Sender, unbounded};
 
+pub(crate) mod macros;
+
+#[cfg(feature = "tracing")]
+use bevy_log::tracing;
+
+#[cfg(feature = "tracing")]
+pub use tracing::{debug, error, info, trace, warn};
+
+#[cfg(not(feature = "tracing"))]
+#[macro_export]
+macro_rules! debug {
+    ($($arg:tt)*) => {()};
+}
+
+#[cfg(not(feature = "tracing"))]
+#[macro_export]
+macro_rules! error {
+    ($($arg:tt)*) => {()};
+}
+
+#[cfg(not(feature = "tracing"))]
+#[macro_export]
+macro_rules! info {
+    ($($arg:tt)*) => {()};
+}
+
+#[cfg(not(feature = "tracing"))]
+#[macro_export]
+macro_rules! trace {
+    ($($arg:tt)*) => {()};
+}
+
+#[cfg(not(feature = "tracing"))]
+#[macro_export(local_inner_macros)]
+macro_rules! warn {
+    ($($arg:tt)*) => {()};
+}
+
 #[cfg(feature = "query")]
 pub mod query;
 
@@ -84,7 +122,7 @@ impl CommandQueueSender {
         let (response_tx, response_rx) = flume::bounded(1);
         let cmd = make_command(response_tx);
         self.tx.send(cmd).map_err(|err| format!("{}, {}, {}", err.to_string(), file!(), line!()))?;
-        response_rx.recv_timeout(Duration::from_millis(100)).map_err(|err|  format!("{}, {}, {}", err.to_string(), file!(), line!()))
+        response_rx.recv_timeout(Duration::from_millis(10000)).map_err(|err|  format!("{}, {}, {}", err.to_string(), file!(), line!()))
     }
 }
 

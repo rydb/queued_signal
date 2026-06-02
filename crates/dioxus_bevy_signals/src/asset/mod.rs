@@ -11,7 +11,6 @@ pub use std::{
 use bevy_app::{Last, PostUpdate, Update};
 use bevy_asset::{Asset, AssetEvent, AssetId, AssetServer, Assets, Handle, LoadState, uuid::Uuid};
 use bevy_ecs::{prelude::*, world::CommandQueue};
-use bevy_log::warn;
 use bytemuck::{TransparentWrapper, TransparentWrapperAlloc};
 use dioxus::html::g::seed;
 use dioxus_core::{needs_update, use_drop, use_hook};
@@ -21,10 +20,11 @@ use flume::{Receiver, Sender};
 use generational_box::GenerationalRef;
 use linked_hash_set::LinkedHashSet;
 use parking_lot::Mutex;
-use queued_signal::signal::{HealthStatus, QueuedSignal, TrackedReadGuard, WriterDriver};
+use queued_signal::{signal::{HealthStatus, QueuedSignal, TrackedReadGuard, WriterDriver}};
 use trait_set::trait_set;
+pub(crate) use crate::macros::*;
 
-use crate::{add_systems_through_world, CommandQueueSender};
+use crate::{CommandQueueSender, add_systems_through_world};
 
 
 trait_set! {
@@ -181,10 +181,10 @@ pub fn init_requested_asset_mirrors<A: DioxusAssetSync>(
 ) {
     let requests = mirrors.init_requests.clone();
     for id in requests {
-        println!("PROCESSING ASSET INIT REQUEST");
+        trace!("processing asset init request");
 
         let Some(entry) = mirrors.assets.get_mut(&id) else {
-            println!("how was an asset requested, but not have its uninitialized value exist in the assets list? {}", type_name::<A>());
+            error!("how was an asset requested, but not have its uninitialized value exist in the assets list? {}", type_name::<A>());
             continue
         };
         let fetch = match asset_server.get_load_state(id) {
@@ -198,7 +198,7 @@ pub fn init_requested_asset_mirrors<A: DioxusAssetSync>(
                                 Ok(asset.clone())
                             },
                             None => {
-                                println!("how was this asset marked as loaded without Assets<A> holding the asset? {}", type_name::<A>());
+                                error!("how was this asset marked as loaded without Assets<A> holding the asset? {}", type_name::<A>());
                                 Err(AssetNoneState::Error("asset marked as loaded, but Assets<A> didn't have the asset".into()))
                             },
                             
@@ -236,7 +236,7 @@ pub fn sync_mirrors_to_assets<A: DioxusAssetSync>(
         };
         // dont re-set the asset on the same frame that it was set to a new value to stop infinite loops
         if changed.0.contains(id) == true {
-            println!("CHANGED INCLUDEDS {}, SKIPPING", id);
+            trace!("chhanged includes {}, skipping", id);
             continue
         }
         if let Some(entry) = mirrors.assets.get(id) {
@@ -365,7 +365,7 @@ fn update_signals_with_initialized_ids<A: DioxusAssetSync>(
         // let old_id = request.signal_extra_info.read().asset_id.clone();
 
         let Some((_, mirror)) = map.assets.remove_entry(&old_id) else {
-            println!("requested asset id for update is invalid? {}", old_id);
+            error!("requested asset id for update is invalid? {}", old_id);
             continue;
         };
 
@@ -440,8 +440,7 @@ impl<A: DioxusAssetSync> Command for RequestBevyAssetMirror<A> {
 
         let (asset_state, extra_info) = match map.assets.get_mut(&self.asset_id) {
             Some(asset) => {
-                // println!("REQUEsTED NEW SIGNAL AND SET NEW TRACKING VALUE FOR {} -> {}", asset.tracking_signals, asset.tracking_signals + 1);
-                // asset.tracking_signals += 1;
+                trace!("requested new signal and set new tracking value for {} -> {}", asset.tracking_signals, asset.tracking_signals + 1);
                 (asset.state.clone(), asset.extra_update_info.clone())
             },
             None => {
@@ -495,8 +494,6 @@ impl<A: DioxusAssetSync> Command for RequestBevyAssetMirror<A> {
                     extra_update_info_driver: extra_info_driver_arc,
                     tracking_signals: 0,
                 };
-                // let latest_ticket_id = map.asset_id_initialize_tickets.back().unwrap_or(&RequestAssetIdTicket { ticket_id: 0 });
-                // ticket_id = Some(RequestAssetIdTicket {ticket_id: latest_ticket_id.ticket_id + 1 });
                 map.assets.insert(self.asset_id, mirror);
                 map.init_requests.insert(self.asset_id);
                 (asset_state, extra_info)
@@ -507,10 +504,9 @@ impl<A: DioxusAssetSync> Command for RequestBevyAssetMirror<A> {
 
         let initialize_request_tx = world.resource::<UpdateAssetSignalSender<A>>();
 
-        println!("SENDING BACK NEW SIGNAL RESPONSE");
+        trace!("SENDING BACK NEW SIGNAL RESPONSE");
         let _ = self.response_tx.send(AssetMirrorRequestResponse {
             asset_state,
-            // asset_id_initialize_ticket: ticket_id,
             initialize_request_tx: initialize_request_tx.tx.clone(),
             extra_info,
         });
@@ -534,13 +530,13 @@ fn apply_tracking_queries_delta<A: DioxusAssetSync>(
     mut tracking_delta: ResMut<PendingAssetTrackingDeltas<A>>
 ) {
     for (id, delta) in tracking_delta.pending.drain(..) {
-        println!("PROCESSING INCREMENT FOR: {}:  {}", id, delta);
+        trace!("PROCESSING INCREMENT FOR: {}:  {}", id, delta);
         let clear = {
             let Some(entry) = mirrors.assets.get_mut(&id) else {
                 println!("delta change request recieved by asset doesn't exist in map? How did this happen?");
                 continue
             };
-            println!("ENTRY NEW TRACKING DELTA FOR ASSET ID {}: {} -> {}", id, entry.tracking_signals, entry.tracking_signals + delta);
+            trace!("ENTRY NEW TRACKING DELTA FOR ASSET ID {}: {} -> {}", id, entry.tracking_signals, entry.tracking_signals + delta);
 
             entry.tracking_signals += delta;
 
@@ -552,7 +548,7 @@ fn apply_tracking_queries_delta<A: DioxusAssetSync>(
             }
         };
         if clear {
-            println!("last signal referencing {}, dropped. removing un-used asset mirror from map", id);
+            trace!("last signal referencing {}, dropped. removing un-used asset mirror from map", id);
             mirrors.assets.remove(&id);
         }
     }
@@ -663,7 +659,7 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
     let ctx_clone = ctx.clone();
     use_effect(move || {
         let asset_id = response.extra_info.read().asset_id;
-        println!("ASSET SIGNAL MOUNTED, SENDING +1 for {:?}", asset_id);
+        trace!("ASSET SIGNAL MOUNTED, SENDING +1 for {:?}", asset_id);
         let mut queue = CommandQueue::default();
         queue.push(UpdateTrackingAssets::<A> {
             delta: 1,
@@ -676,7 +672,7 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
     let r = ctx.clone();
     use_drop(move || {
         let asset_id = *current_asset_id.read();
-        println!("ASSET SIGNAL DROPPED, SENDING -1 for {:?}", asset_id);
+        trace!("ASSET SIGNAL DROPPED, SENDING -1 for {:?}", asset_id);
         let mut queue = CommandQueue::default();
         queue.push(UpdateTrackingAssets::<A> {
             delta: -1,
