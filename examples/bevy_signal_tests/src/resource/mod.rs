@@ -4,7 +4,6 @@ use dioxus::prelude::*;
 use dioxus_bevy_signals::resource::use_bevy_resource;
 use dioxus_core::Element;
 use dioxus_hooks::use_memo;
-use dioxus_signals::ReadableExt;
 use queued_signal::signal::HealthStatus;
 use std::time::{Duration, Instant};
 
@@ -77,7 +76,6 @@ impl DioxusTestPlugin for ResourceTestsPlugin {
 /// bevy resource <-> dioxus sync test
 #[component]
 pub fn CounterResource() -> Element {
-    bevy_log::warn!("warn success!");
     let counter = use_bevy_resource::<Counter>();
 
     let value = use_memo(move || {
@@ -99,7 +97,7 @@ pub fn CounterResource() -> Element {
     rsx! {
         div {
             style: "border: 2px solid black; background-color: #f0f0f0; padding: 16px; border-radius: 8px;",
-            h2 {" bevy resource <-> dioxus sync"}
+            h2 {" bevy resource <-> dioxus"}
 
             h1 { "Counter: {value}" }
             p { "Health: {health_text}" }

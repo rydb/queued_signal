@@ -174,26 +174,13 @@ pub fn toggleable_query_mirror_output(
     }
 }
 
-/// component for testing cleanup for components that leaks memory, and to see if:
-/// 1. the leak is caught and identified
-/// 2. the component is shutdown
-#[component]
-pub fn BadComponentTest() -> Element {
-    rsx! {
-        ErrorBoundary {
-
-        }
-    }
-}
-
 #[component]
 pub fn ToggleableQuery() -> Element {
     let second_query = use_bevy_query::<ToggleableQueryData, ToggleableQueryFilter>();
-    let second_query = use_signal(|| second_query.clone());
 
     let second_query_str = use_memo(move || {
         let mut value = "".to_owned();
-        let Some((_e, name, _)) = second_query.read().iter().next() else {
+        let Some((_e, name, _)) = second_query.iter().next() else {
             return value;
         };
         value = format!("Name: {}", **name.read());
@@ -221,15 +208,13 @@ pub fn TenNamesQuery() -> Element {
 
     let mut conditional_query_hidden = use_signal(|| true);
 
-    let names = use_signal(|| names.clone());
-
     let names_list_str = use_memo(move || {
         let mut value = "".to_string();
 
         println!("changed names list str");
         let mut new_str_list = Vec::new();
 
-        for (_e, name, greets) in names.read().iter() {
+        for (_e, name, greets) in names.iter() {
             new_str_list.push((name.read().clone(), greets.read().clone()))
         }
         let mut new_str_list = new_str_list
@@ -244,7 +229,7 @@ pub fn TenNamesQuery() -> Element {
     let greet_button_onclick = move |_evt| {
         println!("sending greet");
 
-        for (_e, _n, greet) in names.read().iter() {
+        for (_e, _n, greet) in names.iter() {
             println!("greeting");
             greet.value.mutate(|n| n.value += 1);
         }
@@ -263,7 +248,7 @@ pub fn TenNamesQuery() -> Element {
         div {
             style: "border: 2px solid black; background-color: #f0f0f0; padding: 16px; border-radius: 8px;",
             h1 {
-                "bevy query <-> dioxus sync test"
+                "bevy query <-> dioxus"
             }
             h1 {
                 "names list:"

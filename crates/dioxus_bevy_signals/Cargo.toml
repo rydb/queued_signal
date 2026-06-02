@@ -19,8 +19,6 @@ flume = {workspace = true}
 queued_signal = {workspace = true}
 trait-set = {workspace = true}
 bevy_log = {workspace = true, optional = true}
-linked_hash_set = {workspace = true}
-
 
 [features]
 asset = []

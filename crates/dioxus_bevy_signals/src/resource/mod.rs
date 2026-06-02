@@ -22,7 +22,7 @@ pub type Result<T, E> = std::result::Result<T, E>;
 
 trait_set! {
     /// Resource that is syncable with dioxus
-    pub trait ResourceDioxusSync = Resource + Clone + Send + Sync + 'static;
+    pub trait ResourceDioxusSync = bevy_ecs::resource::Resource + Clone + Send + Sync + 'static;
 }
 
 #[derive(Resource)]
@@ -188,6 +188,7 @@ impl<T: Clone + Send + Sync + 'static> Deref for ResourceMirrorSignal<T> {
     }
 }
 
+/// Create or fetch a QueuedSignal mirror to a bevy resource
 pub fn use_bevy_resource<T>() -> ResourceMirrorSignal<T>
 where
     T: ResourceDioxusSync,

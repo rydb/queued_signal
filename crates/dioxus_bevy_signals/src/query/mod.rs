@@ -20,7 +20,7 @@ use bevy_ecs::{
     world::CommandQueue,
 };
 use dioxus_core::{use_drop, use_hook};
-use dioxus_hooks::{use_context, use_effect};
+use dioxus_hooks::{use_context, use_effect, use_signal};
 use dioxus_signals::{ReadableExt, Signal};
 use flume::Sender;
 use parking_lot::Mutex;
@@ -761,9 +761,10 @@ pub struct MirrorQueryWriteDriver<Q: DioxusQuerySync, F: QueryFilter>(
 pub struct MirrorQuerySignalHandle<Q: MirrorQueryData, F: QueryFilter> {
     signal: Signal<Option<Arc<MirrorQuery<Q, F>>>>,
     pub health: Signal<HealthStatus>,
-    pub writer: QueuedSignal<MirrorQuery<Q, F>>,
+    pub writer: Signal<QueuedSignal<MirrorQuery<Q, F>>>,
     _filter: PhantomData<F>,
 }
+
 
 impl<Q: MirrorQueryData, F: QueryFilter> Clone for MirrorQuerySignalHandle<Q, F> {
     fn clone(&self) -> Self {
@@ -775,6 +776,8 @@ impl<Q: MirrorQueryData, F: QueryFilter> Clone for MirrorQuerySignalHandle<Q, F>
         }
     }
 }
+
+impl<Q: MirrorQueryData, F: QueryFilter> Copy for MirrorQuerySignalHandle<Q, F> {}
 
 pub struct MirrorQueryIter<Q: MirrorQueryData, F: QueryFilter> {
     items: std::vec::IntoIter<Q::MirrorItemHandles>,
@@ -855,7 +858,7 @@ pub fn use_bevy_query<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>()
     MirrorQuerySignalHandle {
         signal: value_signal,
         health,
-        writer: signal,
+        writer: use_signal(|| signal),
         _filter: PhantomData::default(),
     }
 }

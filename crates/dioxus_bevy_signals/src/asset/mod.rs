@@ -17,7 +17,6 @@ use dioxus_core::{use_drop, use_hook};
 use dioxus_hooks::{use_context, use_effect, use_memo, use_signal};
 use dioxus_signals::{Memo, ReadableExt, Signal, WritableExt};
 use flume::{Receiver, Sender};
-use linked_hash_set::LinkedHashSet;
 use parking_lot::Mutex;
 use queued_signal::signal::{HealthStatus, QueuedSignal, WriterDriver};
 use trait_set::trait_set;
@@ -122,7 +121,6 @@ pub struct AssetMaybeMirror<A: DioxusAssetSync> {
 #[derive(Resource)]
 pub struct AssetMirrorMap<A: DioxusAssetSync> {
     assets: HashMap<AssetId<A>, AssetMaybeMirror<A>>,
-    asset_id_initialize_tickets: LinkedHashSet<RequestAssetIdTicket>,
     init_requests: HashSet<AssetId<A>>,
 }
 
@@ -131,7 +129,6 @@ impl<A: DioxusAssetSync> Default for AssetMirrorMap<A> {
         Self {
             assets: Default::default(),
             init_requests: Default::default(),
-            asset_id_initialize_tickets: Default::default(),
         }
     }
 }
@@ -289,10 +286,6 @@ pub fn clear_changed_flags<A: DioxusAssetSync>(mut changed: ResMut<ChangedAssetM
     changed.0.clear();
 }
 
-pub struct AssetInitResponse<A: DioxusAssetSync> {
-    signal: QueuedSignal<AssetMaybeMirrorState<A>>,
-}
-
 #[derive(Resource)]
 pub struct AssetSyncInitialized<A: DioxusAssetSync> {
     _phantom: PhantomData<A>,
@@ -304,31 +297,13 @@ pub struct AssetSignalId {
     id: u32,
 }
 
-#[derive(Resource)]
-pub struct RegisteredAssetSignals<A: DioxusAssetSync> {
-    ids: LinkedHashSet<AssetSignalId>,
-    _phantom: PhantomData<A>,
-}
-
-impl<A: DioxusAssetSync> Default for RegisteredAssetSignals<A> {
-    fn default() -> Self {
-        Self {
-            ids: Default::default(),
-            _phantom: Default::default(),
-        }
-    }
-}
-
 #[derive(Hash, PartialEq, Eq, Clone, Copy)]
 pub struct RequestAssetIdTicket {
     ticket_id: u32,
 }
 
 pub struct InitializeSignalAssetIdRequest<A: DioxusAssetSync> {
-    // signal: QueuedSignal<AssetMaybeMirrorState<A>>,
-    // signal_extra_info: QueuedSignal<AssetUpdateExtraInfo<A>>,
     new_id: AssetId<A>,
-    // requesting_signal_ticket: RequestAssetIdTicket,
     old_id: AssetId<A>,
 }
 
@@ -411,7 +386,6 @@ impl<A: DioxusAssetSync> Command for RequestBevyAssetMirror<A> {
                     tx: initialize_asset_id_tx,
                 });
                 world.insert_resource(PendingAssetTrackingDeltas::<A>::default());
-                world.insert_resource(RegisteredAssetSignals::<A>::default());
 
                 add_systems_through_world(world, Update, collect_changed_ids::<A>);
                 add_systems_through_world(world, Update, drive_maybe_assets::<A>);
@@ -635,6 +609,10 @@ impl<A: DioxusAssetSync> AssetMaybeMirrorSignal<A> {
             None => self.dummy_value.deref()(),
         };
         value
+    }
+    pub fn health(&self) -> HealthStatus {
+        let health = *self.health.read();
+        health
     }
 }
 use std::fmt::Debug;
