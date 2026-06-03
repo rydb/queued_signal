@@ -385,9 +385,6 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
     }
 }
 
-// -----------------------------------------------------------------------------
-// QueuedSignal (public handle)
-// -----------------------------------------------------------------------------
 #[derive(Clone)]
 pub struct QueuedSignal<T: Clone + Send + Sync> {
     pub state: QueuedState<T>,
@@ -463,15 +460,22 @@ impl<T: Clone + Send + Sync + 'static> QueuedSignal<T> {
         self.state.health()
     }
 
-    pub fn use_hook(&self) -> (Signal<Option<Arc<T>>>, Signal<HealthStatus>) {
-        use_queued_signal(self.state.clone())
+    pub fn use_hook<E: 'static>(&self, error_state: E) -> (Signal<Result<Arc<T>, E>>, Signal<HealthStatus>) {
+        use_queued_signal(self.state.clone(), error_state)
+    }
+
+    /// Like [`use_hook`], but passes `Arc<T>` directly without wrapping in `Ok()`.
+    pub fn use_hook_direct(&self, initial: T) -> (Signal<Arc<T>>, Signal<HealthStatus>) {
+        use_queued_signal_direct(self.state.clone(), initial)
     }
 }
 
-pub fn use_queued_signal<T: Clone + Send + Sync + 'static>(
+/// Subscribe a [`Signal`] to a [`QueuedState`], wrapping each value in `Ok(Arc<T>)`.
+pub fn use_queued_signal<T: Clone + Send + Sync + 'static, E: 'static>(
     state: QueuedState<T>,
-) -> (Signal<Option<Arc<T>>>, Signal<HealthStatus>) {
-    let mut value_signal = use_signal(|| None);
+    error_state: E,
+) -> (Signal<Result<Arc<T>, E>>, Signal<HealthStatus>) {
+    let mut value_signal = use_signal(|| Err(error_state));
     let mut health_signal = use_signal(|| HealthStatus::Healthy);
 
     use_future(move || {
@@ -484,16 +488,46 @@ pub fn use_queued_signal<T: Clone + Send + Sync + 'static>(
             loop {
                 tokio::select! {
                     Ok(()) = notify_rx.changed() => {
-                        // let current_version = *notify_rx.borrow();
-
-                        let Some(guard) = read_handle.enter() else {
-                            break
-                        };
+                        let Some(guard) = read_handle.enter() else { break };
                         let reader_id = registry.register();
                         registry.heartbeat(reader_id);
+                        value_signal.set(Ok(guard.0.clone()));
+                        registry.unregister(reader_id);
+                    }
+                    Ok(()) = health_rx.changed() => {
+                        health_signal.set(*health_rx.borrow());
+                    }
+                    else => break,
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+    });
 
-                        // Clone the Arc<T>, not T itself. Just a refcount bump.
-                        value_signal.set(Some(guard.0.clone()));
+    (value_signal, health_signal)
+}
+
+pub fn use_queued_signal_direct<T: Clone + Send + Sync + 'static>(
+    state: QueuedState<T>,
+    initial: T,
+) -> (Signal<Arc<T>>, Signal<HealthStatus>) {
+    let mut value_signal = use_signal(|| Arc::new(initial));
+    let mut health_signal = use_signal(|| HealthStatus::Healthy);
+
+    use_future(move || {
+        let mut notify_rx = state.notify_rx();
+        let mut health_rx = state.health_rx.clone();
+        let read_handle = state.read_handle.clone();
+        let registry = state.registry.clone();
+
+        async move {
+            loop {
+                tokio::select! {
+                    Ok(()) = notify_rx.changed() => {
+                        let Some(guard) = read_handle.enter() else { break };
+                        let reader_id = registry.register();
+                        registry.heartbeat(reader_id);
+                        value_signal.set(guard.0.clone());
                         registry.unregister(reader_id);
                     }
                     Ok(()) = health_rx.changed() => {

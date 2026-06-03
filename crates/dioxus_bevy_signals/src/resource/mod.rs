@@ -11,18 +11,23 @@ use parking_lot::Mutex;
 use queued_signal::signal::{HealthStatus, QueuedSignal, WriterDriver};
 use std::any::{TypeId, type_name};
 use std::collections::HashSet;
-use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
 use trait_set::trait_set;
 
-use crate::{CommandQueueSender, add_systems_through_world};
+use crate::{CommandQueueSender, add_systems_through_world, SignalReadGuard};
 
 pub type Result<T, E> = std::result::Result<T, E>;
 
 trait_set! {
     /// Resource that is syncable with dioxus
     pub trait ResourceDioxusSync = bevy_ecs::resource::Resource + Clone + Send + Sync + 'static;
+}
+
+/// Error state for a resource signal that hasn't been initialized yet.
+#[derive(Clone, Debug)]
+pub enum ResourceNoneState {
+    NotInitialized,
 }
 
 #[derive(Resource)]
@@ -143,7 +148,7 @@ fn drive_signal<T: ResourceDioxusSync>(
 /// Dioxus signal for managing bevy resource <-> dioxus interop.
 #[derive(Clone)]
 pub struct ResourceMirrorSignal<R: Clone + Send + Sync + 'static> {
-    pub signal: Signal<Option<Arc<R>>>,
+    pub signal: Signal<Result<Arc<R>, ResourceNoneState>>,
     pub health: Signal<HealthStatus>,
     pub writer: Signal<QueuedSignal<R>>,
 }
@@ -173,18 +178,18 @@ impl<R: Clone + Send + Sync + 'static> ResourceMirrorSignal<R> {
         *self.health.read()
     }
 
-    pub fn read(&self) -> Option<Arc<R>> {
-        let value = self.signal.deref();
-
-        let value = value();
-        value
+    /// Read resource 
+    pub fn read(&self) -> SignalReadGuard<'_, Result<Arc<R>, ResourceNoneState>> {
+        SignalReadGuard::new(self.signal.read())
     }
-}
 
-impl<T: Clone + Send + Sync + 'static> Deref for ResourceMirrorSignal<T> {
-    type Target = Signal<Option<Arc<T>>>;
-    fn deref(&self) -> &Self::Target {
-        &self.signal
+    /// Read and map the `Ok` variant of the resource, or pass through the error.
+    pub fn read_ok<U>(&self, f: impl FnOnce(&R) -> U) -> Result<U, ResourceNoneState> {
+        let guard = self.signal.read();
+        match &*guard {
+            Ok(arc_r) => Ok(f(arc_r.as_ref())),
+            Err(e) => Err(e.clone()),
+        }
     }
 }
 
@@ -206,7 +211,7 @@ where
     })
     .unwrap();
 
-    let (value_signal, health_signal) = signal.use_hook();
+    let (value_signal, health_signal) = signal.use_hook(ResourceNoneState::NotInitialized);
 
     let signal = use_signal(|| signal);
     ResourceMirrorSignal {

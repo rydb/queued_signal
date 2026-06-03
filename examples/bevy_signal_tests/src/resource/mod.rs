@@ -79,8 +79,7 @@ pub fn CounterResource() -> Element {
     let counter = use_bevy_resource::<Counter>();
 
     let value = use_memo(move || {
-        let value = counter.read().map(|c| c.value).unwrap_or(0);
-        value
+        counter.read_ok(|c| c.value).unwrap_or(0)
     });
 
     let health = counter.health();

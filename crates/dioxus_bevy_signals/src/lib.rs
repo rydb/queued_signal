@@ -1,5 +1,6 @@
 use std::{
     any::type_name_of_val,
+    sync::Arc,
     time::Duration,
 };
 
@@ -122,6 +123,8 @@ pub struct DioxusBevyMirrorPlugin {
     pub bevy_command_txrx: BevyCommandChannels,
 }
 
+
+
 impl Plugin for DioxusBevyMirrorPlugin {
     fn build(&self, app: &mut App) {
         // let (cmd_tx, cmd_rx) = unbounded::<CommandQueue>();
@@ -168,5 +171,24 @@ pub fn use_bevy_command_queue() -> BevyCommandsSignal {
 
     BevyCommandsSignal {
         command_queue_sender: Signal::new(command_queue),
+    }
+}
+
+/// Thin read guard to signal value.
+pub struct SignalReadGuard<'a, T: 'static> {
+    guard: dioxus_signals::ReadableRef<'a, Signal<T>>,
+}
+
+impl<'a, T: 'static> SignalReadGuard<'a, T> {
+    pub(crate) fn new(guard: dioxus_signals::ReadableRef<'a, Signal<T>>) -> Self {
+        Self { guard }
+    }
+}
+
+impl<'a, T: 'static> std::ops::Deref for SignalReadGuard<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
     }
 }

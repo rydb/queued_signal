@@ -100,13 +100,9 @@ pub fn ToggleableAsset() -> Element {
     let color = use_bevy_asset(handle);
 
     let status_string = use_memo(move || {
-        let mut text = "Loading...".to_owned();
-
-        let Ok(color) = &*color.read() else {
-            return text;
-        };
-        text = format!("{:?}", color.base_color);
-        text
+        color
+            .read_ok(|c| format!("{:?}", c.base_color))
+            .unwrap_or_else(|_| "Loading...".to_owned())
     });
 
     let make_white = move |_| {
@@ -174,12 +170,9 @@ pub fn AssetColorPicker() -> Element {
 
     // Derive the colour text reactively
     let color_text = use_memo(move || {
-        let mut text = "Loading...".to_string();
-        let Ok(color) = &*asset_state.read() else {
-            return text;
-        };
-        text = format!("{:?}", color.base_color);
-        text
+        asset_state
+            .read_ok(|c| format!("{:?}", c.base_color))
+            .unwrap_or_else(|_| "Loading...".to_string())
     });
 
     let on_click_white = move |_| {
