@@ -21,9 +21,9 @@ use bevy_ecs::{
     world::CommandQueue,
 };
 use dioxus_core::{use_drop, use_hook};
-use dioxus_hooks::{use_context, use_effect, use_signal};
-use dioxus_signals::{ReadableExt, Signal};
-use flume::Sender;
+use dioxus_hooks::{use_context, use_effect, use_future, use_signal};
+use dioxus_signals::{ReadableExt, Signal, WritableExt};
+use tokio::sync::oneshot;
 use parking_lot::Mutex;
 use queued_signal::signal::{HealthStatus, QueuedSignal, WriterDriver};
 use trait_set::trait_set;
@@ -412,7 +412,7 @@ impl<T: DioxusComponentSync> Command for RequestComponentsMirror<T> {
     }
 }
 pub struct RequestQueryMirror<T: DioxusQuerySync, F: QueryFilter + 'static> {
-    response_tx: Sender<QueuedSignal<MirrorQuery<T, F>>>,
+    response_tx: oneshot::Sender<QueuedSignal<MirrorQuery<T, F>>>,
 }
 
 impl<T: DioxusQuerySync + 'static, F: QueryFilter> Command for RequestQueryMirror<T, F> {
@@ -759,7 +759,8 @@ pub struct MirrorQueryWriteDriver<Q: DioxusQuerySync, F: QueryFilter>(
 pub struct MirrorQuerySignalHandle<Q: MirrorQueryData, F: QueryFilter> {
     signal: Signal<Result<Arc<MirrorQuery<Q, F>>, QueryNoneState>>,
     pub health: Signal<HealthStatus>,
-    pub writer: Signal<QueuedSignal<MirrorQuery<Q, F>>>,
+    /// `None` until the Bevy round-trip completes (non-blocking).
+    pub writer: Signal<Option<QueuedSignal<MirrorQuery<Q, F>>>>,
     _filter: PhantomData<F>,
 }
 
@@ -816,12 +817,12 @@ impl<Q: MirrorQueryData + 'static, F: QueryFilter + 'static> MirrorQuerySignalHa
     }
 }
 
-/// Create or fetch a [`MirrorQuery`] signal of mirrored components that can be edited to reflect changes to and read from the bevy world.
+/// Create or fetch a [`MirrorQuery`] signal of mirrored components — **non-blocking**.
 pub fn use_bevy_query<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>()
 -> MirrorQuerySignalHandle<Q, F> {
     let ctx = use_context::<CommandQueueSender>();
 
-    // Increment tracking when the component mounts.
+    // Increment tracking when the component mounts (non-blocking send).
     let r = ctx.clone();
     use_effect(move || {
         trace!("query signal mounted, sending increment command");
@@ -845,24 +846,34 @@ pub fn use_bevy_query<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>()
         let _ = r.tx.send(queue);
     });
 
-    let signal = use_hook(|| {
-        trace!("sending query signal");
-        ctx.send_command(|tx| {
-            let mut command_queue = CommandQueue::default();
-            let command = RequestQueryMirror::<Q, F> { response_tx: tx };
-            command_queue.push(command);
-            command_queue
-        })
-        .inspect_err(|err| warn!("{}", err))
-    })
-    .unwrap();
+    let mut value_signal = use_signal(|| Err(QueryNoneState::NotInitialized));
+    let mut health_signal = use_signal(|| HealthStatus::Healthy);
+    let mut writer: Signal<Option<QueuedSignal<MirrorQuery<Q, F>>>> = use_signal(|| None);
 
-    let (value_signal, health) = signal.use_hook(QueryNoneState::NotInitialized);
+    let ctx2 = ctx.clone();
+    use_future(move || {
+        let ctx = ctx2.clone();
+        async move {
+            match ctx.send_command_async(|tx| {
+                let mut q = CommandQueue::default();
+                q.push(RequestQueryMirror::<Q, F> { response_tx: tx });
+                q
+            }).await {
+                Ok(signal) => {
+                    signal.state.forward_to(
+                        value_signal, health_signal, |arc| Ok(arc),
+                    );
+                    writer.set(Some(signal));
+                }
+                Err(err) => warn!("use_bevy_query: {}", err),
+            }
+        }
+    });
 
     MirrorQuerySignalHandle {
         signal: value_signal,
-        health,
-        writer: use_signal(|| signal),
+        health: health_signal,
+        writer,
         _filter: PhantomData::default(),
     }
 }

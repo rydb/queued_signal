@@ -1,6 +1,6 @@
 use std::{rc::Rc, thread};
 
-use bevy_app::{App, Plugin};
+use bevy_app::{App, Plugin, ScheduleRunnerPlugin};
 use bevy_log::debug;
 use dioxus::prelude::*;
 use dioxus::{LaunchBuilder, prelude::rsx};
@@ -97,7 +97,10 @@ pub fn run_signal_tests() {
     let r = signal_tests_plguin.clone();
     let bevy_thread = thread::spawn(move || {
         let mut app = App::new();
-        app.add_plugins(r).run();
+        app
+        // run app in headless mode
+        .add_plugins(ScheduleRunnerPlugin::default())
+        .add_plugins(r).run();
     });
 
     LaunchBuilder::new()

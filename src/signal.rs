@@ -21,36 +21,36 @@ pub enum HealthStatus {
 }
 
 #[derive(Debug)]
-struct ReaderRegistry {
+pub struct ReaderRegistry {
     readers: Mutex<HashMap<u64, Instant>>,
     next_id: AtomicU64,
 }
 
 impl ReaderRegistry {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             readers: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
         }
     }
 
-    fn register(&self) -> u64 {
+    pub fn register(&self) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.readers.lock().insert(id, Instant::now());
         id
     }
 
-    fn unregister(&self, id: u64) {
+    pub fn unregister(&self, id: u64) {
         self.readers.lock().remove(&id);
     }
 
-    fn heartbeat(&self, id: u64) {
+    pub fn heartbeat(&self, id: u64) {
         if let Some(last_seen) = self.readers.lock().get_mut(&id) {
             *last_seen = Instant::now();
         }
     }
 
-    fn check_stalled(&self, timeout: Duration) -> Vec<u64> {
+    pub fn check_stalled(&self, timeout: Duration) -> Vec<u64> {
         let now = Instant::now();
         self.readers
             .lock()
@@ -143,10 +143,10 @@ impl<T: Clone + Send + Sync> Absorb<SignalOp<T>> for Absorbable<T> {
 
 /// Inner state of QueuedSignal
 pub struct QueuedState<T: Clone + Send + Sync> {
-    read_handle: ReadHandle<Absorbable<T>>,
-    notify_rx: watch::Receiver<u64>,
-    health_rx: watch::Receiver<HealthStatus>,
-    registry: Arc<ReaderRegistry>,
+    pub read_handle: ReadHandle<Absorbable<T>>,
+    pub notify_rx: watch::Receiver<u64>,
+    pub health_rx: watch::Receiver<HealthStatus>,
+    pub registry: Arc<ReaderRegistry>,
 }
 
 impl<T: Clone + Send + Sync> Debug for QueuedState<T> {
@@ -180,8 +180,50 @@ impl<T: Clone + Send + Sync> QueuedState<T> {
     pub fn health(&self) -> HealthStatus {
         *self.health_rx.borrow()
     }
-    fn notify_rx(&self) -> watch::Receiver<u64> {
+    pub fn notify_rx(&self) -> watch::Receiver<u64> {
         self.notify_rx.clone()
+    }
+}
+
+impl<T: Clone + Send + Sync + 'static> QueuedState<T> {
+    /// Spawn a background task that forwards values from this `QueuedState`
+    /// into existing Dioxus signals.  This is the non‑hook equivalent of
+    /// [`QueuedSignal::use_hook`] — call it from inside a `use_future` once
+    /// you have obtained the real `QueuedState` asynchronously.
+    ///
+    /// `map` converts `Arc<T>` into whatever the value signal expects
+    /// (e.g. `|arc| Ok(arc)` for `Signal<Result<Arc<T>, E>>`).
+    pub fn forward_to<V: 'static>(
+        &self,
+        value_signal: Signal<V>,
+        health_signal: Signal<HealthStatus>,
+        map: impl Fn(Arc<T>) -> V + 'static,
+    ) {
+        let state = self.clone();
+        // Use Dioxus's local spawn (not tokio::spawn) because `Signal`
+        // is not `Send` (it uses `RefCell` internally).
+        spawn(async move {
+            let mut value_signal = value_signal;
+            let mut health_signal = health_signal;
+            let mut nr = state.notify_rx();
+            let mut hr = state.health_rx.clone();
+            loop {
+                tokio::select! {
+                    Ok(()) = nr.changed() => {
+                        let Some(g) = state.read_handle.enter() else { break };
+                        let reader_id = state.registry.register();
+                        state.registry.heartbeat(reader_id);
+                        value_signal.set(map(g.0.clone()));
+                        state.registry.unregister(reader_id);
+                    }
+                    Ok(()) = hr.changed() => {
+                        health_signal.set(*hr.borrow());
+                    }
+                    else => break,
+                }
+                tokio::task::yield_now().await;
+            }
+        });
     }
 }
 

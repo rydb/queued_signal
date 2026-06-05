@@ -3,16 +3,16 @@ use bevy_app::prelude::*;
 use bevy_ecs::world::CommandQueue;
 use bevy_ecs::prelude::*;
 use dioxus::prelude::*;
-use dioxus_core::use_hook;
 use dioxus_hooks::{use_context, use_signal};
 use dioxus_signals::{ReadableExt, Signal};
-use flume::Sender;
 use parking_lot::Mutex;
 use queued_signal::signal::{HealthStatus, QueuedSignal, WriterDriver};
 use std::any::{TypeId, type_name};
 use std::collections::HashSet;
+use std::fmt::Display;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::oneshot;
 use trait_set::trait_set;
 
 use crate::{CommandQueueSender, add_systems_through_world, SignalReadGuard};
@@ -30,11 +30,19 @@ pub enum ResourceNoneState {
     NotInitialized,
 }
 
+impl From<ResourceNoneState> for String {
+    fn from(value: ResourceNoneState) -> Self {
+        match value {
+            ResourceNoneState::NotInitialized => "Not Initialized".into(),
+        }
+    }
+}
+
 #[derive(Resource)]
 pub struct ResourceWriteDriver<T: ResourceDioxusSync>(pub Arc<Mutex<WriterDriver<T>>>);
 
 struct RequestBevyResource<T: ResourceDioxusSync> {
-    response_tx: Sender<QueuedSignal<T>>,
+    response_tx: oneshot::Sender<QueuedSignal<T>>,
 }
 
 #[derive(Resource)]
@@ -150,35 +158,49 @@ fn drive_signal<T: ResourceDioxusSync>(
 pub struct ResourceMirrorSignal<R: Clone + Send + Sync + 'static> {
     pub signal: Signal<Result<Arc<R>, ResourceNoneState>>,
     pub health: Signal<HealthStatus>,
-    pub writer: Signal<QueuedSignal<R>>,
+    /// `None` until the Bevy round-trip completes (non-blocking). Writes are
+    /// silently ignored while the writer is still pending.
+    pub writer: Signal<Option<QueuedSignal<R>>>,
 }
 
 impl<R: Clone + Send + Sync + 'static> Copy for ResourceMirrorSignal<R> {}
+
+impl<R: Clone + Send + Sync + 'static + Display> Display for ResourceMirrorSignal<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.read_ok(|n| format!("{}", n)).unwrap_or_else(|n| n.into()))
+    }
+}
 
 impl<R: Clone + Send + Sync + 'static> ResourceMirrorSignal<R> {
     pub fn mutate<F>(&self, f: F)
     where
         F: Fn(&mut R) + Send + Sync + 'static,
     {
-        self.writer.read().mutate(f);
+        if let Some(w) = self.writer.read().as_ref() {
+            w.mutate(f);
+        }
     }
 
     pub fn mutate_set<F>(&self, f: F)
     where
         F: Fn(&mut R) + Send + Sync + 'static,
     {
-        self.writer.read().mutate_set(f);
+        if let Some(w) = self.writer.read().as_ref() {
+            w.mutate_set(f);
+        }
     }
 
     pub fn set_value(&self, value: Arc<R>) {
-        self.writer.read().set_value(value);
+        if let Some(w) = self.writer.read().as_ref() {
+            w.set_value(value);
+        }
     }
 
     pub fn health(&self) -> HealthStatus {
         *self.health.read()
     }
 
-    /// Read resource 
+    /// Read resource
     pub fn read(&self) -> SignalReadGuard<'_, Result<Arc<R>, ResourceNoneState>> {
         SignalReadGuard::new(self.signal.read())
     }
@@ -193,30 +215,51 @@ impl<R: Clone + Send + Sync + 'static> ResourceMirrorSignal<R> {
     }
 }
 
-/// Create or fetch a QueuedSignal mirror to a bevy resource
+/// Create or fetch a QueuedSignal mirror to a bevy resource.
+///
+/// This hook is **non-blocking**: it returns immediately with the value
+/// signal set to [`ResourceNoneState::NotInitialized`] and the writer
+/// set to `None`.  The real [`QueuedSignal`] is fetched asynchronously
+/// via [`CommandQueueSender::send_command_async`] and installed when
+/// the Bevy world processes the request.
 pub fn use_bevy_resource<T>() -> ResourceMirrorSignal<T>
 where
     T: ResourceDioxusSync,
 {
     let ctx = use_context::<CommandQueueSender>();
-    let signal = use_hook(|| {
-        trace!("sending signal {}", type_name::<T>());
-        ctx.send_command(|tx| {
-            let mut command_queue = CommandQueue::default();
-            let command = RequestBevyResource::<T> { response_tx: tx };
-            command_queue.push(command);
-            command_queue
-        })
-        .inspect_err(|err| warn!("{}", err))
-    })
-    .unwrap();
 
-    let (value_signal, health_signal) = signal.use_hook(ResourceNoneState::NotInitialized);
+    let mut value_signal = use_signal(|| Err(ResourceNoneState::NotInitialized));
+    let mut health_signal = use_signal(|| HealthStatus::Healthy);
+    let mut writer: Signal<Option<QueuedSignal<T>>> = use_signal(|| None);
 
-    let signal = use_signal(|| signal);
+    let ctx_clone = ctx.clone();
+    use_future(move || {
+        let ctx = ctx_clone.clone();
+        async move {
+            match ctx
+                .send_command_async(|tx| {
+                    let mut command_queue = CommandQueue::default();
+                    command_queue.push(RequestBevyResource::<T> { response_tx: tx });
+                    command_queue
+                })
+                .await
+            {
+                Ok(signal) => {
+                    signal.state.forward_to(
+                        value_signal,
+                        health_signal,
+                        |arc| Ok(arc),
+                    );
+                    writer.set(Some(signal));
+                }
+                Err(err) => warn!("use_bevy_resource: {}", err),
+            }
+        }
+    });
+
     ResourceMirrorSignal {
         signal: value_signal,
         health: health_signal,
-        writer: signal,
+        writer,
     }
 }

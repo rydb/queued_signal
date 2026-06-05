@@ -14,6 +14,7 @@ use bevy_ecs::{
 use dioxus_hooks::use_context;
 use dioxus_signals::Signal;
 use flume::{Receiver, Sender, unbounded};
+use tokio::sync::oneshot;
 
 pub(crate) mod macros;
 pub(crate) use crate::macros::{debug, error, info, trace, warn};
@@ -84,6 +85,9 @@ pub struct CommandQueueSender {
 }
 
 impl CommandQueueSender {
+    /// Synchronously send a command to bevy and block for the response (up to 10s).
+    /// Prefer [`send_command_async`] in async contexts (e.g., Dioxus hooks) to avoid
+    /// blocking the runtime.
     pub fn send_command<R: Send + 'static>(
         &self,
         make_command: impl FnOnce(Sender<R>) -> CommandQueue,
@@ -96,6 +100,27 @@ impl CommandQueueSender {
         response_rx
             .recv_timeout(Duration::from_millis(10000))
             .map_err(|err| format!("{}, {}, {}", err.to_string(), file!(), line!()))
+    }
+
+    /// Async variant of [`send_command`]. Uses a `tokio::sync::oneshot` channel so the
+    /// caller can `.await` the response without blocking any OS thread.
+    ///
+    /// No explicit timeout is used — Dioxus's `use_future` runs on a manually-polled
+    /// virtual DOM without a tokio reactor, so `tokio::time::timeout` would hang.
+    /// The oneshot resolves once Bevy processes the command (typically next frame).
+    pub async fn send_command_async<R: Send + 'static>(
+        &self,
+        make_command: impl FnOnce(oneshot::Sender<R>) -> CommandQueue,
+    ) -> Result<R, String> {
+        let (response_tx, response_rx) = oneshot::channel();
+        let cmd = make_command(response_tx);
+        self.tx
+            .send(cmd)
+            .map_err(|err| format!("{}", err))?;
+
+        response_rx
+            .await
+            .map_err(|_| format!("sender dropped before responding"))
     }
 }
 
@@ -123,15 +148,19 @@ pub struct DioxusBevyMirrorPlugin {
     pub bevy_command_txrx: BevyCommandChannels,
 }
 
-
+impl Default for DioxusBevyMirrorPlugin {
+    fn default() -> Self {
+        Self { bevy_command_txrx: Default::default() }
+    }
+}
 
 impl Plugin for DioxusBevyMirrorPlugin {
     fn build(&self, app: &mut App) {
         // let (cmd_tx, cmd_rx) = unbounded::<CommandQueue>();
 
-        if !app.is_plugin_added::<ScheduleRunnerPlugin>() {
-            app.add_plugins(ScheduleRunnerPlugin::default());
-        }
+        // if !app.is_plugin_added::<ScheduleRunnerPlugin>() {
+        //     app.add_plugins(ScheduleRunnerPlugin::default());
+        // }
 
         app.insert_resource(CommandQueueReciever {
             rx: self.bevy_command_txrx.rx.clone(),
