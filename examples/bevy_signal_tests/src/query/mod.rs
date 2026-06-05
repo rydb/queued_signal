@@ -5,7 +5,7 @@ use bevy_ecs::{prelude::*, world::CommandQueue};
 use dioxus::prelude::*;
 use dioxus_bevy_signals::{
     push_and_send,
-    query::{DioxusMirror, MirrorQueryData, use_bevy_query},
+    query::{DioxusMirror, MirrorQueryData, single::use_bevy_single, use_bevy_query},
     use_bevy_command_queue,
 };
 use dioxus_hooks::{use_memo, use_signal};
@@ -142,6 +142,7 @@ pub struct QueryTestsPlugin;
 impl Plugin for QueryTestsPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(TenNamesTestPlugin);
+        app.add_plugins(SingleQuerySetup);
     }
 }
 
@@ -149,6 +150,7 @@ impl DioxusTestPlugin for QueryTestsPlugin {
     fn included_element(&self) -> Element {
         rsx! {
             TenNamesQuery {  }
+            SingleQuery {}
         }
     }
 
@@ -289,5 +291,82 @@ pub fn TenNamesQuery() -> Element {
             }
         }
 
+    }
+}
+
+#[derive(Component, Clone)]
+pub struct SingleMatch;
+
+#[derive(Component, Clone)]
+pub struct NoMatch;
+
+#[derive(Component, Clone)]
+pub struct MoreThenOneMatch;
+
+pub fn setup_singleton_test(
+    mut commands: Commands,
+) {
+    // single match
+    commands.spawn(
+        SingleMatch
+    );
+
+    // no matches (due to filter)
+    commands.spawn(
+        NoMatch
+    );
+
+    // more then one match
+    commands.spawn(
+        MoreThenOneMatch
+    );
+    commands.spawn(
+        MoreThenOneMatch
+    );
+
+}
+
+pub struct SingleQuerySetup;
+
+impl Plugin for SingleQuerySetup {
+    fn build(&self, app: &mut App) {
+        app
+        .add_systems(Startup, setup_singleton_test)
+        ;
+    }
+}
+
+/// test for use_bevy_single Single<T> mirror
+#[component]
+pub fn SingleQuery() -> Element {
+    let single_match = use_bevy_single::<(Entity, &mut SingleMatch), ()>();
+    
+    let single_match_str = use_memo(move || {
+        single_match.read_ok(|(e, _)| e.to_string()).unwrap_or_else(|n| n.into())
+    });
+
+    let no_match = use_bevy_single::<(Entity, &mut MoreThenOneMatch), With<NoMatch>>();
+    let no_match_str = use_memo(move || {
+        no_match.read_ok(|(e, _)| e.to_string()).unwrap_or_else(|n| n.into())
+    });
+
+    let more_then_one_match = use_bevy_single::<(Entity, &mut MoreThenOneMatch), ()>();
+    let more_then_one_match_str = use_memo(move || {
+        more_then_one_match.read_ok(|(e, _)| e.to_string()).unwrap_or_else(|n| n.into())
+    });
+
+    rsx! {
+        h1 {
+            "Single query sync test"
+        }
+        h2 { 
+            {format!("single match: {}", single_match_str)}
+        }
+        h2 { 
+            {format!("no match: {}", no_match_str)}
+        }
+        h2 { 
+            {format!("more then one match: {}", more_then_one_match_str)}
+        }
     }
 }

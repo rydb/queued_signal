@@ -12,6 +12,7 @@ use std::{
 
 pub(crate) use crate::macros::*;
 mod macros;
+pub mod single;
 
 use bevy_app::{Last, PostUpdate, Update};
 use bevy_ecs::{
@@ -757,7 +758,7 @@ pub struct MirrorQueryWriteDriver<Q: DioxusQuerySync, F: QueryFilter>(
 
 /// Handle to mirror version of bevy query, that can be used from dioxus.
 pub struct MirrorQuerySignalHandle<Q: MirrorQueryData, F: QueryFilter> {
-    signal: Signal<Result<Arc<MirrorQuery<Q, F>>, QueryNoneState>>,
+    pub(crate) signal: Signal<Result<Arc<MirrorQuery<Q, F>>, QueryNoneState>>,
     pub health: Signal<HealthStatus>,
     /// `None` until the Bevy round-trip completes (non-blocking).
     pub writer: Signal<Option<QueuedSignal<MirrorQuery<Q, F>>>>,

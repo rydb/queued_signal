@@ -187,12 +187,7 @@ impl<T: Clone + Send + Sync> QueuedState<T> {
 
 impl<T: Clone + Send + Sync + 'static> QueuedState<T> {
     /// Spawn a background task that forwards values from this `QueuedState`
-    /// into existing Dioxus signals.  This is the non‑hook equivalent of
-    /// [`QueuedSignal::use_hook`] — call it from inside a `use_future` once
-    /// you have obtained the real `QueuedState` asynchronously.
-    ///
-    /// `map` converts `Arc<T>` into whatever the value signal expects
-    /// (e.g. `|arc| Ok(arc)` for `Signal<Result<Arc<T>, E>>`).
+    /// into existing Dioxus signals.  
     pub fn forward_to<V: 'static>(
         &self,
         value_signal: Signal<V>,
