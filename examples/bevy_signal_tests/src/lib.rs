@@ -1,4 +1,4 @@
-use std::{rc::Rc, thread};
+use std::{io, rc::Rc, thread};
 
 use bevy_app::{App, Plugin, ScheduleRunnerPlugin};
 use bevy_log::debug;
@@ -6,6 +6,8 @@ use dioxus::prelude::*;
 use dioxus::{LaunchBuilder, prelude::rsx};
 use dioxus_bevy_signals::{BevyCommandChannels, CommandQueueSender, DioxusBevyMirrorPlugin};
 use dioxus_hooks::{use_context, use_context_provider};
+use tracing_chrome::ChromeLayerBuilder;
+use tracing_subscriber::{fmt, prelude::*, registry, util::SubscriberInitExt};
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "resource_tests")] {
@@ -92,6 +94,19 @@ impl Plugin for SignalTestsPlugin {
 }
 
 pub fn run_signal_tests() {
+    let stdout_layer = fmt::layer().with_writer(io::stdout);
+
+    let (chrome_layer, _chrome_guard) = ChromeLayerBuilder::new()
+        .file("./target/bevy_signal_tests_trace.json")
+        .include_args(true)
+        .build();
+
+    let subscriber = registry()
+        .with(stdout_layer)
+        .with(chrome_layer);
+
+    subscriber.init();
+
     let signal_tests_plguin = SignalTestsPlugin::default();
 
     let r = signal_tests_plguin.clone();

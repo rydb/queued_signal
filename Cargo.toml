@@ -60,6 +60,8 @@ queued_signal = {path = "./"}
 left-right = "0.11.7"
 cfg-if = "1.0"
 macro-v = "0.1.4"
+tracing-subscriber = "0.3"
+tracing-chrome = "0.7"
 
 [features]
 resource_example = ["bevy_signal_tests/resource_tests"]

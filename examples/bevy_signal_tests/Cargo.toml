@@ -21,6 +21,8 @@ dioxus_bevy_signals = {workspace = true}
 parking_lot = {workspace = true}
 tokio = {workspace = true}
 cfg-if = {workspace = true}
+tracing-subscriber = {workspace = true}
+tracing-chrome = {workspace = true}
 sysinfo = "0.39.3"
 
 [features]

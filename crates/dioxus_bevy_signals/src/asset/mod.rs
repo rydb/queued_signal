@@ -141,7 +141,7 @@ pub fn init_requested_asset_mirrors<A: DioxusAssetSync>(
 ) {
     let requests = mirrors.init_requests.clone();
     for id in requests {
-        trace!("processing asset init request");
+        trace!("asset init request for id {:?}", id);
 
         let Some(entry) = mirrors.assets.get_mut(&id) else {
             error!(
@@ -194,6 +194,7 @@ pub fn sync_mirrors_to_assets<A: DioxusAssetSync>(
     changed: Res<ChangedAssetMirrors<A>>,
 ) {
     for event in events.read() {
+        trace!("recieved event trace for {:#?}", event);
         let id = match event {
             AssetEvent::Modified { id } | AssetEvent::LoadedWithDependencies { id } => id,
             _ => continue,
@@ -226,6 +227,7 @@ pub fn sync_assets_to_mirrors<A: DioxusAssetSync>(
         let state = handle.state.read();
 
         if let Ok(mirror) = state.as_ref() {
+            trace!("syncing asset {:#?} to mirror", type_name::<A>());
             *asset = mirror.clone();
         }
     }
@@ -236,11 +238,13 @@ pub fn collect_changed_ids<A: DioxusAssetSync>(
     mut changed: ResMut<ChangedAssetMirrors<A>>,
 ) {
     while let Ok(id) = rx.0.try_recv() {
+        trace!("id {} marked as changed for asset type {:#?}", id, type_name::<A>());
         changed.0.insert(id);
     }
 }
 
 pub fn clear_changed_flags<A: DioxusAssetSync>(mut changed: ResMut<ChangedAssetMirrors<A>>) {
+    trace!("clearing changed assets");
     changed.0.clear();
 }
 
@@ -281,9 +285,11 @@ fn update_signals_with_initialized_ids<A: DioxusAssetSync>(
     mut map: ResMut<AssetMirrorMap<A>>,
 ) {
     while let Ok(request) = requests.rx.try_recv() {
+        trace!("received swap request old {:?} -> new {:?}", request.old_id, request.new_id);
         // don't remove mirror thats already been removed to stop use after free
         let old_id = request.old_id;
         if !map.assets.contains_key(&old_id) {
+            trace!("old_id {:?} not found in map, skipping", old_id);
             continue;
         }
 
@@ -302,6 +308,7 @@ fn update_signals_with_initialized_ids<A: DioxusAssetSync>(
             .send(request.new_id)
             .inspect_err(|err| println!("{err}"));
 
+        trace!("swap complete, inserted new_id {:?} into init_requests", request.new_id);
         map.init_requests.insert(request.new_id);
         map.assets.insert(request.new_id, mirror);
     }
@@ -432,7 +439,7 @@ impl<A: DioxusAssetSync> Command for RequestBevyAssetMirror<A> {
 
         let initialize_request_tx = world.resource::<UpdateAssetSignalSender<A>>();
 
-        trace!("SENDING BACK NEW SIGNAL RESPONSE");
+        trace!("sending back signal response for {}", type_name::<A>());
         let _ = self.response_tx.send(AssetMirrorRequestResponse {
             asset_state,
             initialize_request_tx: initialize_request_tx.tx.clone(),
@@ -461,10 +468,10 @@ fn apply_tracking_queries_delta<A: DioxusAssetSync>(
     mut tracking_delta: ResMut<PendingAssetTrackingDeltas<A>>,
 ) {
     for (id, delta) in tracking_delta.pending.drain(..) {
-        trace!("PROCESSING INCREMENT FOR: {}:  {}", id, delta);
+        trace!("processing increment: {}  {}", id, delta);
         let clear = {
             let Some(entry) = mirrors.assets.get_mut(&id) else {
-                println!(
+                error!(
                     "delta change request recieved by asset doesn't exist in map? How did this happen?"
                 );
                 continue;
@@ -619,7 +626,7 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
 
             // Mount: send +1 tracking
             let asset_id = resp.extra_info.read().asset_id;
-            trace!("ASSET SIGNAL MOUNTED, SENDING +1 for {:?}", asset_id);
+            trace!("asset signal mounted, sending +1 for {:?}", asset_id);
             let mut q = CommandQueue::default();
             q.push(UpdateTrackingAssets::<A> { delta: 1, asset_id, _phantom: PhantomData });
             let _ = ctx.tx.send(q);
@@ -633,23 +640,42 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
     let r = ctx.clone();
     use_drop(move || {
         let asset_id = *current_asset_id.read();
-        trace!("ASSET SIGNAL DROPPED, SENDING -1 for {:?}", asset_id);
+        trace!("asset signal dropped, sending -1 for {:?}", asset_id);
         let mut q = CommandQueue::default();
         q.push(UpdateTrackingAssets::<A> { delta: -1, asset_id, _phantom: PhantomData });
         let _ = r.tx.send(q);
     });
 
-    // Asset ID changes (waits for response to be Some)
-    let mut last_requested_id = use_signal(|| *id.read());
+    // Asset ID changes (waits for response to be Some).
+    //
+    // Uses `sent_update_for_id` instead of a simple "last requested" guard so that
+    // when `response` arrives *after* `id` has already changed we still send the
+    // re-initialization request and the mirror doesn't get stuck in NonAsset.
+    let mut sent_update_for_id = use_signal(|| None::<AssetId<A>>);
     use_effect(move || {
         let wanted = *id.read();
-        let last = *last_requested_id.read();
-        if wanted != last {
-            last_requested_id.set(wanted);
-            if let Some(new_id) = wanted {
-                let old_id = *current_asset_id.read();
-                if old_id != new_id {
-                    if let Some(ref resp) = *response.read() {
+        // always subscribe to response so the effect re-runs when it becomes Some
+        let resp = response.read();
+
+        trace!(
+            "effect: wanted={:?} resp.is_some={} already_sent={:?} current_asset_id={:?}",
+            wanted.map(|id| format!("{:?}", id)),
+            resp.is_some(),
+            *sent_update_for_id.read(),
+            *current_asset_id.read()
+        );
+
+        if let Some(new_id) = wanted {
+            let already_sent = *sent_update_for_id.read() == Some(new_id);
+            if !already_sent {
+                if let Some(ref resp) = *resp {
+                    let old_id = *current_asset_id.read();
+                    if old_id != new_id {
+                        sent_update_for_id.set(Some(new_id));
+                        trace!(
+                            "sending InitializeSignalAssetIdRequest old {:?} -> new {:?}",
+                            old_id, new_id
+                        );
                         let _ = resp.initialize_request_tx
                             .send(InitializeSignalAssetIdRequest { new_id, old_id });
                     }

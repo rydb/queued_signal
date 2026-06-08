@@ -137,7 +137,9 @@ impl<T: Clone + Send + Sync> Absorb<SignalOp<T>> for Absorbable<T> {
     }
 
     fn sync_with(&mut self, first: &Self) {
-        self.0 = first.0.clone();
+        // Clone T into a fresh Arc so that subsequent absorb_first/absorb_second
+        // calls see strong_count == 1, making Arc::make_mut a no-op.
+        self.0 = Arc::new((*first.0).clone());
     }
 }
 

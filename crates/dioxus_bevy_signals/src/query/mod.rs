@@ -307,7 +307,7 @@ pub struct QueryMirrorInitailized<Q: QueryData, F: QueryFilter> {
 pub fn sync_query_mirror_to_signal<T: DioxusQuerySync + 'static, F: QueryFilter + 'static>(
     components_without_signals: Query<T, (F, T::MirrorSignalsWithoutFilter)>,
     mirror_components: Query<T::MirrorSignalsQueryDataImMut, F>,
-    changed_mirror_components: Query<T::MirrorSignalsQueryDataImMut, T::MirrorSignalsChangedFilter>,
+    changed_mirror_components: Query<T::MirrorSignalsQueryDataImMut, (F, T::MirrorSignalsChangedFilter)>,
     mirror_signal: ResMut<MirrorQuerySignal<T, F>>,
     mut commands: Commands,
     mut init_status: ResMut<QueryMirrorInitailized<T, F>>,

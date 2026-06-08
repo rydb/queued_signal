@@ -102,7 +102,7 @@ pub fn ToggleableAsset() -> Element {
     let status_string = use_memo(move || {
         color
             .read_ok(|c| format!("{:?}", c.base_color))
-            .unwrap_or_else(|_| "Loading...".to_owned())
+            .unwrap_or_else(|err| err.as_string())
     });
 
     let make_white = move |_| {
@@ -172,7 +172,7 @@ pub fn AssetColorPicker() -> Element {
     let color_text = use_memo(move || {
         asset_state
             .read_ok(|c| format!("{:?}", c.base_color))
-            .unwrap_or_else(|_| "Loading...".to_string())
+            .unwrap_or_else(|err| err.as_string())
     });
 
     let on_click_white = move |_| {
