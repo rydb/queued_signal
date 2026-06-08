@@ -8,8 +8,8 @@ pub use std::{
 };
 
 pub(crate) use crate::macros::*;
-use bevy_app::{Last, PostUpdate, Update};
 use bevy_asset::{Asset, AssetEvent, AssetId, AssetServer, Assets, LoadState, uuid::Uuid};
+use crate::schedules::{DioxusSyncLast, DioxusSyncPostUpdate, DioxusSyncUpdate};
 use bevy_ecs::{prelude::*, world::CommandQueue};
 use dioxus_core::{use_drop, use_hook};
 use dioxus_hooks::{use_context, use_effect, use_future, use_memo, use_signal};
@@ -346,28 +346,28 @@ impl<A: DioxusAssetSync> Command for RequestBevyAssetMirror<A> {
                 });
                 world.insert_resource(PendingAssetTrackingDeltas::<A>::default());
 
-                add_systems_through_world(world, Update, collect_changed_ids::<A>);
-                add_systems_through_world(world, Update, drive_maybe_assets::<A>);
-                add_systems_through_world(world, Update, update_signals_with_initialized_ids::<A>);
-                add_systems_through_world(world, PostUpdate, init_requested_asset_mirrors::<A>);
-                add_systems_through_world(world, PostUpdate, sync_mirrors_to_assets::<A>);
+                add_systems_through_world(world, DioxusSyncUpdate, collect_changed_ids::<A>);
+                add_systems_through_world(world, DioxusSyncUpdate, drive_maybe_assets::<A>);
+                add_systems_through_world(world, DioxusSyncUpdate, update_signals_with_initialized_ids::<A>);
+                add_systems_through_world(world, DioxusSyncPostUpdate, init_requested_asset_mirrors::<A>);
+                add_systems_through_world(world, DioxusSyncPostUpdate, sync_mirrors_to_assets::<A>);
                 add_systems_through_world(
                     world,
-                    PostUpdate,
+                    DioxusSyncPostUpdate,
                     sync_assets_to_mirrors::<A>.run_if(resource_changed::<ChangedAssetMirrors<A>>),
                 );
                 add_systems_through_world(
                     world,
-                    PostUpdate,
+                    DioxusSyncPostUpdate,
                     apply_tracking_queries_delta::<A>
                         .run_if(resource_changed::<PendingAssetTrackingDeltas<A>>),
                 );
                 add_systems_through_world(
                     world,
-                    Last,
+                    DioxusSyncLast,
                     clear_changed_flags::<A>.run_if(resource_changed::<ChangedAssetMirrors<A>>),
                 );
-                add_systems_through_world(world, Last, clear_asset_init_requests::<A>);
+                add_systems_through_world(world, DioxusSyncLast, clear_asset_init_requests::<A>);
 
                 world.insert_resource(AssetSyncInitialized {
                     _phantom: PhantomData::<A>,

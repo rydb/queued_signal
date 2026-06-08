@@ -51,6 +51,7 @@ bevy_asset = {version = "0.17"}
 bevy_color = {version = "0.17"}
 bevy_pbr = {version = "0.17"}
 bevy_transform = {version = "0.17"}
+bevy_time = {version = "0.17"}
 bevy_log = {version = "0.17"}
 glam = {version = "0.30"}
 trait-set = {version = "0.3"}

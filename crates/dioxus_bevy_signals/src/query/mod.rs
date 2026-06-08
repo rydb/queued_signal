@@ -14,13 +14,13 @@ pub(crate) use crate::macros::*;
 mod macros;
 pub mod single;
 
-use bevy_app::{Last, PostUpdate, Update};
 use bevy_ecs::{
     component::Mutable,
     prelude::*,
     query::{QueryData, QueryFilter},
     world::CommandQueue,
 };
+use crate::schedules::{DioxusSyncLast, DioxusSyncPostUpdate, DioxusSyncUpdate};
 use dioxus_core::{use_drop, use_hook};
 use dioxus_hooks::{use_context, use_effect, use_future, use_signal};
 use dioxus_signals::{ReadableExt, Signal, WritableExt};
@@ -45,29 +45,20 @@ pub enum QueryNoneState {
     NotInitialized,
 }
 
-/// Minimum time to pass til queued mutations from QueuedSignal are published. The time to publish may be longer then this duration, but no shorter then this duration.
-#[derive(Resource)]
-pub struct ComponentSyncTickRate(Duration);
-
 fn drive_component_signals<T: DioxusComponentSync>(
     components: Query<&DioxusMirror<T>>,
-    tick_rate: Res<ComponentSyncTickRate>,
 ) {
     for component in components {
         let mut guard = component.driver.lock();
-        guard.tick(tick_rate.0);
+        guard.tick(Duration::ZERO);
     }
 }
 
-#[derive(Resource)]
-pub struct QuerySyncTickRate(Duration);
-
 fn drive_query_signal<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>(
     driver: ResMut<MirrorQueryWriteDriver<Q, F>>,
-    tick_rate: Res<QuerySyncTickRate>,
 ) {
     let mut guard = driver.0.lock();
-    guard.tick(tick_rate.0);
+    guard.tick(Duration::ZERO);
 }
 
 /// mirrored version of bevy component + infastructure for queries
@@ -155,8 +146,6 @@ impl<T: DioxusComponentSync> std::ops::Deref for DioxusMirrorHandle<T> {
         &self.value
     }
 }
-
-pub const DEFAULT_COMPONENT_SYNC_INTERVAL: Duration = Duration::from_millis(100);
 
 fn query_to_tracking_id<Q: DioxusQuerySync, F: QueryFilter + 'static>() -> (TypeId, TypeId) {
     (TypeId::of::<Q::MirrorItem>(), TypeId::of::<F>())
@@ -403,12 +392,11 @@ impl<T: DioxusComponentSync> Command for RequestComponentsMirror<T> {
             new_map
         });
         if !mirrored_components.0.contains(&TypeId::of::<T>()) {
-            add_systems_through_world(world, Update, drive_component_signals::<T>);
-            add_systems_through_world(world, PostUpdate, sync_component_to_mirror::<T>);
-            add_systems_through_world(world, PostUpdate, sync_mirror_to_component::<T>);
-            add_systems_through_world(world, PostUpdate, delete_unused_mirrors::<T>);
+            add_systems_through_world(world, DioxusSyncUpdate, drive_component_signals::<T>);
+            add_systems_through_world(world, DioxusSyncPostUpdate, sync_component_to_mirror::<T>);
+            add_systems_through_world(world, DioxusSyncPostUpdate, sync_mirror_to_component::<T>);
+            add_systems_through_world(world, DioxusSyncPostUpdate, delete_unused_mirrors::<T>);
 
-            world.insert_resource(ComponentSyncTickRate(Duration::from_millis(16)));
         }
     }
 }
@@ -425,16 +413,16 @@ impl<T: DioxusQuerySync + 'static, F: QueryFilter> Command for RequestQueryMirro
                     T::register_mirror_sync_systems::<F>(world);
 
                     let query_driver = WriterDriver::new(MirrorQuery::default());
-                    add_systems_through_world(world, Update, drive_query_signal::<T, F>);
+                    add_systems_through_world(world, DioxusSyncUpdate, drive_query_signal::<T, F>);
                     add_systems_through_world(
                         world,
-                        PostUpdate,
+                        DioxusSyncPostUpdate,
                         apply_tracking_queries_delta::<T, F>
                             .run_if(resource_changed::<PendingQueryTrackingDeltas<T, F>>),
                     );
                     add_systems_through_world(
                         world,
-                        Last,
+                        DioxusSyncLast,
                         sync_query_mirror_to_signal::<T, F>.run_if(resource_equals(
                             MirrorQueryActive::<T, F> {
                                 active: true,
@@ -459,7 +447,6 @@ impl<T: DioxusQuerySync + 'static, F: QueryFilter> Command for RequestQueryMirro
                     );
 
                     world.insert_resource(MirrorQueryWriteDriver(driver_arc));
-                    world.insert_resource(QuerySyncTickRate(Duration::ZERO));
                     world.insert_resource(MirrorQuerySignal(signal.clone()));
                     world.insert_resource(QueryMirrorInitailized::<T, F> {
                         initialized: false,

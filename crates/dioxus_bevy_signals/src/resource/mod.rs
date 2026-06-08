@@ -1,6 +1,7 @@
 pub(crate) use crate::macros::*;
 use bevy_app::prelude::*;
 use bevy_ecs::world::CommandQueue;
+use crate::schedules::{DioxusSyncPostUpdate, DioxusSyncUpdate};
 use bevy_ecs::prelude::*;
 use dioxus::prelude::*;
 use dioxus_hooks::{use_context, use_signal};
@@ -87,21 +88,16 @@ impl<T: ResourceDioxusSync> Command for RequestBevyResource<T> {
                 );
                 world.insert_resource(ResourceWriteDriver(driver_arc));
 
-                // tick the resources 60 times a second (If uninitialized) by default to match standard FPS settings.
-                world.get_resource_or_insert_with(|| {
-                    ResourceSyncTickRate(Duration::from_millis(16))
-                });
-
-                add_systems_through_world(world, Update, drive_signal::<T>);
+                add_systems_through_world(world, DioxusSyncUpdate, drive_signal::<T>);
                 // Also add the authoritative sync system, but **after** command processing.
                 add_systems_through_world(
                     world,
-                    PostUpdate,
+                    DioxusSyncPostUpdate,
                     sync_mirror_to_resource::<T>.run_if(resource_changed::<T>),
                 );
                 add_systems_through_world(
                     world,
-                    PostUpdate,
+                    DioxusSyncPostUpdate,
                     sync_resource_to_mirror::<T>.run_if(not(resource_changed::<T>)),
                 );
                 let mut map = world.get_resource_or_init::<RegisteredResourceSyncs>();
@@ -113,11 +109,6 @@ impl<T: ResourceDioxusSync> Command for RequestBevyResource<T> {
         let _ = self.response_tx.send(signal_to_send);
     }
 }
-
-/// Minimum time to pass til queued mutations from QueuedSignal are published.
-/// The time to publish may be longer then this duration, but no shorter then this duration.
-#[derive(Resource)]
-pub struct ResourceSyncTickRate(Duration);
 
 /// System that synchronises the authoritative Bevy resource into the signal mirror.
 /// It uses `set_value`, which results in exactly two clones (one into the operation,
@@ -147,10 +138,9 @@ pub fn sync_resource_to_mirror<T: ResourceDioxusSync>(
 
 fn drive_signal<T: ResourceDioxusSync>(
     driver: Res<ResourceWriteDriver<T>>,
-    tick_rate: Res<ResourceSyncTickRate>,
 ) {
     let mut guard = driver.0.lock();
-    guard.tick(tick_rate.0);
+    guard.tick(Duration::ZERO);
 }
 
 /// Dioxus signal for managing bevy resource <-> dioxus interop.

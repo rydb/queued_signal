@@ -8,6 +8,7 @@ edition = "2024"
 bevy_ecs = {workspace = true}
 bevy_app = {workspace = true}
 bevy_asset = {workspace = true}
+bevy_time = {workspace = true}
 dioxus-core = {workspace = true}
 dioxus = {workspace = true}
 dioxus-hooks = {workspace = true}

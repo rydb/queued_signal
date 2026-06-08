@@ -81,8 +81,10 @@ impl Default for SignalTestsPlugin {
 
 impl Plugin for SignalTestsPlugin {
     fn build(&self, app: &mut bevy_app::App) {
+        app.add_plugins(bevy_time::TimePlugin);
         app.add_plugins(DioxusBevyMirrorPlugin {
             bevy_command_txrx: self.cmd_channels.clone(),
+            ..Default::default()
         });
 
         let plugins = (self.test_plugin_list)();

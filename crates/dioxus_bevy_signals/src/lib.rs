@@ -7,7 +7,7 @@ use std::{
 use bevy_app::{ScheduleRunnerPlugin, prelude::*};
 use bevy_ecs::prelude::*;
 use bevy_ecs::{
-    schedule::{IntoScheduleConfigs, ScheduleLabel, Schedules},
+    schedule::{IntoScheduleConfigs, Schedule, ScheduleLabel, Schedules},
     system::ScheduleSystem,
     world::{CommandQueue, World},
 };
@@ -18,6 +18,8 @@ use tokio::sync::oneshot;
 
 pub(crate) mod macros;
 pub(crate) use crate::macros::{debug, error, info, trace, warn};
+
+pub mod schedules;
 
 #[cfg(feature = "query")]
 pub mod query;
@@ -146,21 +148,37 @@ impl BevyCommandChannels {
 /// plugin for mirroring state from the bevy world into the dioxus world
 pub struct DioxusBevyMirrorPlugin {
     pub bevy_command_txrx: BevyCommandChannels,
+    /// The target frames-per-second for the Dioxus sync schedules.
+    /// Determines how many times per second the resource, query, and asset
+    /// sync systems run.  Default: 60.
+    pub dioxus_sync_fps: u32,
 }
 
 impl Default for DioxusBevyMirrorPlugin {
     fn default() -> Self {
-        Self { bevy_command_txrx: Default::default() }
+        Self {
+            bevy_command_txrx: Default::default(),
+            dioxus_sync_fps: 60,
+        }
     }
 }
 
 impl Plugin for DioxusBevyMirrorPlugin {
     fn build(&self, app: &mut App) {
-        // let (cmd_tx, cmd_rx) = unbounded::<CommandQueue>();
+        use schedules::*;
 
-        // if !app.is_plugin_added::<ScheduleRunnerPlugin>() {
-        //     app.add_plugins(ScheduleRunnerPlugin::default());
-        // }
+        // Register the Dioxus sync fixed-timestep schedules.
+        app.add_schedule(Schedule::new(DioxusSyncMain))
+            .add_schedule(Schedule::new(DioxusSyncPreUpdate))
+            .add_schedule(Schedule::new(DioxusSyncUpdate))
+            .add_schedule(Schedule::new(DioxusSyncPostUpdate))
+            .add_schedule(Schedule::new(DioxusSyncLast))
+            .insert_resource(DioxusSyncConfig::from_fps(self.dioxus_sync_fps))
+            .insert_resource(DioxusSyncAccumulator::default())
+            .init_resource::<DioxusSyncMainScheduleOrder>()
+            // The runner is checked every frame (via Update) but only ticks
+            // the Dioxus sync schedules when enough time has accumulated.
+            .add_systems(Update, DioxusSyncMain::run_dioxus_sync_main);
 
         app.insert_resource(CommandQueueReciever {
             rx: self.bevy_command_txrx.rx.clone(),
@@ -168,7 +186,7 @@ impl Plugin for DioxusBevyMirrorPlugin {
         .insert_resource(CommandQueueSender {
             tx: self.bevy_command_txrx.tx.clone(),
         })
-        .add_systems(PreUpdate, process_commands);
+        .add_systems(DioxusSyncPreUpdate, process_commands);
     }
 }
 
