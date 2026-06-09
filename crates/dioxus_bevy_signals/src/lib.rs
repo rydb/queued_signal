@@ -221,18 +221,18 @@ pub fn use_bevy_command_queue() -> BevyCommandsSignal {
     }
 }
 
-/// Thin read guard to signal value.
-pub struct SignalReadGuard<'a, T: 'static> {
-    guard: dioxus_signals::ReadableRef<'a, Signal<T>>,
+/// Thin read guard to a readable value (works with both [`Signal`] and [`Memo`]).
+pub struct SignalReadGuard<'a, T: 'static, R: dioxus_signals::Readable<Target = T> + 'static = dioxus_signals::Signal<T>> {
+    guard: dioxus_signals::ReadableRef<'a, R>,
 }
 
-impl<'a, T: 'static> SignalReadGuard<'a, T> {
-    pub(crate) fn new(guard: dioxus_signals::ReadableRef<'a, Signal<T>>) -> Self {
+impl<'a, T: 'static, R: dioxus_signals::Readable<Target = T> + 'static> SignalReadGuard<'a, T, R> {
+    pub(crate) fn new(guard: dioxus_signals::ReadableRef<'a, R>) -> Self {
         Self { guard }
     }
 }
 
-impl<'a, T: 'static> std::ops::Deref for SignalReadGuard<'a, T> {
+impl<'a, T: 'static, R: dioxus_signals::Readable<Target = T> + 'static> std::ops::Deref for SignalReadGuard<'a, T, R> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {

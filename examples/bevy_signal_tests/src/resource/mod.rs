@@ -1,36 +1,27 @@
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
+use bevy_time::{Real, Time};
 use dioxus::prelude::*;
 use dioxus_bevy_signals::resource::use_bevy_resource;
 use dioxus_core::Element;
 use dioxus_hooks::use_memo;
 use queued_signal::signal::HealthStatus;
-use std::time::{Duration, Instant};
 
-use crate::DioxusTestPlugin;
-
-#[derive(Resource)]
-pub struct TickTimer {
-    last_tick: Instant,
-}
-
-impl Default for TickTimer {
-    fn default() -> Self {
-        Self {
-            last_tick: Instant::now(),
-        }
-    }
-}
+use crate::{DioxusTestPlugin, TickTimer};
 
 #[derive(Clone, Resource, Debug)]
 pub struct Counter {
     pub value: i32,
 }
 
-pub fn bevy_tick_counter(mut counter: ResMut<Counter>, mut timer: ResMut<TickTimer>) {
-    if timer.last_tick.elapsed() >= Duration::from_millis(1000) {
+pub fn bevy_tick_counter(
+    mut counter: ResMut<Counter>,
+    mut timer: ResMut<TickTimer>,
+    time: Res<Time<Real>>,
+) {
+    timer.0.tick(time.delta());
+    if timer.0.just_finished() {
         counter.value += 1;
-        timer.last_tick = Instant::now();
     }
 }
 
@@ -40,8 +31,7 @@ pub struct CounterResourceTestPlugin;
 impl Plugin for CounterResourceTestPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Update, bevy_tick_counter)
-            .insert_resource(Counter { value: 0 })
-            .insert_resource(TickTimer::default());
+            .insert_resource(Counter { value: 0 });
     }
 }
 

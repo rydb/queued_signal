@@ -1,12 +1,15 @@
-use std::{io, rc::Rc, thread};
+use std::{io, rc::Rc, thread, time::Duration};
 
 use bevy_app::{App, Plugin, ScheduleRunnerPlugin};
+use bevy_ecs::prelude::*;
 use bevy_log::debug;
+use bevy_time::{Timer, TimerMode};
 use dioxus::prelude::*;
 use dioxus::{LaunchBuilder, prelude::rsx};
 use dioxus_bevy_signals::{BevyCommandChannels, CommandQueueSender, DioxusBevyMirrorPlugin};
 use dioxus_hooks::{use_context, use_context_provider};
 use tracing_chrome::ChromeLayerBuilder;
+use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::{fmt, prelude::*, registry, util::SubscriberInitExt};
 
 cfg_if::cfg_if! {
@@ -36,6 +39,19 @@ pub trait DioxusTestPlugin: Plugin + 'static {
     fn included_element(&self) -> Element;
 
     fn register_plugin(&self, app: &mut App);
+}
+
+/// Shared tick timer resource, driven by [`bevy_time::Time`] delta.
+///
+/// Both the resource counter and the single-query counter tick on
+/// the same cadence via this timer.
+#[derive(Resource)]
+pub struct TickTimer(pub Timer);
+
+impl Default for TickTimer {
+    fn default() -> Self {
+        Self(Timer::new(Duration::from_secs(1), TimerMode::Repeating))
+    }
 }
 
 /// plugin that setups infastructure to run all tests
@@ -82,6 +98,7 @@ impl Default for SignalTestsPlugin {
 impl Plugin for SignalTestsPlugin {
     fn build(&self, app: &mut bevy_app::App) {
         app.add_plugins(bevy_time::TimePlugin);
+        app.insert_resource(TickTimer::default());
         app.add_plugins(DioxusBevyMirrorPlugin {
             bevy_command_txrx: self.cmd_channels.clone(),
             ..Default::default()
@@ -96,6 +113,18 @@ impl Plugin for SignalTestsPlugin {
 }
 
 pub fn run_signal_tests() {
+
+    // Filter OUT noisy crate tracing
+    // metadata.target() is the module path, e.g. "dioxus_core::scope_arena"
+    let filter = filter_fn(|metadata| {
+        !metadata.target().starts_with("dioxus_core")
+            && !metadata.target().starts_with("dioxus_signals")
+            && !metadata.target().starts_with("tungstenite")
+            && !metadata.target().starts_with("bevy_ecs")
+            && !metadata.target().starts_with("bevy_app")
+            && !metadata.target().starts_with("warnings")
+    });
+
     let stdout_layer = fmt::layer().with_writer(io::stdout);
 
     let (chrome_layer, _chrome_guard) = ChromeLayerBuilder::new()
@@ -104,6 +133,7 @@ pub fn run_signal_tests() {
         .build();
 
     let subscriber = registry()
+        .with(filter)
         .with(stdout_layer)
         .with(chrome_layer);
 

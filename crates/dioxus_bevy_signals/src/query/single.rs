@@ -4,8 +4,8 @@ use bevy_ecs::{
     prelude::*,
     query::QueryFilter,
 };
-use dioxus_hooks::{use_effect, use_signal};
-use dioxus_signals::{ReadableExt, Signal, WritableExt};
+use dioxus_hooks::{use_effect, use_memo, use_signal};
+use dioxus_signals::{Memo, ReadableExt, Signal, WritableExt};
 use queued_signal::signal::{HealthStatus, QueuedSignal};
 
 use super::{
@@ -22,6 +22,8 @@ pub enum SingleQueryError {
     NoMatchingEntity,
     /// The query matched more than one entity. Contains all matching [`Entity`] IDs.
     MoreThanOneEntity { entities: Vec<Entity> },
+    /// no upper bound found on the size hint for the query size
+    NoUpperBound
 }
 
 impl From<SingleQueryError> for String {
@@ -30,6 +32,7 @@ impl From<SingleQueryError> for String {
             SingleQueryError::NotInitialized => "Not initialized".into(),
             SingleQueryError::NoMatchingEntity => "No matching entities".into(),
             SingleQueryError::MoreThanOneEntity { entities } => format!("more then one matching entities: {:#?}", entities),
+            SingleQueryError::NoUpperBound => "No upper bound for query size found".into(),
         }
     }
 }
@@ -37,7 +40,7 @@ impl From<SingleQueryError> for String {
 /// Handle to a single-entity mirrored Bevy query, 
 pub struct MirrorQuerySingleHandle<Q: MirrorQueryData, F: QueryFilter> {
     /// The single matched item, or an error describing why resolution failed.
-    pub item: Signal<Result<Q::MirrorItemHandles, SingleQueryError>>,
+    item: Signal<Result<Q::MirrorItemHandles, SingleQueryError>>,
     /// Health of the underlying signal.
     pub health: Signal<HealthStatus>,
     /// `None` until the Bevy round-trip completes (non-blocking).
@@ -59,18 +62,10 @@ impl<Q: MirrorQueryData, F: QueryFilter> Clone for MirrorQuerySingleHandle<Q, F>
 impl<Q: MirrorQueryData, F: QueryFilter> Copy for MirrorQuerySingleHandle<Q, F> {}
 
 impl<Q: MirrorQueryData + 'static, F: QueryFilter + 'static> MirrorQuerySingleHandle<Q, F> {
-    /// Read the single item with zero refcount bump.
-    ///
-    /// Returns a [`SignalReadGuard`] that derefs to `Result<Q::MirrorItemHandles, SingleQueryError>`,
-    /// so callers write `&*self.read()` to get `&Result<Q::MirrorItemHandles, SingleQueryError>`.
     pub fn read(&self) -> SignalReadGuard<'_, Result<Q::MirrorItemHandles, SingleQueryError>> {
         SignalReadGuard::new(self.item.read())
     }
 
-    /// Read and map the `Ok` variant of the single item, or pass through the error.
-    ///
-    /// Avoids the refcount bump of a full [`SignalReadGuard`] when you only need
-    /// a projected value from the matched entity.
     pub fn read_ok<U>(&self, f: impl FnOnce(&Q::MirrorItemHandles) -> U) -> Result<U, SingleQueryError> {
         let guard = self.item.read();
         match &*guard {
@@ -80,42 +75,34 @@ impl<Q: MirrorQueryData + 'static, F: QueryFilter + 'static> MirrorQuerySingleHa
     }
 }
 
-/// Create or fetch a single-entity [`MirrorQuery`] signal — **non-blocking**.
-///
-/// Composes on [`use_bevy_query`], reusing all its infrastructure (tracking,
-/// Bevy round-trip, health). The derived signal validates that exactly one
-/// entity matches and errors with [`SingleQueryError`] otherwise.
+/// Query for a mirror bevy [`Single<Q>`], resolves an error when read if there more or less then one result.
 pub fn use_bevy_single<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>()
 -> MirrorQuerySingleHandle<Q, F> {
     let query_handle = use_bevy_query::<Q, F>();
 
-    let mut item: Signal<Result<Q::MirrorItemHandles, SingleQueryError>> =
-        use_signal(|| Err(SingleQueryError::NotInitialized));
+    let mut item: Signal<Result<Q::MirrorItemHandles, SingleQueryError>> =use_signal(|| Err(SingleQueryError::NotInitialized));
 
-    // Derive the single-item signal from the underlying query signal.
-    {
-        let query_signal = query_handle.signal;
-        use_effect(move || {
-            let new_val = match &*query_signal.read() {
-                Err(_) => Err(SingleQueryError::NotInitialized),
-                Ok(mq) => {
-                    match mq.value.len() {
-                        0 => Err(SingleQueryError::NoMatchingEntity),
-                        1 => {
-                            let single = mq.value.values().next().unwrap().clone();
-                            Ok(single)
-                        }
-                        _ => {
-                            let entities: Vec<Entity> =
-                                mq.value.keys().copied().collect();
-                            Err(SingleQueryError::MoreThanOneEntity { entities })
-                        }
+    use_memo(move || {
+        let new_val = match &*query_handle.read() {
+            Err(_) => Err(SingleQueryError::NotInitialized),
+            Ok(mq) => {
+                match mq.value.len() {
+                    0 => Err(SingleQueryError::NoMatchingEntity),
+                    1 => {
+                        let single = mq.value.values().next().unwrap().clone();
+                        Ok(single)
+                    }
+                    _ => {
+                        let entities: Vec<Entity> =
+                            mq.value.keys().copied().collect();
+                        Err(SingleQueryError::MoreThanOneEntity { entities })
                     }
                 }
-            };
-            item.set(new_val);
-        });
-    }
+            }
+        };
+        item.set(new_val);
+    });
+
 
     MirrorQuerySingleHandle {
         item,

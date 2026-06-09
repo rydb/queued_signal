@@ -2,6 +2,7 @@ use std::{fmt::Display, time::Instant};
 
 use bevy_app::prelude::*;
 use bevy_ecs::{prelude::*, world::CommandQueue};
+use bevy_time::{Real, Time};
 use dioxus::prelude::*;
 use dioxus_bevy_signals::{
     push_and_send,
@@ -11,7 +12,7 @@ use dioxus_bevy_signals::{
 use dioxus_hooks::{use_memo, use_signal};
 use dioxus_signals::{ReadableExt, WritableExt};
 
-use crate::DioxusTestPlugin;
+use crate::{DioxusTestPlugin, TickTimer};
 
 #[derive(Component, Clone, Default, PartialEq, PartialOrd, Eq, Ord, Debug)]
 pub struct Greets {
@@ -26,11 +27,6 @@ impl Display for Greets {
 
 #[derive(Resource)]
 pub struct DebugPrintTimer {
-    last_tick: Instant,
-}
-
-#[derive(Resource)]
-pub struct ToggleQueryDebugTimer {
     last_tick: Instant,
 }
 
@@ -128,11 +124,8 @@ impl Plugin for TenNamesTestPlugin {
         app.insert_resource(DebugPrintTimer {
             last_tick: Instant::now(),
         })
-        .insert_resource(ToggleQueryDebugTimer {
-            last_tick: Instant::now(),
-        })
         .add_systems(PostUpdate, print_mirrors)
-        .add_systems(PostUpdate, toggleable_query_mirror_output);
+        ;
     }
 }
 
@@ -149,7 +142,7 @@ impl Plugin for QueryTestsPlugin {
 impl DioxusTestPlugin for QueryTestsPlugin {
     fn included_element(&self) -> Element {
         rsx! {
-            TenNamesQuery {  }
+            // TenNamesQuery {  }
             SingleQuery {}
         }
     }
@@ -161,20 +154,6 @@ impl DioxusTestPlugin for QueryTestsPlugin {
 
 type ToggleableQueryData = (Entity, &'static mut Name, &'static mut ToggleTestMarker);
 type ToggleableQueryFilter = ();
-
-pub fn toggleable_query_mirror_output(
-    query: Query<
-        <ToggleableQueryData as MirrorQueryData>::MirrorSignalsQueryDataImMut,
-        ToggleableQueryFilter,
-    >,
-    mut timer: ResMut<ToggleQueryDebugTimer>,
-) {
-    if timer.last_tick.elapsed() >= core::time::Duration::from_millis(1000) {
-        timer.last_tick = Instant::now();
-
-        println!("toggleable query dioxus mirrors: {}", query.count())
-    }
-}
 
 #[component]
 pub fn ToggleableQuery() -> Element {
@@ -293,9 +272,8 @@ pub fn TenNamesQuery() -> Element {
 
     }
 }
-
 #[derive(Component, Clone)]
-pub struct SingleMatch;
+pub struct SingleCounter (u32);
 
 #[derive(Component, Clone)]
 pub struct NoMatch;
@@ -308,7 +286,10 @@ pub fn setup_singleton_test(
 ) {
     // single match
     commands.spawn(
-        SingleMatch
+        (
+            SingleCounter(0),
+            MoreThenOneMatch,
+        )
     );
 
     // no matches (due to filter)
@@ -326,12 +307,29 @@ pub fn setup_singleton_test(
 
 }
 
+/// Ticks the shared [`TickTimer`] and increments [`SingleCounter`] on each
+/// elapsed interval.
+pub fn tick_single_counter(
+    mut query: Query<&mut SingleCounter>,
+    mut timer: ResMut<TickTimer>,
+    time: Res<Time<Real>>,
+) {
+    timer.0.tick(time.delta());
+    if timer.0.just_finished() {
+        for mut counter in &mut query{
+            println!("counter value: {}", counter.0);
+            counter.0 += 1;
+        }
+    }
+}
+
 pub struct SingleQuerySetup;
 
 impl Plugin for SingleQuerySetup {
     fn build(&self, app: &mut App) {
         app
         .add_systems(Startup, setup_singleton_test)
+        .add_systems(Update, tick_single_counter)
         ;
     }
 }
@@ -339,11 +337,15 @@ impl Plugin for SingleQuerySetup {
 /// test for use_bevy_single Single<T> mirror
 #[component]
 pub fn SingleQuery() -> Element {
-    let single_match = use_bevy_single::<(Entity, &mut SingleMatch), ()>();
+    let counter = use_bevy_single::<(Entity, &mut SingleCounter), ()>();
     
-    let single_match_str = use_memo(move || {
-        single_match.read_ok(|(e, _)| e.to_string()).unwrap_or_else(|n| n.into())
+    let counter_str = use_memo(move || {
+        counter.read_ok(|(_, val, ..)| val.read().0.to_string()).unwrap_or_else(|n| n.into())
     });
+
+    let increment_counter = move |_evt| {
+        let _ = counter.read_ok(|value| value.1.mutate(|counter| counter.0 += 10)).unwrap_or_else(|err| println!("tried to increment counter but: {:#?}", err));
+    };
 
     let no_match = use_bevy_single::<(Entity, &mut MoreThenOneMatch), With<NoMatch>>();
     let no_match_str = use_memo(move || {
@@ -359,9 +361,16 @@ pub fn SingleQuery() -> Element {
         h1 {
             "Single query sync test"
         }
-        h2 { 
-            {format!("single match: {}", single_match_str)}
+        div {
+            h2 { 
+                {format!("single match: {}", counter_str)}
+            }
+            button {
+                onclick: increment_counter,
+                "increment counter"
+            }
         }
+
         h2 { 
             {format!("no match: {}", no_match_str)}
         }

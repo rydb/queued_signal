@@ -13,7 +13,7 @@ use crate::schedules::{DioxusSyncLast, DioxusSyncPostUpdate, DioxusSyncUpdate};
 use bevy_ecs::{prelude::*, world::CommandQueue};
 use dioxus_core::{use_drop, use_hook};
 use dioxus_hooks::{use_context, use_effect, use_future, use_memo, use_signal};
-use dioxus_signals::{Memo, ReadableExt, Signal, WritableExt};
+use dioxus_signals::{Memo, ReadableExt, ReadableResultExt, Signal, WritableExt};
 use flume::{Receiver, Sender};
 use parking_lot::Mutex;
 use queued_signal::signal::{HealthStatus, QueuedSignal, WriterDriver};
@@ -43,7 +43,7 @@ impl<A: DioxusAssetSync> AssetState<A> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AssetNoneState {
     Loading,
     NotLoaded,
@@ -245,7 +245,7 @@ pub fn collect_changed_ids<A: DioxusAssetSync>(
 
 pub fn clear_changed_flags<A: DioxusAssetSync>(mut changed: ResMut<ChangedAssetMirrors<A>>) {
     trace!("clearing changed assets");
-    changed.0.clear();
+    changed.bypass_change_detection().0.clear();
 }
 
 #[derive(Resource)]
@@ -577,16 +577,14 @@ impl<A: DioxusAssetSync> AssetMaybeMirrorSignal<A> {
 
 use std::fmt::Debug;
 
-/// return the asset or a dummy — **non-blocking**.
-///
 /// Returns immediately with `Fetching` state.  The real mirror is fetched
 /// asynchronously and installed when the Bevy world processes the request.
 pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
-    id: Memo<Option<AssetId<A>>>,
+    id: Memo<Result<AssetId<A>, AssetNoneState>>,
 ) -> AssetMaybeMirrorSignal<A> {
     let ctx = use_context::<CommandQueueSender>();
 
-    let initial_id = id.read().unwrap_or_else(|| AssetId::<A>::from(Uuid::new_v4()));
+    let initial_id = id.read().clone().unwrap_or_else(|_| AssetId::<A>::from(Uuid::new_v4()));
 
     // Value/health signals start in Fetching state
     let mut asset_value_signal = use_signal(|| Arc::new(Err(AssetNoneState::Fetching)));
@@ -653,31 +651,31 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
     // re-initialization request and the mirror doesn't get stuck in NonAsset.
     let mut sent_update_for_id = use_signal(|| None::<AssetId<A>>);
     use_effect(move || {
-        let wanted = *id.read();
+        let wanted = id.as_ref();
         // always subscribe to response so the effect re-runs when it becomes Some
         let resp = response.read();
 
         trace!(
             "effect: wanted={:?} resp.is_some={} already_sent={:?} current_asset_id={:?}",
-            wanted.map(|id| format!("{:?}", id)),
+            wanted.as_ref().map(|id| format!("{:?}", id)).ok(),
             resp.is_some(),
             *sent_update_for_id.read(),
             *current_asset_id.read()
         );
 
-        if let Some(new_id) = wanted {
-            let already_sent = *sent_update_for_id.read() == Some(new_id);
+        if let Ok(new_id) = wanted {
+            let already_sent = *sent_update_for_id.read() == Some(*new_id);
             if !already_sent {
                 if let Some(ref resp) = *resp {
                     let old_id = *current_asset_id.read();
-                    if old_id != new_id {
-                        sent_update_for_id.set(Some(new_id));
+                    if old_id != *new_id {
+                        sent_update_for_id.set(Some(*new_id));
                         trace!(
                             "sending InitializeSignalAssetIdRequest old {:?} -> new {:?}",
                             old_id, new_id
                         );
                         let _ = resp.initialize_request_tx
-                            .send(InitializeSignalAssetIdRequest { new_id, old_id });
+                            .send(InitializeSignalAssetIdRequest { new_id: *new_id, old_id });
                     }
                 }
             }

@@ -8,7 +8,7 @@ use bevy_color::{Color, Srgba};
 use bevy_ecs::prelude::*;
 use bevy_pbr::{MeshMaterial3d, StandardMaterial};
 use dioxus::prelude::*;
-use dioxus_bevy_signals::asset::use_bevy_asset;
+use dioxus_bevy_signals::asset::{use_bevy_asset, AssetNoneState};
 // use dioxus_bevy_signals::asset::use_bevy_asset;
 use dioxus_bevy_signals::query::use_bevy_query;
 use dioxus_hooks::{use_memo, use_signal};
@@ -95,7 +95,13 @@ pub fn ToggleableAsset() -> Element {
         (),
     >();
 
-    let handle = use_memo(move || colors.iter().next().map(|n| n.1.read().0.clone().id()));
+    let handle = use_memo(move || {
+        colors
+            .iter()
+            .next()
+            .map(|n| n.1.read().0.clone().id())
+            .ok_or(AssetNoneState::NonAsset)
+    });
 
     let color = use_bevy_asset(handle);
 
@@ -165,7 +171,13 @@ pub fn AssetColorPicker() -> Element {
     // Reactive handle to the first material (if any)
     let handle = use_memo(move || colors.iter().next().map(|(_, mat, _)| mat.read().0.clone()));
 
-    let asset_id = use_memo(move || handle.read().as_ref().map(|h| h.id()));
+    let asset_id = use_memo(move || {
+        handle
+            .read()
+            .as_ref()
+            .map(|h| h.id())
+            .ok_or(AssetNoneState::NonAsset)
+    });
     let asset_state = use_bevy_asset(asset_id);
 
     // Derive the colour text reactively

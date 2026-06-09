@@ -386,16 +386,25 @@ impl<T: DioxusComponentSync> Default for RequestComponentsMirror<T> {
 
 impl<T: DioxusComponentSync> Command for RequestComponentsMirror<T> {
     fn apply(self, world: &mut World) -> () {
-        let mirrored_components = world.get_resource_or_insert_with(|| {
-            let mut new_map = MirroredComponents::default();
-            new_map.0.insert(TypeId::of::<T>());
-            new_map
+        let mut mirrored_components = world.get_resource_or_insert_with(|| {
+            MirroredComponents::default()
         });
         if !mirrored_components.0.contains(&TypeId::of::<T>()) {
-            add_systems_through_world(world, DioxusSyncUpdate, drive_component_signals::<T>);
-            add_systems_through_world(world, DioxusSyncPostUpdate, sync_component_to_mirror::<T>);
-            add_systems_through_world(world, DioxusSyncPostUpdate, sync_mirror_to_component::<T>);
-            add_systems_through_world(world, DioxusSyncPostUpdate, delete_unused_mirrors::<T>);
+            // Mark T as mirrored before adding systems so subsequent
+            // requests for the same component type are no-ops.
+            mirrored_components.0.insert(TypeId::of::<T>());
+            
+            add_systems_through_world(
+                world,
+                DioxusSyncPostUpdate,
+                (
+                    sync_component_to_mirror::<T>,
+                    sync_mirror_to_component::<T>,
+                    drive_component_signals::<T>,
+                    delete_unused_mirrors::<T>,
+                )
+                    .chain(),
+            );
 
         }
     }
@@ -413,22 +422,28 @@ impl<T: DioxusQuerySync + 'static, F: QueryFilter> Command for RequestQueryMirro
                     T::register_mirror_sync_systems::<F>(world);
 
                     let query_driver = WriterDriver::new(MirrorQuery::default());
-                    add_systems_through_world(world, DioxusSyncUpdate, drive_query_signal::<T, F>);
+                    // sync must run before drive: sync sends mutations to the
+                    // flume, then drive ticks the writer and publishes them.
+                    // .chain() guarantees this order.
+                    add_systems_through_world(
+                        world,
+                        DioxusSyncLast,
+                        (
+                            sync_query_mirror_to_signal::<T, F>.run_if(resource_equals(
+                                MirrorQueryActive::<T, F> {
+                                    active: true,
+                                    _phantom: || PhantomData::default(),
+                                },
+                            )),
+                            drive_query_signal::<T, F>,
+                        )
+                            .chain(),
+                    );
                     add_systems_through_world(
                         world,
                         DioxusSyncPostUpdate,
                         apply_tracking_queries_delta::<T, F>
                             .run_if(resource_changed::<PendingQueryTrackingDeltas<T, F>>),
-                    );
-                    add_systems_through_world(
-                        world,
-                        DioxusSyncLast,
-                        sync_query_mirror_to_signal::<T, F>.run_if(resource_equals(
-                            MirrorQueryActive::<T, F> {
-                                active: true,
-                                _phantom: || PhantomData::default(),
-                            },
-                        )),
                     );
 
                     let set_value_tx = query_driver.set_value_tx.clone();
@@ -805,12 +820,12 @@ impl<Q: MirrorQueryData + 'static, F: QueryFilter + 'static> MirrorQuerySignalHa
     }
 }
 
-/// Create or fetch a [`MirrorQuery`] signal of mirrored components — **non-blocking**.
+/// Create or fetch a [`MirrorQuery`] signal of mirrored components
 pub fn use_bevy_query<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>()
 -> MirrorQuerySignalHandle<Q, F> {
     let ctx = use_context::<CommandQueueSender>();
 
-    // Increment tracking when the component mounts (non-blocking send).
+    // Increment tracking when the component mounts
     let r = ctx.clone();
     use_effect(move || {
         trace!("query signal mounted, sending increment command");
