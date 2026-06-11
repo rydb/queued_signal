@@ -14,22 +14,22 @@ pub(crate) use crate::macros::*;
 mod macros;
 pub mod single;
 
+use crate::schedules::{DioxusSyncLast, DioxusSyncPostUpdate, DioxusSyncUpdate};
 use bevy_ecs::{
     component::Mutable,
     prelude::*,
     query::{QueryData, QueryFilter},
     world::CommandQueue,
 };
-use crate::schedules::{DioxusSyncLast, DioxusSyncPostUpdate, DioxusSyncUpdate};
 use dioxus_core::{use_drop, use_hook};
 use dioxus_hooks::{use_context, use_effect, use_future, use_signal};
 use dioxus_signals::{ReadableExt, Signal, WritableExt};
-use tokio::sync::oneshot;
 use parking_lot::Mutex;
 use queued_signal::signal::{HealthStatus, QueuedSignal, WriterDriver};
+use tokio::sync::oneshot;
 use trait_set::trait_set;
 
-use crate::{CommandQueueSender, add_systems_through_world, SignalReadGuard};
+use crate::{CommandQueueSender, SignalReadGuard, add_systems_through_world};
 
 trait_set! {
     /// Component that is syncable with dioxus
@@ -45,9 +45,7 @@ pub enum QueryNoneState {
     NotInitialized,
 }
 
-fn drive_component_signals<T: DioxusComponentSync>(
-    mut components: Query<&mut DioxusMirror<T>>,
-) {
+fn drive_component_signals<T: DioxusComponentSync>(mut components: Query<&mut DioxusMirror<T>>) {
     for mut component in &mut components {
         let old_version = component.version.load(std::sync::atomic::Ordering::Relaxed);
         // Drop guard before set_changed to avoid borrow conflict
@@ -209,7 +207,10 @@ fn sync_component_to_mirror<T: DioxusComponentSync>(
         let current_version = mirror.version.load(Ordering::Acquire);
         // Use current_version as default instead of 0 to avoid spurious write-back
         // on the first tick after initialization (version goes from 0→1 due to setup).
-        let last = last_versions.get(&entity).copied().unwrap_or(current_version);
+        let last = last_versions
+            .get(&entity)
+            .copied()
+            .unwrap_or(current_version);
         if current_version != last {
             *value.bypass_change_detection() = mirror.value.read().as_ref().clone();
             mirror.set_changed();
@@ -392,7 +393,9 @@ pub fn sync_query_mirror_to_signal<T: DioxusQuerySync + 'static, F: QueryFilter 
         // Seed versions for any new entities that weren't in the scan above
         for item in mirror_components.iter() {
             let entity = T::get_mirror_entity(&item);
-            last_versions.entry(entity).or_insert_with(|| T::extract_version(&item));
+            last_versions
+                .entry(entity)
+                .or_insert_with(|| T::extract_version(&item));
         }
     }
 
@@ -442,14 +445,13 @@ impl<T: DioxusComponentSync> Default for RequestComponentsMirror<T> {
 
 impl<T: DioxusComponentSync> Command for RequestComponentsMirror<T> {
     fn apply(self, world: &mut World) -> () {
-        let mut mirrored_components = world.get_resource_or_insert_with(|| {
-            MirroredComponents::default()
-        });
+        let mut mirrored_components =
+            world.get_resource_or_insert_with(|| MirroredComponents::default());
         if !mirrored_components.0.contains(&TypeId::of::<T>()) {
             // Mark T as mirrored before adding systems so subsequent
             // requests for the same component type are no-ops.
             mirrored_components.0.insert(TypeId::of::<T>());
-            
+
             add_systems_through_world(
                 world,
                 DioxusSyncPostUpdate,
@@ -461,7 +463,6 @@ impl<T: DioxusComponentSync> Command for RequestComponentsMirror<T> {
                 )
                     .chain(),
             );
-
         }
     }
 }
@@ -766,7 +767,10 @@ impl<A: DioxusComponentSync, B: DioxusComponentSync> MirrorQueryData for (Entity
     }
 
     fn extract_version<'w, 's>(
-        item: &<<Self::MirrorSignalsQueryDataImMut as QueryData>::ReadOnly as QueryData>::Item<'w, 's>,
+        item: &<<Self::MirrorSignalsQueryDataImMut as QueryData>::ReadOnly as QueryData>::Item<
+            'w,
+            's,
+        >,
     ) -> u64 {
         let (_, a, b) = item;
         let va = a.version.load(std::sync::atomic::Ordering::Relaxed);
@@ -934,15 +938,18 @@ pub fn use_bevy_query<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>()
     use_future(move || {
         let ctx = ctx2.clone();
         async move {
-            match ctx.send_command_async(|tx| {
-                let mut q = CommandQueue::default();
-                q.push(RequestQueryMirror::<Q, F> { response_tx: tx });
-                q
-            }).await {
+            match ctx
+                .send_command_async(|tx| {
+                    let mut q = CommandQueue::default();
+                    q.push(RequestQueryMirror::<Q, F> { response_tx: tx });
+                    q
+                })
+                .await
+            {
                 Ok(signal) => {
-                    signal.state.forward_to(
-                        value_signal, health_signal, |arc| Ok(arc),
-                    );
+                    signal
+                        .state
+                        .forward_to(value_signal, health_signal, |arc| Ok(arc));
                     writer.set(Some(signal));
                 }
                 Err(err) => warn!("use_bevy_query: {}", err),

@@ -6,7 +6,7 @@ use bevy_time::{Real, Time};
 use dioxus::prelude::*;
 use dioxus_bevy_signals::{
     push_and_send,
-    query::{DioxusMirror, MirrorQueryData, single::use_bevy_single, use_bevy_query},
+    query::{DioxusMirror, single::use_bevy_single, use_bevy_query},
     use_bevy_command_queue,
 };
 use dioxus_hooks::{use_memo, use_signal};
@@ -124,8 +124,7 @@ impl Plugin for TenNamesTestPlugin {
         app.insert_resource(DebugPrintTimer {
             last_tick: Instant::now(),
         })
-        .add_systems(PostUpdate, print_mirrors)
-        ;
+        .add_systems(PostUpdate, print_mirrors);
     }
 }
 
@@ -273,7 +272,7 @@ pub fn TenNamesQuery() -> Element {
     }
 }
 #[derive(Component, Clone)]
-pub struct SingleCounter (u32);
+pub struct SingleCounter(u32);
 
 #[derive(Component, Clone)]
 pub struct NoMatch;
@@ -281,30 +280,16 @@ pub struct NoMatch;
 #[derive(Component, Clone)]
 pub struct MoreThenOneMatch;
 
-pub fn setup_singleton_test(
-    mut commands: Commands,
-) {
+pub fn setup_singleton_test(mut commands: Commands) {
     // single match
-    commands.spawn(
-        (
-            SingleCounter(0),
-            MoreThenOneMatch,
-        )
-    );
+    commands.spawn((SingleCounter(0), MoreThenOneMatch));
 
     // no matches (due to filter)
-    commands.spawn(
-        NoMatch
-    );
+    commands.spawn(NoMatch);
 
     // more then one match
-    commands.spawn(
-        MoreThenOneMatch
-    );
-    commands.spawn(
-        MoreThenOneMatch
-    );
-
+    commands.spawn(MoreThenOneMatch);
+    commands.spawn(MoreThenOneMatch);
 }
 
 /// Ticks the shared [`TickTimer`] and increments [`SingleCounter`] on each
@@ -316,7 +301,7 @@ pub fn tick_single_counter(
 ) {
     timer.0.tick(time.delta());
     if timer.0.just_finished() {
-        for mut counter in &mut query{
+        for mut counter in &mut query {
             println!("counter value: {}", counter.0);
             counter.0 += 1;
         }
@@ -327,10 +312,8 @@ pub struct SingleQuerySetup;
 
 impl Plugin for SingleQuerySetup {
     fn build(&self, app: &mut App) {
-        app
-        .add_systems(Startup, setup_singleton_test)
-        .add_systems(Update, tick_single_counter)
-        ;
+        app.add_systems(Startup, setup_singleton_test)
+            .add_systems(Update, tick_single_counter);
     }
 }
 
@@ -338,23 +321,31 @@ impl Plugin for SingleQuerySetup {
 #[component]
 pub fn SingleQuery() -> Element {
     let counter = use_bevy_single::<(Entity, &mut SingleCounter), ()>();
-    
+
     let counter_str = use_memo(move || {
-        counter.read_ok(|(_, val, ..)| val.read().0.to_string()).unwrap_or_else(|n| n.into())
+        counter
+            .read_ok(|(_, val, ..)| val.read().0.to_string())
+            .unwrap_or_else(|n| n.into())
     });
 
     let increment_counter = move |_evt| {
-        let _ = counter.read_ok(|value| value.1.mutate(|counter| counter.0 += 10)).unwrap_or_else(|err| println!("tried to increment counter but: {:#?}", err));
+        let _ = counter
+            .read_ok(|value| value.1.mutate(|counter| counter.0 += 10))
+            .unwrap_or_else(|err| println!("tried to increment counter but: {:#?}", err));
     };
 
     let no_match = use_bevy_single::<(Entity, &mut MoreThenOneMatch), With<NoMatch>>();
     let no_match_str = use_memo(move || {
-        no_match.read_ok(|(e, _)| e.to_string()).unwrap_or_else(|n| n.into())
+        no_match
+            .read_ok(|(e, _)| e.to_string())
+            .unwrap_or_else(|n| n.into())
     });
 
     let more_then_one_match = use_bevy_single::<(Entity, &mut MoreThenOneMatch), ()>();
     let more_then_one_match_str = use_memo(move || {
-        more_then_one_match.read_ok(|(e, _)| e.to_string()).unwrap_or_else(|n| n.into())
+        more_then_one_match
+            .read_ok(|(e, _)| e.to_string())
+            .unwrap_or_else(|n| n.into())
     });
 
     rsx! {
@@ -362,7 +353,7 @@ pub fn SingleQuery() -> Element {
             "Single query sync test"
         }
         div {
-            h2 { 
+            h2 {
                 {format!("single match: {}", counter_str)}
             }
             button {
@@ -371,10 +362,10 @@ pub fn SingleQuery() -> Element {
             }
         }
 
-        h2 { 
+        h2 {
             {format!("no match: {}", no_match_str)}
         }
-        h2 { 
+        h2 {
             {format!("more then one match: {}", more_then_one_match_str)}
         }
     }

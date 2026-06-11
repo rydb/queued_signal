@@ -1,8 +1,4 @@
-use std::{
-    any::type_name_of_val,
-    sync::Arc,
-    time::Duration,
-};
+use std::{any::type_name_of_val, sync::Arc, time::Duration};
 
 use bevy_app::{ScheduleRunnerPlugin, prelude::*};
 use bevy_ecs::prelude::*;
@@ -116,9 +112,7 @@ impl CommandQueueSender {
     ) -> Result<R, String> {
         let (response_tx, response_rx) = oneshot::channel();
         let cmd = make_command(response_tx);
-        self.tx
-            .send(cmd)
-            .map_err(|err| format!("{}", err))?;
+        self.tx.send(cmd).map_err(|err| format!("{}", err))?;
 
         response_rx
             .await
@@ -227,7 +221,11 @@ pub fn use_bevy_command_queue() -> BevyCommandsSignal {
 }
 
 /// Thin read guard to a readable value (works with both [`Signal`] and [`Memo`]).
-pub struct SignalReadGuard<'a, T: 'static, R: dioxus_signals::Readable<Target = T> + 'static = dioxus_signals::Signal<T>> {
+pub struct SignalReadGuard<
+    'a,
+    T: 'static,
+    R: dioxus_signals::Readable<Target = T> + 'static = dioxus_signals::Signal<T>,
+> {
     guard: dioxus_signals::ReadableRef<'a, R>,
 }
 
@@ -237,7 +235,9 @@ impl<'a, T: 'static, R: dioxus_signals::Readable<Target = T> + 'static> SignalRe
     }
 }
 
-impl<'a, T: 'static, R: dioxus_signals::Readable<Target = T> + 'static> std::ops::Deref for SignalReadGuard<'a, T, R> {
+impl<'a, T: 'static, R: dioxus_signals::Readable<Target = T> + 'static> std::ops::Deref
+    for SignalReadGuard<'a, T, R>
+{
     type Target = T;
 
     fn deref(&self) -> &Self::Target {

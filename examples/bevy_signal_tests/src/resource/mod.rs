@@ -68,9 +68,7 @@ impl DioxusTestPlugin for ResourceTestsPlugin {
 pub fn CounterResource() -> Element {
     let counter = use_bevy_resource::<Counter>();
 
-    let value = use_memo(move || {
-        counter.read_ok(|c| c.value).unwrap_or(0)
-    });
+    let value = use_memo(move || counter.read_ok(|c| c.value).unwrap_or(0));
 
     let health = counter.health();
     let health_text = match health {

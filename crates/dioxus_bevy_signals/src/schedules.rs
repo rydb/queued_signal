@@ -1,6 +1,6 @@
-use bevy_ecs::{prelude::*, world::CommandQueue};
 use bevy_ecs::schedule::{InternedScheduleLabel, ScheduleLabel};
 use bevy_ecs::world::World;
+use bevy_ecs::{prelude::*, world::CommandQueue};
 use bevy_time::{Time, Virtual};
 use std::time::Duration;
 

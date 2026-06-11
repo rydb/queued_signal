@@ -113,7 +113,6 @@ impl Plugin for SignalTestsPlugin {
 }
 
 pub fn run_signal_tests() {
-
     // Filter OUT noisy crate tracing
     // metadata.target() is the module path, e.g. "dioxus_core::scope_arena"
     let filter = filter_fn(|metadata| {
@@ -146,9 +145,10 @@ pub fn run_signal_tests() {
     let bevy_thread = thread::spawn(move || {
         let mut app = App::new();
         app
-        // run app in headless mode
-        .add_plugins(ScheduleRunnerPlugin::default())
-        .add_plugins(r).run();
+            // run app in headless mode
+            .add_plugins(ScheduleRunnerPlugin::default())
+            .add_plugins(r)
+            .run();
     });
 
     LaunchBuilder::new()

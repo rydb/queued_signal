@@ -1,8 +1,8 @@
 pub(crate) use crate::macros::*;
-use bevy_app::prelude::*;
-use bevy_ecs::world::CommandQueue;
 use crate::schedules::{DioxusSyncPostUpdate, DioxusSyncUpdate};
+use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
+use bevy_ecs::world::CommandQueue;
 use dioxus::prelude::*;
 use dioxus_hooks::{use_context, use_signal};
 use dioxus_signals::{ReadableExt, Signal};
@@ -16,7 +16,7 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use trait_set::trait_set;
 
-use crate::{CommandQueueSender, add_systems_through_world, SignalReadGuard};
+use crate::{CommandQueueSender, SignalReadGuard, add_systems_through_world};
 
 pub type Result<T, E> = std::result::Result<T, E>;
 
@@ -136,9 +136,7 @@ fn sync_resource_to_mirror<T: ResourceDioxusSync>(
     *resource.bypass_change_detection() = new_value
 }
 
-fn drive_signal<T: ResourceDioxusSync>(
-    driver: Res<ResourceWriteDriver<T>>,
-) {
+fn drive_signal<T: ResourceDioxusSync>(driver: Res<ResourceWriteDriver<T>>) {
     let mut guard = driver.0.lock();
     guard.tick(Duration::ZERO);
 }
@@ -148,8 +146,8 @@ fn drive_signal<T: ResourceDioxusSync>(
 pub struct ResourceMirrorSignal<R: Clone + Send + Sync + 'static> {
     signal: Signal<Result<Arc<R>, ResourceNoneState>>,
     health: Signal<HealthStatus>,
-    /// None until the Bevy round-trip completes. 
-    /// 
+    /// None until the Bevy round-trip completes.
+    ///
     /// Writes are silently ignored while the writer is still pending.
     writer: Signal<Option<QueuedSignal<R>>>,
 }
@@ -158,7 +156,12 @@ impl<R: Clone + Send + Sync + 'static> Copy for ResourceMirrorSignal<R> {}
 
 impl<R: Clone + Send + Sync + 'static + Display> Display for ResourceMirrorSignal<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.read_ok(|n| format!("{}", n)).unwrap_or_else(|n| n.into()))
+        write!(
+            f,
+            "{}",
+            self.read_ok(|n| format!("{}", n))
+                .unwrap_or_else(|n| n.into())
+        )
     }
 }
 
@@ -237,11 +240,9 @@ where
                     // misses the already-published initial value.
                     let current = signal.read().clone();
                     value_signal.set(Ok(current));
-                    signal.state.forward_to(
-                        value_signal,
-                        health_signal,
-                        |arc| Ok(arc),
-                    );
+                    signal
+                        .state
+                        .forward_to(value_signal, health_signal, |arc| Ok(arc));
                     writer.set(Some(signal));
                 }
                 Err(err) => warn!("use_bevy_resource: {}", err),

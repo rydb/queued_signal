@@ -8,7 +8,7 @@ use bevy_color::{Color, Srgba};
 use bevy_ecs::prelude::*;
 use bevy_pbr::{MeshMaterial3d, StandardMaterial};
 use dioxus::prelude::*;
-use dioxus_bevy_signals::asset::{use_bevy_asset, AssetNoneState};
+use dioxus_bevy_signals::asset::{AssetNoneState, use_bevy_asset};
 // use dioxus_bevy_signals::asset::use_bevy_asset;
 use dioxus_bevy_signals::query::use_bevy_query;
 use dioxus_hooks::{use_memo, use_signal};

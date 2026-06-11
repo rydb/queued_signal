@@ -506,7 +506,10 @@ impl<T: Clone + Send + Sync + 'static> QueuedSignal<T> {
         self.state.health()
     }
 
-    pub fn use_hook<E: 'static>(&self, error_state: E) -> (Signal<Result<Arc<T>, E>>, Signal<HealthStatus>) {
+    pub fn use_hook<E: 'static>(
+        &self,
+        error_state: E,
+    ) -> (Signal<Result<Arc<T>, E>>, Signal<HealthStatus>) {
         use_queued_signal(self.state.clone(), error_state)
     }
 

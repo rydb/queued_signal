@@ -8,10 +8,10 @@ pub use std::{
 };
 
 pub(crate) use crate::macros::*;
-use bevy_asset::{Asset, AssetEvent, AssetId, AssetServer, Assets, LoadState};
 use crate::schedules::{DioxusSyncLast, DioxusSyncPostUpdate, DioxusSyncUpdate};
+use bevy_asset::{Asset, AssetEvent, AssetId, AssetServer, Assets, LoadState};
 use bevy_ecs::{prelude::*, world::CommandQueue};
-use dioxus_core::{use_drop, use_hook, spawn};
+use dioxus_core::{spawn, use_drop, use_hook};
 use dioxus_hooks::{use_context, use_effect, use_signal};
 use dioxus_signals::{Memo, ReadableExt, Signal, WritableExt};
 use flume::{Receiver, Sender};
@@ -20,7 +20,7 @@ use queued_signal::signal::{HealthStatus, QueuedSignal, WriterDriver};
 use tokio::sync::oneshot;
 use trait_set::trait_set;
 
-use crate::{CommandQueueSender, add_systems_through_world, SignalReadGuard};
+use crate::{CommandQueueSender, SignalReadGuard, add_systems_through_world};
 
 trait_set! {
     pub trait DioxusAssetSync = Asset + Clone + Send + Sync + 'static;
@@ -70,7 +70,6 @@ impl From<AssetNoneState> for String {
         value.as_string()
     }
 }
-
 
 #[derive(Clone, Debug)]
 pub struct AssetUpdateExtraInfo<A: DioxusAssetSync> {
@@ -190,7 +189,10 @@ pub fn init_requested_asset_mirrors<A: DioxusAssetSync>(
             // that directly before concluding it's invalid.
             None => match assets.get(id) {
                 Some(asset) => {
-                    trace!("init_requested_asset_mirrors: get_load_state=None but found in Assets<A> for {:?}", id);
+                    trace!(
+                        "init_requested_asset_mirrors: get_load_state=None but found in Assets<A> for {:?}",
+                        id
+                    );
                     Ok(asset.clone())
                 }
                 None => {
@@ -207,9 +209,7 @@ pub fn init_requested_asset_mirrors<A: DioxusAssetSync>(
                 Err(e) => e.as_string(),
             }
         );
-        entry
-            .state
-            .set_value(Arc::new(fetch));
+        entry.state.set_value(Arc::new(fetch));
     }
 }
 
@@ -264,7 +264,11 @@ pub fn collect_changed_ids<A: DioxusAssetSync>(
     mut changed: ResMut<ChangedAssetMirrors<A>>,
 ) {
     while let Ok(id) = rx.0.try_recv() {
-        trace!("id {} marked as changed for asset type {:#?}", id, type_name::<A>());
+        trace!(
+            "id {} marked as changed for asset type {:#?}",
+            id,
+            type_name::<A>()
+        );
         changed.0.insert(id);
     }
 }
@@ -305,7 +309,11 @@ impl<A: DioxusAssetSync> Command for RequestBevyAssetMirror<A> {
 
                 add_systems_through_world(world, DioxusSyncUpdate, collect_changed_ids::<A>);
                 add_systems_through_world(world, DioxusSyncUpdate, drive_maybe_assets::<A>);
-                add_systems_through_world(world, DioxusSyncPostUpdate, init_requested_asset_mirrors::<A>);
+                add_systems_through_world(
+                    world,
+                    DioxusSyncPostUpdate,
+                    init_requested_asset_mirrors::<A>,
+                );
                 add_systems_through_world(world, DioxusSyncPostUpdate, sync_mirrors_to_assets::<A>);
                 add_systems_through_world(
                     world,
@@ -546,8 +554,10 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
     // Value/health signals start in Fetching state — same as before.
     let mut asset_value_signal = use_signal(|| Arc::new(Err(AssetNoneState::Fetching)));
     let mut health_signal = use_signal(|| HealthStatus::Healthy);
-    let mut extra_info_signal: Signal<Result<Arc<AssetUpdateExtraInfo<A>>, AssetNoneState>> = use_signal(|| Err(AssetNoneState::Fetching));
-    let mut writer_signal: Signal<Option<QueuedSignal<Result<A, AssetNoneState>>>> = use_signal(|| None);
+    let mut extra_info_signal: Signal<Result<Arc<AssetUpdateExtraInfo<A>>, AssetNoneState>> =
+        use_signal(|| Err(AssetNoneState::Fetching));
+    let mut writer_signal: Signal<Option<QueuedSignal<Result<A, AssetNoneState>>>> =
+        use_signal(|| None);
 
     // Tracks which asset ID we have sent a mirror request for,
     // and whether the +1 tracking command has been dispatched.
@@ -574,22 +584,37 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
         // Avoid re-requesting if we're already working on this ID
         // or have already set up the mirror.
         if *sent_id.read() == Some(asset_id) || writer_signal.read().is_some() {
-            trace!("use_bevy_asset effect: already sent for {:?}, skipping", asset_id);
+            trace!(
+                "use_bevy_asset effect: already sent for {:?}, skipping",
+                asset_id
+            );
             return;
         }
         sent_id.set(Some(asset_id));
-        trace!("use_bevy_asset effect: spawning mirror request for {:?}", asset_id);
+        trace!(
+            "use_bevy_asset effect: spawning mirror request for {:?}",
+            asset_id
+        );
 
         let ctx = ctx2.clone();
         spawn(async move {
-            let resp = match ctx.send_command_async(|tx| {
-                let mut q = CommandQueue::default();
-                q.push(RequestBevyAssetMirror::<A> { response_tx: tx, asset_id });
-                q
-            }).await {
+            let resp = match ctx
+                .send_command_async(|tx| {
+                    let mut q = CommandQueue::default();
+                    q.push(RequestBevyAssetMirror::<A> {
+                        response_tx: tx,
+                        asset_id,
+                    });
+                    q
+                })
+                .await
+            {
                 Ok(r) => r,
                 Err(_) => {
-                    trace!("use_bevy_asset spawn: send_command_async failed for {:?}", asset_id);
+                    trace!(
+                        "use_bevy_asset spawn: send_command_async failed for {:?}",
+                        asset_id
+                    );
                     return;
                 }
             };
@@ -614,18 +639,22 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
             );
 
             // Forward future changes into the hook signals
-            resp.asset_state.state.forward_to(
-                asset_value_signal, health_signal, |arc| arc,
-            );
-            resp.extra_info.state.forward_to(
-                extra_info_signal, health_signal, |arc| Ok(arc),
-            );
+            resp.asset_state
+                .state
+                .forward_to(asset_value_signal, health_signal, |arc| arc);
+            resp.extra_info
+                .state
+                .forward_to(extra_info_signal, health_signal, |arc| Ok(arc));
 
             // Mount: send +1 tracking
             let asset_id = resp.extra_info.read().asset_id;
             trace!("asset signal mounted, sending +1 for {:?}", asset_id);
             let mut q = CommandQueue::default();
-            q.push(UpdateTrackingAssets::<A> { delta: 1, asset_id, _phantom: PhantomData });
+            q.push(UpdateTrackingAssets::<A> {
+                delta: 1,
+                asset_id,
+                _phantom: PhantomData,
+            });
             let _ = ctx.tx.send(q);
 
             tracking_active.set(true);
@@ -643,7 +672,11 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
         if let Some(asset_id) = *sent_id.read() {
             trace!("asset signal dropped, sending -1 for {:?}", asset_id);
             let mut q = CommandQueue::default();
-            q.push(UpdateTrackingAssets::<A> { delta: -1, asset_id, _phantom: PhantomData });
+            q.push(UpdateTrackingAssets::<A> {
+                delta: -1,
+                asset_id,
+                _phantom: PhantomData,
+            });
             let _ = r.tx.send(q);
         }
     });
