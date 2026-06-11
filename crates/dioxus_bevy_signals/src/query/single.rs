@@ -80,10 +80,28 @@ pub fn use_bevy_single<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>()
 -> MirrorQuerySingleHandle<Q, F> {
     let query_handle = use_bevy_query::<Q, F>();
 
-    let mut item: Signal<Result<Q::MirrorItemHandles, SingleQueryError>> =use_signal(|| Err(SingleQueryError::NotInitialized));
+    let mut item: Signal<Result<Q::MirrorItemHandles, SingleQueryError>> = use_signal(|| Err(SingleQueryError::NotInitialized));
+
+    let mut last_version: Signal<u64> = use_signal(|| 0);
 
     use_memo(move || {
-        let new_val = match &*query_handle.read() {
+        // Always read to register the reactive dependency on the query signal,
+        // even when we early-return. Without this, Dioxus's reset_and_run_in
+        // clears the subscriber registration and subsequent updates from Bevy
+        // never trigger this memo
+        let dep = query_handle.read();
+
+        // Check if the query signal has published a new version
+        let writer = query_handle.writer.read();
+        let current_version = writer.as_ref()
+            .map(|s| s.peek_version())
+            .unwrap_or(0);
+        if current_version == *last_version.read() {
+            return;
+        }
+        last_version.set(current_version);
+
+        let new_val = match &*dep {
             Err(_) => Err(SingleQueryError::NotInitialized),
             Ok(mq) => {
                 match mq.value.len() {

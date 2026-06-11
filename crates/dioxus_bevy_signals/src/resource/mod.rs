@@ -113,7 +113,7 @@ impl<T: ResourceDioxusSync> Command for RequestBevyResource<T> {
 /// System that synchronises the authoritative Bevy resource into the signal mirror.
 /// It uses `set_value`, which results in exactly two clones (one into the operation,
 /// one for the second internal buffer).
-pub fn sync_mirror_to_resource<T: ResourceDioxusSync>(
+fn sync_mirror_to_resource<T: ResourceDioxusSync>(
     resource: Res<T>,
     mut mirror: ResMut<ResourceQueuedSignalMirror<T>>,
 ) {
@@ -128,7 +128,7 @@ pub fn sync_mirror_to_resource<T: ResourceDioxusSync>(
     }
 }
 
-pub fn sync_resource_to_mirror<T: ResourceDioxusSync>(
+fn sync_resource_to_mirror<T: ResourceDioxusSync>(
     mut resource: ResMut<T>,
     mirror: Res<ResourceQueuedSignalMirror<T>>,
 ) {
@@ -146,11 +146,12 @@ fn drive_signal<T: ResourceDioxusSync>(
 /// Dioxus signal for managing bevy resource <-> dioxus interop.
 #[derive(Clone)]
 pub struct ResourceMirrorSignal<R: Clone + Send + Sync + 'static> {
-    pub signal: Signal<Result<Arc<R>, ResourceNoneState>>,
-    pub health: Signal<HealthStatus>,
-    /// `None` until the Bevy round-trip completes (non-blocking). Writes are
-    /// silently ignored while the writer is still pending.
-    pub writer: Signal<Option<QueuedSignal<R>>>,
+    signal: Signal<Result<Arc<R>, ResourceNoneState>>,
+    health: Signal<HealthStatus>,
+    /// None until the Bevy round-trip completes. 
+    /// 
+    /// Writes are silently ignored while the writer is still pending.
+    writer: Signal<Option<QueuedSignal<R>>>,
 }
 
 impl<R: Clone + Send + Sync + 'static> Copy for ResourceMirrorSignal<R> {}
@@ -206,12 +207,6 @@ impl<R: Clone + Send + Sync + 'static> ResourceMirrorSignal<R> {
 }
 
 /// Create or fetch a QueuedSignal mirror to a bevy resource.
-///
-/// This hook is **non-blocking**: it returns immediately with the value
-/// signal set to [`ResourceNoneState::NotInitialized`] and the writer
-/// set to `None`.  The real [`QueuedSignal`] is fetched asynchronously
-/// via [`CommandQueueSender::send_command_async`] and installed when
-/// the Bevy world processes the request.
 pub fn use_bevy_resource<T>() -> ResourceMirrorSignal<T>
 where
     T: ResourceDioxusSync,
@@ -235,6 +230,13 @@ where
                 .await
             {
                 Ok(signal) => {
+                    // Eagerly forward the current mirrored value so that
+                    // static resources (which are never updated by Bevy
+                    // after initialization) are available immediately.
+                    // forward_to only fires on *published* changes; it
+                    // misses the already-published initial value.
+                    let current = signal.read().clone();
+                    value_signal.set(Ok(current));
                     signal.state.forward_to(
                         value_signal,
                         health_signal,

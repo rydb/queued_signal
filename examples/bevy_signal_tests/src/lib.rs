@@ -123,6 +123,7 @@ pub fn run_signal_tests() {
             && !metadata.target().starts_with("bevy_ecs")
             && !metadata.target().starts_with("bevy_app")
             && !metadata.target().starts_with("warnings")
+        // true
     });
 
     let stdout_layer = fmt::layer().with_writer(io::stdout);

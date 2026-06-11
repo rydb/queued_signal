@@ -176,17 +176,22 @@ impl Plugin for DioxusBevyMirrorPlugin {
             .insert_resource(DioxusSyncConfig::from_fps(self.dioxus_sync_fps))
             .insert_resource(DioxusSyncAccumulator::default())
             .init_resource::<DioxusSyncMainScheduleOrder>()
-            // The runner is checked every frame (via Update) but only ticks
+            // The runner is checked every frame (via PostUpdate) but only ticks
             // the Dioxus sync schedules when enough time has accumulated.
-            .add_systems(Update, DioxusSyncMain::run_dioxus_sync_main);
+            // PostUpdate ensures user Update systems (animate, etc.) run first,
+            // so the latest component state is synced to Dioxus signals without
+            // requiring explicit .before() ordering from end users.
+            .add_systems(PostUpdate, DioxusSyncMain::run_dioxus_sync_main);
 
         app.insert_resource(CommandQueueReciever {
             rx: self.bevy_command_txrx.rx.clone(),
         })
         .insert_resource(CommandQueueSender {
             tx: self.bevy_command_txrx.tx.clone(),
-        })
-        .add_systems(DioxusSyncPreUpdate, process_commands);
+        });
+        // process_commands is now handled inside DioxusSyncMain::run_dioxus_sync_main
+        // (before the sub-schedule loop) so dynamically-registered systems from
+        // command processing are available for the current frame.
     }
 }
 

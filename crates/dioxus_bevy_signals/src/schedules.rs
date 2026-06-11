@@ -1,4 +1,4 @@
-use bevy_ecs::prelude::*;
+use bevy_ecs::{prelude::*, world::CommandQueue};
 use bevy_ecs::schedule::{InternedScheduleLabel, ScheduleLabel};
 use bevy_ecs::world::World;
 use bevy_time::{Time, Virtual};
@@ -39,9 +39,6 @@ impl DioxusSyncConfig {
 pub(crate) struct DioxusSyncAccumulator {
     pub accumulated: Duration,
 }
-
-// -- Schedule Labels 
-
 /// The container schedule that runs the four Dioxus sync sub-schedules in order.
 ///
 /// It is driven by [`DioxusSyncMain::run_dioxus_sync_main`] at the rate
@@ -56,11 +53,11 @@ pub struct DioxusSyncMain;
 #[derive(ScheduleLabel, Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct DioxusSyncPreUpdate;
 
-/// Main Dioxus sync systems — all `drive_*` signal tickers.
+/// Main Dioxus sync systems all `drive_*` signal tickers.
 #[derive(ScheduleLabel, Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct DioxusSyncUpdate;
 
-/// Mirror ↔ world synchronisation systems (e.g. `sync_mirror_to_resource`).
+/// Mirror world synchronisation systems (e.g. `sync_mirror_to_resource`).
 #[derive(ScheduleLabel, Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct DioxusSyncPostUpdate;
 
@@ -88,16 +85,27 @@ impl Default for DioxusSyncMainScheduleOrder {
     }
 }
 
-// -- Runner 
-
 impl DioxusSyncMain {
     /// System that runs [`DioxusSyncMain`] at the rate configured in
     /// [`DioxusSyncConfig`].
     ///
-    /// Added to the [`Update`] schedule so it is checked every frame, but
+    /// Added to the [`PostUpdate`] schedule so it is checked every frame, but
     /// the contained sync schedules only tick when enough
     /// [`Time<Virtual>`] delta has accumulated.
     pub fn run_dioxus_sync_main(world: &mut World) {
+        // Process pending Dioxus commands BEFORE ticking sync schedules.
+        // This ensures any dynamically-added systems (resource mirrors, etc.)
+        // are registered and available for the sub-schedules in this frame.
+        {
+            use crate::CommandQueueReciever;
+            let rx = &world.resource::<CommandQueueReciever>().rx;
+            let mut queue = CommandQueue::default();
+            while let Ok(mut cmd) = rx.try_recv() {
+                queue.append(&mut cmd);
+            }
+            queue.apply(world);
+        }
+
         let delta = world.resource::<Time<Virtual>>().delta();
         let timestep = world.resource::<DioxusSyncConfig>().timestep;
 

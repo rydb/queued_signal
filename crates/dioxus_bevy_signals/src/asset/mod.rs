@@ -8,12 +8,12 @@ pub use std::{
 };
 
 pub(crate) use crate::macros::*;
-use bevy_asset::{Asset, AssetEvent, AssetId, AssetServer, Assets, LoadState, uuid::Uuid};
+use bevy_asset::{Asset, AssetEvent, AssetId, AssetServer, Assets, LoadState};
 use crate::schedules::{DioxusSyncLast, DioxusSyncPostUpdate, DioxusSyncUpdate};
 use bevy_ecs::{prelude::*, world::CommandQueue};
-use dioxus_core::{use_drop, use_hook};
-use dioxus_hooks::{use_context, use_effect, use_future, use_memo, use_signal};
-use dioxus_signals::{Memo, ReadableExt, ReadableResultExt, Signal, WritableExt};
+use dioxus_core::{use_drop, use_hook, spawn};
+use dioxus_hooks::{use_context, use_effect, use_signal};
+use dioxus_signals::{Memo, ReadableExt, Signal, WritableExt};
 use flume::{Receiver, Sender};
 use parking_lot::Mutex;
 use queued_signal::signal::{HealthStatus, QueuedSignal, WriterDriver};
@@ -64,6 +64,13 @@ impl AssetNoneState {
         value.into()
     }
 }
+
+impl From<AssetNoneState> for String {
+    fn from(value: AssetNoneState) -> Self {
+        value.as_string()
+    }
+}
+
 
 #[derive(Clone, Debug)]
 pub struct AssetUpdateExtraInfo<A: DioxusAssetSync> {
@@ -141,7 +148,7 @@ pub fn init_requested_asset_mirrors<A: DioxusAssetSync>(
 ) {
     let requests = mirrors.init_requests.clone();
     for id in requests {
-        trace!("asset init request for id {:?}", id);
+        trace!("init_requested_asset_mirrors processing {:?}", id);
 
         let Some(entry) = mirrors.assets.get_mut(&id) else {
             error!(
@@ -156,7 +163,8 @@ pub fn init_requested_asset_mirrors<A: DioxusAssetSync>(
                     LoadState::NotLoaded => Err(AssetNoneState::NotLoaded),
                     LoadState::Loading => Err(AssetNoneState::Loading),
                     LoadState::Loaded => {
-                        let fetch = match assets.get(id) {
+                        let asset_opt = assets.get(id);
+                        match asset_opt {
                             Some(asset) => Ok(asset.clone()),
                             None => {
                                 error!(
@@ -168,8 +176,7 @@ pub fn init_requested_asset_mirrors<A: DioxusAssetSync>(
                                         .into(),
                                 ))
                             }
-                        };
-                        fetch
+                        }
                     }
                     LoadState::Failed(asset_load_error) => {
                         Err(AssetNoneState::Error(asset_load_error.to_string()))
@@ -177,10 +184,29 @@ pub fn init_requested_asset_mirrors<A: DioxusAssetSync>(
                 };
                 asset_fetch
             }
-            None => {
-                Err(AssetNoneState::NonAsset)
-            }
+            // get_load_state returns None for procedurally-generated assets
+            // (those added via Assets::add() rather than loaded through the
+            // AssetServer). The asset may still exist in Assets<A> — check
+            // that directly before concluding it's invalid.
+            None => match assets.get(id) {
+                Some(asset) => {
+                    trace!("init_requested_asset_mirrors: get_load_state=None but found in Assets<A> for {:?}", id);
+                    Ok(asset.clone())
+                }
+                None => {
+                    trace!("init_requested_asset_mirrors: asset not found for {:?}", id);
+                    Err(AssetNoneState::NonAsset)
+                }
+            },
         };
+        trace!(
+            "init_requested_asset_mirrors result for {:?}: {}",
+            id,
+            match &fetch {
+                Ok(_) => "Ok(asset)".to_string(),
+                Err(e) => e.as_string(),
+            }
+        );
         entry
             .state
             .set_value(Arc::new(fetch));
@@ -253,72 +279,10 @@ pub struct AssetSyncInitialized<A: DioxusAssetSync> {
     _phantom: PhantomData<A>,
 }
 
-/// id of asset signal. used for initializing signals.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct AssetSignalId {
-    id: u32,
-}
-
-#[derive(Hash, PartialEq, Eq, Clone, Copy)]
-pub struct RequestAssetIdTicket {
-    ticket_id: u32,
-}
-
-pub struct InitializeSignalAssetIdRequest<A: DioxusAssetSync> {
-    new_id: AssetId<A>,
-    old_id: AssetId<A>,
-}
-
-#[derive(Resource)]
-pub struct UpdateAssetSignalSender<A: DioxusAssetSync> {
-    tx: Sender<InitializeSignalAssetIdRequest<A>>,
-}
-
-#[derive(Resource)]
-pub struct UpdateAssetSignalReciever<A: DioxusAssetSync> {
-    rx: Receiver<InitializeSignalAssetIdRequest<A>>,
-}
-
-/// take currently signals that have uninitailized asset ids, point them to their new initialized asset id value
-fn update_signals_with_initialized_ids<A: DioxusAssetSync>(
-    requests: Res<UpdateAssetSignalReciever<A>>,
-    mut map: ResMut<AssetMirrorMap<A>>,
-) {
-    while let Ok(request) = requests.rx.try_recv() {
-        trace!("received swap request old {:?} -> new {:?}", request.old_id, request.new_id);
-        // don't remove mirror thats already been removed to stop use after free
-        let old_id = request.old_id;
-        if !map.assets.contains_key(&old_id) {
-            trace!("old_id {:?} not found in map, skipping", old_id);
-            continue;
-        }
-
-        let Some((_, mirror)) = map.assets.remove_entry(&old_id) else {
-            error!("requested asset id for update is invalid? {}", old_id);
-            continue;
-        };
-
-        let signal = &mirror.extra_update_info;
-
-        signal.mutate(move |n| n.asset_id = request.new_id);
-        // force send changed in order to refresh asset. Otherwise, asset reports as still none.
-        let _ = signal
-            .read()
-            .changed_sender
-            .send(request.new_id)
-            .inspect_err(|err| println!("{err}"));
-
-        trace!("swap complete, inserted new_id {:?} into init_requests", request.new_id);
-        map.init_requests.insert(request.new_id);
-        map.assets.insert(request.new_id, mirror);
-    }
-}
-
-#[derive(Resource, Clone)]
+#[derive(Resource, Clone, Debug)]
 pub struct AssetMirrorRequestResponse<A: DioxusAssetSync> {
     asset_state: QueuedSignal<Result<A, AssetNoneState>>,
     extra_info: QueuedSignal<AssetUpdateExtraInfo<A>>,
-    initialize_request_tx: Sender<InitializeSignalAssetIdRequest<A>>,
 }
 
 pub struct RequestBevyAssetMirror<A: DioxusAssetSync> {
@@ -332,23 +296,15 @@ impl<A: DioxusAssetSync> Command for RequestBevyAssetMirror<A> {
             Some(_) => {}
             None => {
                 let (changed_tx, changed_rx) = flume::unbounded();
-                let (initialize_asset_id_tx, initialize_asset_id_rx) = flume::unbounded();
 
                 world.insert_resource(AssetMirrorMap::<A>::default());
                 world.insert_resource(ChangedAssetMirrors::<A>::default());
                 world.insert_resource(ChangedIdsReceiver::<A>(changed_rx));
                 world.insert_resource(ChangedIdsSender::<A>(changed_tx));
-                world.insert_resource(UpdateAssetSignalReciever::<A> {
-                    rx: initialize_asset_id_rx,
-                });
-                world.insert_resource(UpdateAssetSignalSender::<A> {
-                    tx: initialize_asset_id_tx,
-                });
                 world.insert_resource(PendingAssetTrackingDeltas::<A>::default());
 
                 add_systems_through_world(world, DioxusSyncUpdate, collect_changed_ids::<A>);
                 add_systems_through_world(world, DioxusSyncUpdate, drive_maybe_assets::<A>);
-                add_systems_through_world(world, DioxusSyncUpdate, update_signals_with_initialized_ids::<A>);
                 add_systems_through_world(world, DioxusSyncPostUpdate, init_requested_asset_mirrors::<A>);
                 add_systems_through_world(world, DioxusSyncPostUpdate, sync_mirrors_to_assets::<A>);
                 add_systems_through_world(
@@ -437,12 +393,9 @@ impl<A: DioxusAssetSync> Command for RequestBevyAssetMirror<A> {
             }
         };
 
-        let initialize_request_tx = world.resource::<UpdateAssetSignalSender<A>>();
-
         trace!("sending back signal response for {}", type_name::<A>());
         let _ = self.response_tx.send(AssetMirrorRequestResponse {
             asset_state,
-            initialize_request_tx: initialize_request_tx.tx.clone(),
             extra_info,
         });
     }
@@ -578,43 +531,89 @@ impl<A: DioxusAssetSync> AssetMaybeMirrorSignal<A> {
 use std::fmt::Debug;
 
 /// Returns immediately with `Fetching` state.  The real mirror is fetched
-/// asynchronously and installed when the Bevy world processes the request.
+/// asynchronously once the asset ID becomes available via the `id` memo,
+/// and installed when the Bevy world processes the request.
+///
+/// Unlike the previous implementation, this does NOT use a placeholder UUID
+/// and swap mechanism — it defers creation of the Bevy-side mirror until
+/// the real [`AssetId`] is known, eliminating a class of race conditions
+/// where the mirror could get stuck in a `NonAsset` state.
 pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
     id: Memo<Result<AssetId<A>, AssetNoneState>>,
 ) -> AssetMaybeMirrorSignal<A> {
     let ctx = use_context::<CommandQueueSender>();
 
-    let initial_id = id.read().clone().unwrap_or_else(|_| AssetId::<A>::from(Uuid::new_v4()));
-
-    // Value/health signals start in Fetching state
+    // Value/health signals start in Fetching state — same as before.
     let mut asset_value_signal = use_signal(|| Arc::new(Err(AssetNoneState::Fetching)));
     let mut health_signal = use_signal(|| HealthStatus::Healthy);
     let mut extra_info_signal: Signal<Result<Arc<AssetUpdateExtraInfo<A>>, AssetNoneState>> = use_signal(|| Err(AssetNoneState::Fetching));
-    let mut response: Signal<Option<AssetMirrorRequestResponse<A>>> = use_signal(|| None);
     let mut writer_signal: Signal<Option<QueuedSignal<Result<A, AssetNoneState>>>> = use_signal(|| None);
 
-    let mut current_asset_id = use_signal(|| initial_id);
-    use_memo(move || {
-        if let Ok(info) = extra_info_signal.read().as_ref() {
-            current_asset_id.set(info.asset_id);
-        }
-    });
+    // Tracks which asset ID we have sent a mirror request for,
+    // and whether the +1 tracking command has been dispatched.
+    let mut sent_id = use_signal(|| None::<AssetId<A>>);
+    let mut tracking_active = use_signal(|| false);
 
-    // ---- async fetch: send command, forward values, send +1 ----
+    // ---- Deferred mirror creation: wait for a real AssetId ----
+    //
+    // Previously this used a random UUID placeholder + swap mechanism
+    // (InitializeSignalAssetIdRequest + update_signals_with_initialized_ids).
+    // That created a race window where init_requested_asset_mirrors would
+    // process the placeholder UUID, set NonAsset, and the subsequent swap
+    // to the real ID could leave the asset stuck at NonAsset.
+    //
+    // Now we simply wait until `id` resolves to Ok(real_asset_id) before
+    // creating the mirror — no placeholder, no swap, no race.
     let ctx2 = ctx.clone();
-    use_future(move || {
+    use_effect(move || {
+        let Ok(asset_id) = id.read().clone() else {
+            trace!("use_bevy_asset effect: id not ready yet");
+            return; // ID not yet available — stay in Fetching
+        };
+
+        // Avoid re-requesting if we're already working on this ID
+        // or have already set up the mirror.
+        if *sent_id.read() == Some(asset_id) || writer_signal.read().is_some() {
+            trace!("use_bevy_asset effect: already sent for {:?}, skipping", asset_id);
+            return;
+        }
+        sent_id.set(Some(asset_id));
+        trace!("use_bevy_asset effect: spawning mirror request for {:?}", asset_id);
+
         let ctx = ctx2.clone();
-        async move {
+        spawn(async move {
             let resp = match ctx.send_command_async(|tx| {
                 let mut q = CommandQueue::default();
-                q.push(RequestBevyAssetMirror::<A> { response_tx: tx, asset_id: initial_id });
+                q.push(RequestBevyAssetMirror::<A> { response_tx: tx, asset_id });
                 q
             }).await {
                 Ok(r) => r,
-                Err(e) => { warn!("use_bevy_asset: {}", e); return; }
+                Err(_) => {
+                    trace!("use_bevy_asset spawn: send_command_async failed for {:?}", asset_id);
+                    return;
+                }
             };
 
-            // Forward real values into the hook signals
+            // Eagerly set signals from current queued state values so they
+            // are immediately available (e.g. extra_info_signal needed by
+            // mutate() to send change notifications back to Bevy), then
+            // subscribe to future changes via forward_to.
+            //
+            // forward_to uses nr.changed() which only fires on the *next*
+            // publish; by the time we subscribe here the driver may already
+            // have published the initial value, so we'd miss it and the
+            // signals would stay at their initial Fetching/Err state.
+            let extra_info_arc = resp.extra_info.read().clone();
+            extra_info_signal.set(Ok(extra_info_arc));
+            let asset_arc = resp.asset_state.read().clone();
+            asset_value_signal.set(asset_arc);
+
+            trace!(
+                "use_bevy_asset spawn: response received, asset_value={:?}",
+                *asset_value_signal.read()
+            );
+
+            // Forward future changes into the hook signals
             resp.asset_state.state.forward_to(
                 asset_value_signal, health_signal, |arc| arc,
             );
@@ -629,56 +628,23 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
             q.push(UpdateTrackingAssets::<A> { delta: 1, asset_id, _phantom: PhantomData });
             let _ = ctx.tx.send(q);
 
+            tracking_active.set(true);
             writer_signal.set(Some(resp.asset_state.clone()));
-            response.set(Some(resp));
-        }
+            trace!("use_bevy_asset spawn: setup complete for {:?}", asset_id);
+        });
     });
 
-    // Unmount: send -1 tracking
+    // Unmount: send -1 tracking (only if +1 was sent)
     let r = ctx.clone();
     use_drop(move || {
-        let asset_id = *current_asset_id.read();
-        trace!("asset signal dropped, sending -1 for {:?}", asset_id);
-        let mut q = CommandQueue::default();
-        q.push(UpdateTrackingAssets::<A> { delta: -1, asset_id, _phantom: PhantomData });
-        let _ = r.tx.send(q);
-    });
-
-    // Asset ID changes (waits for response to be Some).
-    //
-    // Uses `sent_update_for_id` instead of a simple "last requested" guard so that
-    // when `response` arrives *after* `id` has already changed we still send the
-    // re-initialization request and the mirror doesn't get stuck in NonAsset.
-    let mut sent_update_for_id = use_signal(|| None::<AssetId<A>>);
-    use_effect(move || {
-        let wanted = id.as_ref();
-        // always subscribe to response so the effect re-runs when it becomes Some
-        let resp = response.read();
-
-        trace!(
-            "effect: wanted={:?} resp.is_some={} already_sent={:?} current_asset_id={:?}",
-            wanted.as_ref().map(|id| format!("{:?}", id)).ok(),
-            resp.is_some(),
-            *sent_update_for_id.read(),
-            *current_asset_id.read()
-        );
-
-        if let Ok(new_id) = wanted {
-            let already_sent = *sent_update_for_id.read() == Some(*new_id);
-            if !already_sent {
-                if let Some(ref resp) = *resp {
-                    let old_id = *current_asset_id.read();
-                    if old_id != *new_id {
-                        sent_update_for_id.set(Some(*new_id));
-                        trace!(
-                            "sending InitializeSignalAssetIdRequest old {:?} -> new {:?}",
-                            old_id, new_id
-                        );
-                        let _ = resp.initialize_request_tx
-                            .send(InitializeSignalAssetIdRequest { new_id: *new_id, old_id });
-                    }
-                }
-            }
+        if !*tracking_active.read() {
+            return;
+        }
+        if let Some(asset_id) = *sent_id.read() {
+            trace!("asset signal dropped, sending -1 for {:?}", asset_id);
+            let mut q = CommandQueue::default();
+            q.push(UpdateTrackingAssets::<A> { delta: -1, asset_id, _phantom: PhantomData });
+            let _ = r.tx.send(q);
         }
     });
 

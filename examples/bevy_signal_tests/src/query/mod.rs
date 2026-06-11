@@ -142,8 +142,8 @@ impl Plugin for QueryTestsPlugin {
 impl DioxusTestPlugin for QueryTestsPlugin {
     fn included_element(&self) -> Element {
         rsx! {
-            // TenNamesQuery {  }
-            SingleQuery {}
+            TenNamesQuery {  }
+            // SingleQuery {}
         }
     }
 

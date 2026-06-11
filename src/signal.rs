@@ -185,6 +185,13 @@ impl<T: Clone + Send + Sync> QueuedState<T> {
     pub fn notify_rx(&self) -> watch::Receiver<u64> {
         self.notify_rx.clone()
     }
+
+    /// Peek the current version without entering the read side or cloning.
+    /// Returns the latest published version number (u64 counter).
+    /// O(1) — just reads the watch channel's current value.
+    pub fn peek_version(&self) -> u64 {
+        *self.notify_rx.borrow()
+    }
 }
 
 impl<T: Clone + Send + Sync + 'static> QueuedState<T> {
@@ -350,7 +357,7 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
         self.publish_counter = Some(counter);
     }
 
-    /// Absolute override – drains all buffers and replaces with the given `T`.
+    /// drains all buffers and replaces with the given `T`.
     pub fn write_absolute(&self, value: T) {
         let arc = Arc::new(value);
         let mut slot = self.abs_slot.lock();

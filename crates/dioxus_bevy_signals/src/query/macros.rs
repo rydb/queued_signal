@@ -10,11 +10,9 @@
 /// 3. Sizes 3+ — uses `Or<(...)>` for filter types.
 
 macro_rules! impl_mirror_query_data {
-    // ── Size 2: no-op (manual impl in mod.rs) ──────────────────────────
-
     ($T0:ident, $T1:ident) => {};
 
-    // ── Single-element arm (1 component) ───────────────────────────────
+    // Single-element arm (1 component)
 
     ($T:ident) => {
         impl<$T: DioxusComponentSync> MirrorQueryData for (Entity, &mut $T) {
@@ -70,6 +68,17 @@ macro_rules! impl_mirror_query_data {
                 (item.0, $T.handle())
             }
 
+            fn extract_version<'w, 's>(
+                item: &<<Self::MirrorSignalsQueryDataImMut as QueryData>::ReadOnly as QueryData>::Item<
+                    'w,
+                    's,
+                >,
+            ) -> u64 {
+                #[allow(non_snake_case)]
+                let (_, $T) = item;
+                $T.version.load(std::sync::atomic::Ordering::Relaxed)
+            }
+
             fn apply_tracking_delta<'w, 's, F: QueryFilter + 'static>(
                 mut item: <Self::TrackingQueriesQuerydataMut as QueryData>::Item<'w, 's>,
                 delta: i32,
@@ -87,7 +96,7 @@ macro_rules! impl_mirror_query_data {
         }
     };
 
-    // ── Multi-element arm (3+ components) ──────────────────────────────
+    // Multi-element arm (3+ components)
 
     ($first:ident, $second:ident, $third:ident $(, $rest:ident)*) => {
         impl<
@@ -196,6 +205,26 @@ macro_rules! impl_mirror_query_data {
                 )
             }
 
+            fn extract_version<'w, 's>(
+                item: &<<Self::MirrorSignalsQueryDataImMut as QueryData>::ReadOnly as QueryData>::Item<
+                    'w,
+                    's,
+                >,
+            ) -> u64 {
+                #[allow(non_snake_case)]
+                let (_, $first, $second, $third $(, $rest)*) = item;
+                let v0 = $first.version.load(std::sync::atomic::Ordering::Relaxed);
+                let v1 = $second.version.load(std::sync::atomic::Ordering::Relaxed);
+                let v2 = $third.version.load(std::sync::atomic::Ordering::Relaxed);
+                // Combine via XOR + rotate to avoid collisions between different version tuples
+                let mut combined = v0 ^ v1.rotate_left(21) ^ v2.rotate_left(42);
+                $(
+                    let v = $rest.version.load(std::sync::atomic::Ordering::Relaxed);
+                    combined ^= v.rotate_left(11);
+                )*
+                combined
+            }
+
             fn apply_tracking_delta<'w, 's, F: QueryFilter + 'static>(
                 mut item: <Self::TrackingQueriesQuerydataMut as QueryData>::Item<'w, 's>,
                 delta: i32,
@@ -241,12 +270,6 @@ macro_rules! impl_mirror_query_data {
         }
     };
 }
-
-// ── Stamp out implementations for sizes 1, 3–13 ────────────────────────────
-//
-// NOTE: variadics_please 1.1.0 only supports `start` of 0 or 1, and up to 13
-// type parameters with `start=1`. Size 2 is a no-op in the macro (manual impl
-// in mod.rs).
 
 use super::*;
 use variadics_please::all_tuples;
