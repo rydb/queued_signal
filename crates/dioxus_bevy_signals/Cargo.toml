@@ -2,6 +2,11 @@
 name = "dioxus_bevy_signals"
 version = "0.1.0"
 edition = "2024"
+description = "Mirror bevy state (resources, queries, assets) to dioxus via QueuedSignals"
+repository = "https://github.com/rydb/queued_signal"
+keywords = ["bevy", "dioxus", "signal", "ecs", "reactive"]
+categories = ["game-engines", "gui"]
+license = "Apache-2.0"
 
 [dependencies]
 bevy_ecs = {workspace = true}

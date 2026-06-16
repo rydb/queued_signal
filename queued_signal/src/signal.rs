@@ -74,7 +74,7 @@ impl<T: Clone + Send + Sync + 'static> QueuedSignalHandle<T> {
     /// Authoritative full value replacement.
     pub fn set_value(&self, value: T) {
         if let Some(w) = self.writer.read().as_ref() {
-            w.set_value(Arc::new(value));
+            w.set_value(value);
         }
     }
 
@@ -83,6 +83,7 @@ impl<T: Clone + Send + Sync + 'static> QueuedSignalHandle<T> {
         *self.health.read()
     }
 
+    /// Read the current value through a [`SignalReadGuard`].
     pub fn read(&self) -> SignalReadGuard<'_, Result<Arc<T>, QueuedSignalNoneState>> {
         SignalReadGuard::new(self.value.read())
     }
@@ -191,8 +192,13 @@ impl QueuedSignalHub {
 
 impl Drop for QueuedSignalHub {
     fn drop(&mut self) {
-        // Only shut down the background ticker thread when the last
-        // user-facing clone is dropped. 
+        // The shutdown Arc starts with strong_count == 2:
+        //   1. self.shutdown (this hub field)
+        //   2. shutdown_clone (moved into the background ticker thread)
+        // When the last hub clone is dropped, only the thread's reference
+        // remains, so strong_count drops to 1 at that point.  We check for
+        // == 2 here because this method runs *before* the field is dropped,
+        // while both references still exist.
         if Arc::strong_count(&self.shutdown) == 2 {
             self.shutdown.store(true, Ordering::Release);
         }

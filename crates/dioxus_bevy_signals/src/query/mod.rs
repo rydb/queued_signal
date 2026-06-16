@@ -1,3 +1,8 @@
+//! Bevy query mirroring via QueuedSignals.
+//!
+//! Provides [`use_bevy_query`] and [`use_bevy_single`] to create dioxus-side
+//! signal mirrors of bevy queries, with automatic bidirectional synchronization.
+
 use std::{
     any::TypeId,
     collections::{HashMap, HashSet},
@@ -34,6 +39,7 @@ use crate::{CommandQueueSender, add_systems_through_world};
 trait_set! {
     /// Component that can be synced with dioxus.
     pub trait DioxusComponentSync = Component<Mutability = Mutable> + Clone + 'static;
+    /// Mirror query data that is Send + Sync.
     pub trait DioxusQuerySync = MirrorQueryData + Send + Sync;
 }
 
@@ -43,6 +49,7 @@ pub enum QueryNoneState {
     NotInitialized,
 }
 
+/// Tick the writer driver for each component mirror.
 fn drive_component_signals<T: DioxusComponentSync>(mut components: Query<&mut DioxusMirror<T>>) {
     for mut component in &mut components {
         let old_version = component.version.load(std::sync::atomic::Ordering::Relaxed);
@@ -70,16 +77,20 @@ fn drive_query_signal<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>(
 /// Mirrored version of a bevy component with query infrastructure.
 #[derive(Component)]
 pub struct DioxusMirror<T: DioxusComponentSync> {
+    /// The queued signal holding the component's value.
     pub value: QueuedSignal<T>,
 
     /// Driver for ticking the signal associated with this component.
     pub(crate) driver: Arc<Mutex<WriterDriver<T>>>,
 
+    /// Atomic version counter for change detection.
     pub version: Arc<AtomicU64>,
 }
 
+/// Tracking component counting active query references.
 #[derive(Component)]
 pub struct DioxusTrackingQueries<T: DioxusComponentSync> {
+    /// Per-query-type tracking reference counts.
     pub tracking_counts: HashMap<(TypeId, TypeId), i32>,
     _component: PhantomData<T>,
 }
@@ -94,6 +105,7 @@ impl<T: DioxusComponentSync + Debug> Debug for DioxusMirror<T> {
 }
 
 impl<T: DioxusComponentSync> DioxusMirror<T> {
+    /// Obtain a lightweight handle to this component mirror.
     pub fn handle(&self) -> DioxusMirrorHandle<T> {
         DioxusMirrorHandle {
             value: self.value.clone(),
@@ -104,12 +116,14 @@ impl<T: DioxusComponentSync> DioxusMirror<T> {
 /// Dioxus handle for a bevy-side mirrored component.
 #[derive(Clone)]
 pub struct DioxusMirrorHandle<T: DioxusComponentSync> {
+    /// The signal handle for the mirrored value.
     pub value: QueuedSignal<T>,
 }
 
 /// Total number of active dioxus components using this query.
 #[derive(Resource)]
 pub struct MirrorQueryHandleCount<Q: MirrorQueryData, F: QueryFilter> {
+    /// Current count of active handles.
     pub count: i32,
     _phantom: fn() -> PhantomData<(Q, F)>,
 }
@@ -126,6 +140,7 @@ impl<Q: MirrorQueryData, F: QueryFilter> Default for MirrorQueryHandleCount<Q, F
 /// Whether any dioxus component currently needs this query.
 #[derive(Resource)]
 pub struct MirrorQueryActive<Q: MirrorQueryData, F: QueryFilter> {
+    /// Whether any dioxus component currently needs this query.
     pub active: bool,
     _phantom: fn() -> PhantomData<(Q, F)>,
 }
@@ -259,7 +274,9 @@ impl<Q: MirrorQueryData, F: QueryFilter> Default for PendingQueryTrackingDeltas<
     }
 }
 
+/// Command updating tracking reference counts for a query.
 pub struct UpdateTrackingQueries<Q: DioxusQuerySync, F: QueryFilter> {
+    /// The tracking delta (+1 for mount, -1 for unmount).
     pub delta: i32,
     _phantom: fn() -> PhantomData<(Q, F)>,
 }
@@ -293,12 +310,14 @@ fn apply_tracking_queries_delta<Q: DioxusQuerySync + 'static, F: QueryFilter + '
 }
 
 #[derive(Resource)]
+/// Marker indicating a query's mirror systems have been registered and initialized.
 pub struct QueryMirrorInitialized<Q: QueryData, F: QueryFilter> {
     initialized: bool,
     _querydata: fn() -> PhantomData<Q>,
     _filter: fn() -> PhantomData<F>,
 }
 
+/// Synchronize a bevy query's results into the dioxus signal mirror.
 pub fn sync_query_mirror_to_signal<T: DioxusQuerySync + 'static, F: QueryFilter + 'static>(
     components_without_signals: Query<T, (F, T::MirrorSignalsWithoutFilter)>,
     mirror_components: Query<T::MirrorSignalsQueryDataImMut, F>,
@@ -319,10 +338,10 @@ pub fn sync_query_mirror_to_signal<T: DioxusQuerySync + 'static, F: QueryFilter 
                 .iter()
                 .map(|item| (T::get_mirror_entity(&item), T::clone_dioxus_signals(&item)))
                 .collect::<HashMap<_, _>>();
-            mirror_signal.0.set_value(Arc::new(MirrorQuery {
+            mirror_signal.0.set_value(MirrorQuery {
                 value: current_map,
                 _marker: PhantomData::default(),
-            }));
+            });
             init_status.initialized = true;
 
             // Seed version tracker with initial values
@@ -422,8 +441,10 @@ pub fn sync_query_mirror_to_signal<T: DioxusQuerySync + 'static, F: QueryFilter 
 }
 
 #[derive(Resource, Default)]
+/// Set of component types that have registered mirror sync systems.
 pub struct MirroredComponents(HashSet<TypeId>);
 
+/// Command requesting mirror sync systems for a component type.
 pub struct RequestComponentsMirror<T: DioxusComponentSync> {
     _marker: PhantomData<T>,
 }
@@ -459,6 +480,7 @@ impl<T: DioxusComponentSync> Command for RequestComponentsMirror<T> {
         }
     }
 }
+/// Command requesting a mirror for a specific query type.
 pub struct RequestQueryMirror<T: DioxusQuerySync, F: QueryFilter + 'static> {
     response_tx: oneshot::Sender<QueuedSignal<MirrorQuery<T, F>>>,
 }
@@ -537,7 +559,7 @@ impl<T: DioxusQuerySync + 'static, F: QueryFilter> Command for RequestQueryMirro
 
 /// Query data trait for mirroring bevy queries to dioxus signals.
 /// query that corresponds to the mirorred signals that correspond to the underlying bevy value,
-/// ```
+/// ```text
 /// let signal = MirrorQuery<(Entity, &mut A, &mut B)> -> Query<(Entity, &mut DioxusMirror<A>, &mut DioxusMirror<B>)> -> HashMap<Entity, (Entity, DioxusMirror<A>, DioxusMirror<B>)> -> QueuedQuerySignal
 /// ```
 pub trait MirrorQueryData: QueryData {
@@ -549,11 +571,11 @@ pub trait MirrorQueryData: QueryData {
     /// Handle type for the mirrored query item results.
     ///
     /// E.G; if `MirrorItem` is
-    /// ```rust
+    /// ```text
     /// (Entity, DioxusMirror<A>, DioxusMirror<A>)
     /// ```
     /// this would be
-    /// ```rust
+    /// ```text
     /// (Entity, DioxusMirrorHandle<A>, DioxusMirrorHandle<B>)
     /// ```
     type MirrorItemHandles: Clone + Send + Sync + 'static;
@@ -562,13 +584,13 @@ pub trait MirrorQueryData: QueryData {
     ///
     /// E.G; if MirrorQueryData is
     ///
-    /// ```rust
+    /// ```text
     /// Query<(Entity, &mut A, &mut B)>
     /// ```
     ///
     /// This would be:
     ///
-    /// ```rust
+    /// ```text
     /// Query<(Entity, &mut DioxusMirror<A>, &mut DioxusMirror<B>)>
     /// ```
     type MirrorSignalsQueryDataImMut: QueryData;
@@ -583,12 +605,12 @@ pub trait MirrorQueryData: QueryData {
     ///
     /// E.G; if the query is:
     ///
-    /// ```rust
+    /// ```text
     /// Query<(Entity, &mut A, &mut B)>
     /// ```
     ///
     /// this will be
-    /// ```rust
+    /// ```text
     /// Query<(Entity, &mut DioxusTrackingQueries<A>, &mut DioxusTrackingQueries<B>)>
     /// ```
     type TrackingQueriesQuerydataMut: QueryData;
@@ -730,6 +752,7 @@ impl<A: DioxusComponentSync, B: DioxusComponentSync> MirrorQueryData for (Entity
     }
 }
 
+/// A mirrored bevy query result: maps entities to their dioxus signal handles.
 pub struct MirrorQuery<Q: MirrorQueryData, F: QueryFilter> {
     value: HashMap<Entity, Q::MirrorItemHandles>,
     _marker: PhantomData<fn() -> F>,
@@ -792,6 +815,7 @@ pub struct MirrorQueryWriteDriver<Q: DioxusQuerySync, F: QueryFilter>(
 /// Handle to a mirrored bevy query, usable from dioxus.
 pub struct MirrorQuerySignalHandle<Q: MirrorQueryData, F: QueryFilter> {
     pub(crate) signal: Signal<Result<Arc<MirrorQuery<Q, F>>, QueryNoneState>>,
+    /// Health status of the underlying signal.
     pub health: Signal<HealthStatus>,
     /// None until the bevy round-trip completes.
     pub writer: Signal<Option<QueuedSignal<MirrorQuery<Q, F>>>>,
@@ -811,6 +835,7 @@ impl<Q: MirrorQueryData, F: QueryFilter> Clone for MirrorQuerySignalHandle<Q, F>
 
 impl<Q: MirrorQueryData, F: QueryFilter> Copy for MirrorQuerySignalHandle<Q, F> {}
 
+/// Iterator over mirrored query results.
 pub struct MirrorQueryIter<Q: MirrorQueryData, F: QueryFilter> {
     items: std::vec::IntoIter<Q::MirrorItemHandles>,
     _filter: PhantomData<F>,
@@ -835,6 +860,7 @@ impl<Q: MirrorQueryData + 'static, F: QueryFilter + 'static> MirrorQuerySignalHa
         SignalReadGuard::new(self.signal.read())
     }
 
+    /// Iterate over all mirrored query items.
     pub fn iter(&self) -> MirrorQueryIter<Q, F> {
         let guard = self.read();
         let items = match &*guard {

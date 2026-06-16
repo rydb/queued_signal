@@ -1,3 +1,6 @@
+#![warn(missing_docs)]
+//! Crate for mirroring bevy state to and from dioxus using QueuedSignals.
+
 use std::{any::type_name_of_val, sync::Arc, time::Duration};
 
 use bevy_app::{ScheduleRunnerPlugin, prelude::*};
@@ -15,22 +18,30 @@ use tokio::sync::oneshot;
 pub(crate) mod macros;
 pub(crate) use crate::macros::{debug, error, info, trace, warn};
 
+/// Fixed-timestep schedules for dioxus-bevy synchronization.
 pub mod schedules;
 
+/// Bevy query mirroring (feature = "query").
 #[cfg(feature = "query")]
 pub mod query;
 
+/// Bevy resource mirroring (feature = "resource").
 #[cfg(feature = "resource")]
 pub mod resource;
 
+/// Bevy asset mirroring (feature = "asset").
 #[cfg(feature = "asset")]
 pub mod asset;
 
+/// Sender for bevy command queues across thread boundaries.
 pub type CommandSender = Sender<CommandQueue>;
+/// Receiver for bevy command queues across thread boundaries.
 pub type CommandReceiver = Receiver<CommandQueue>;
 
+/// Bevy resource holding the receiving end of the command channel.
 #[derive(Resource)]
 pub struct CommandQueueReceiver {
+    /// The flume receiver for incoming command queues.
     pub rx: CommandReceiver,
 }
 /// Adds a system to bevy through `&mut World` instead of `&mut App`.
@@ -67,15 +78,10 @@ pub fn add_systems_through_world<T>(
     schedule.add_systems(systems);
 }
 
-pub fn process_commands(command_rx: ResMut<CommandQueueReceiver>, mut commands: Commands) {
-    while let Ok(mut cmd) = command_rx.rx.try_recv() {
-        commands.append(&mut cmd);
-    }
-}
-
-/// Command queue for sending commands to bevy.
+/// Sending end of the bevy command channel, usable from dioxus hooks.
 #[derive(Clone, Resource)]
 pub struct CommandQueueSender {
+    /// The flume sender for outgoing command queues.
     pub tx: CommandSender,
 }
 
@@ -129,6 +135,7 @@ impl Default for BevyCommandChannels {
     }
 }
 impl BevyCommandChannels {
+    /// Returns a clone of the sender.
     pub fn tx(&self) -> CommandSender {
         self.tx.clone()
     }
@@ -136,6 +143,7 @@ impl BevyCommandChannels {
 
 /// Plugin for mirroring state from the bevy world into dioxus.
 pub struct DioxusBevyMirrorPlugin {
+    /// The bidirectional command channels for bevy-dioxus communication.
     pub bevy_command_txrx: BevyCommandChannels,
     /// The target frames per second for the dioxus sync schedules.
     /// Determines how many times per second the sync systems run.
@@ -182,13 +190,14 @@ impl Plugin for DioxusBevyMirrorPlugin {
 /// Dioxus-accessible command queue for sending commands to bevy.
 #[derive(Clone, Copy)]
 pub struct BevyCommandsSignal {
+    /// Signal holding the command queue sender.
     pub command_queue_sender: Signal<CommandQueueSender>,
 }
 
 /// Macro for pushing and sending a group of commands to bevy.
 ///
 /// Usage:
-/// ```rust
+/// ```ignore
 /// push_and_send!(bevy_command_signal: BevyCommandsSignal, (command1_, command_2, .. command_n))
 /// ```
 #[macro_export]

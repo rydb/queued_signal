@@ -2,6 +2,11 @@
 name = "queued_signal"
 version = "0.1.0"
 edition = "2024"
+description = "A Dioxus signal for shared, wait-free reads and queued writes across VDOMs"
+repository = "https://github.com/rydb/queued_signal"
+keywords = ["dioxus", "signal", "state", "reactive"]
+categories = ["gui", "concurrency"]
+license = "Apache-2.0"
 
 
 [dependencies]
@@ -18,14 +23,6 @@ parking_lot = {workspace = true}
 anyhow = {workspace = true}
 macro-v = {workspace = true}
 tracing = {workspace = true, optional = true}
-
-# [dev-dependencies]
-# # dioxus-native = {workspace = true, features = ["system-fonts"]}
-# # blitz-shell = {workspace = true}
-# # winit = {workspace = true}
-# # parley = {workspace = true}
-# # tracing-chrome = {workspace = true}
-# # tracing-subscriber = {workspace = true}
 
 
 [features]

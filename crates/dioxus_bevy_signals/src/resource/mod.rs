@@ -1,3 +1,8 @@
+//! Bevy resource mirroring via QueuedSignals.
+//!
+//! Provides [`use_bevy_resource`] to create dioxus-side signal mirrors
+//! of bevy resources, with automatic bidirectional synchronization.
+
 pub(crate) use crate::macros::*;
 use crate::schedules::{DioxusSyncPostUpdate, DioxusSyncUpdate};
 use bevy_app::prelude::*;
@@ -18,6 +23,7 @@ use trait_set::trait_set;
 
 use crate::{CommandQueueSender, add_systems_through_world};
 
+/// Convenience re-export of the standard Result type.
 pub type Result<T, E> = std::result::Result<T, E>;
 
 trait_set! {
@@ -28,6 +34,7 @@ trait_set! {
 /// Error state for a resource signal that hasn't been initialized yet.
 #[derive(Clone, Debug)]
 pub enum ResourceNoneState {
+    /// The resource mirror has not been requested from bevy yet.
     NotInitialized,
 }
 
@@ -39,6 +46,7 @@ impl From<ResourceNoneState> for String {
     }
 }
 
+/// Write driver for ticking resource signal updates.
 #[derive(Resource)]
 pub struct ResourceWriteDriver<T: ResourceDioxusSync>(pub Arc<Mutex<WriterDriver<T>>>);
 
@@ -46,9 +54,11 @@ struct RequestBevyResource<T: ResourceDioxusSync> {
     response_tx: oneshot::Sender<QueuedSignal<T>>,
 }
 
+/// The queued signal mirroring a bevy resource.
 #[derive(Resource)]
 pub struct ResourceQueuedSignalMirror<T: ResourceDioxusSync>(pub QueuedSignal<T>);
 
+/// Set of [`TypeId`]s for resources that have registered sync systems.
 #[derive(Resource, Default)]
 pub struct RegisteredResourceSyncs(HashSet<TypeId>);
 
@@ -122,7 +132,7 @@ fn sync_mirror_to_resource<T: ResourceDioxusSync>(
     mirror
         .bypass_change_detection()
         .0
-        .set_value(new_value.into());
+        .set_value(new_value);
 }
 
 /// Synchronizes a dioxus-side signal mutation back into the bevy resource.
@@ -171,6 +181,7 @@ impl<R: Clone + Send + Sync + 'static + Display> Display for ResourceMirrorSigna
 }
 
 impl<R: Clone + Send + Sync + 'static> ResourceMirrorSignal<R> {
+    /// Enqueue a relative mutation. 
     pub fn mutate<F>(&self, f: F)
     where
         F: Fn(&mut R) + Send + Sync + 'static,
@@ -182,6 +193,7 @@ impl<R: Clone + Send + Sync + 'static> ResourceMirrorSignal<R> {
         }
     }
 
+    /// Enqueue an authoritative mutation.
     pub fn mutate_set<F>(&self, f: F)
     where
         F: Fn(&mut R) + Send + Sync + 'static,
@@ -193,7 +205,8 @@ impl<R: Clone + Send + Sync + 'static> ResourceMirrorSignal<R> {
         }
     }
 
-    pub fn set_value(&self, value: Arc<R>) {
+    /// Enqueue a full-value replacement.
+    pub fn set_value(&self, value: R) {
         if let Some(w) = self.writer.read().as_ref() {
             w.set_value(value);
         } else {
@@ -201,6 +214,7 @@ impl<R: Clone + Send + Sync + 'static> ResourceMirrorSignal<R> {
         }
     }
 
+    /// Current health status of the underlying signal.
     pub fn health(&self) -> HealthStatus {
         *self.health.read()
     }

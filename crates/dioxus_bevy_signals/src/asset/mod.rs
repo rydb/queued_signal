@@ -1,3 +1,9 @@
+//! Bevy asset mirroring via QueuedSignals.
+//!
+//! Provides [`use_bevy_asset`] to create dioxus-side signal mirrors
+//! of bevy assets, with automatic bidirectional synchronization and
+//! cleanup of unused mirrors.
+
 pub use std::{
     any::{TypeId, type_name},
     collections::{HashMap, HashSet},
@@ -23,13 +29,16 @@ use trait_set::trait_set;
 use crate::{CommandQueueSender, add_systems_through_world};
 
 trait_set! {
+    /// Trait alias for assets that can be synced with dioxus.
     pub trait DioxusAssetSync = Asset + Clone + Send + Sync + 'static;
 }
 
 /// Current state of an asset in the asset server.
 #[derive(Clone, Debug)]
 pub enum AssetState<A: DioxusAssetSync> {
+    /// The asset is fully loaded.
     Loaded(A),
+    /// The asset is still loading.
     Loading,
 }
 
@@ -43,12 +52,18 @@ impl<A: DioxusAssetSync> AssetState<A> {
     }
 }
 
+/// Error/loading states for an asset that may not be available.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AssetNoneState {
+    /// Asset is still loading.
     Loading,
+    /// Asset was not found in the asset server.
     NotLoaded,
+    /// The requested handle does not correspond to an asset.
     NonAsset,
+    /// The mirror request has been sent but not yet responded to.
     Fetching,
+    /// An error occurred while fetching the asset.
     Error(String),
 }
 
@@ -71,6 +86,7 @@ impl From<AssetNoneState> for String {
     }
 }
 
+/// Extra metadata for asset update propagation.
 #[derive(Clone, Debug)]
 pub struct AssetUpdateExtraInfo<A: DioxusAssetSync> {
     changed_sender: Sender<AssetId<A>>,
@@ -92,6 +108,7 @@ pub struct AssetMaybeMirror<A: DioxusAssetSync> {
     tracking_signals: i32,
 }
 
+/// Maps asset IDs to their dioxus mirror state.
 #[derive(Resource)]
 pub struct AssetMirrorMap<A: DioxusAssetSync> {
     assets: HashMap<AssetId<A>, AssetMaybeMirror<A>>,
@@ -107,6 +124,7 @@ impl<A: DioxusAssetSync> Default for AssetMirrorMap<A> {
     }
 }
 
+/// Set of asset IDs whose dioxus-side mirrors have changed.
 #[derive(Resource)]
 pub struct ChangedAssetMirrors<A: DioxusAssetSync>(HashSet<AssetId<A>>);
 
@@ -116,12 +134,15 @@ impl<A: DioxusAssetSync> Default for ChangedAssetMirrors<A> {
     }
 }
 
+/// Flume receiver for changed asset IDs.
 #[derive(Resource)]
 pub struct ChangedIdsReceiver<A: DioxusAssetSync>(Receiver<AssetId<A>>);
 
+/// Flume sender for changed asset IDs.
 #[derive(Resource, Clone)]
 pub struct ChangedIdsSender<A: DioxusAssetSync>(Sender<AssetId<A>>);
 
+/// Tick all asset mirror drivers.
 pub fn drive_maybe_assets<A: DioxusAssetSync>(mut mirrors: ResMut<AssetMirrorMap<A>>) {
     for (_id, asset) in &mut mirrors.assets {
         let mut guard = asset.state_driver.lock();
@@ -132,6 +153,7 @@ pub fn drive_maybe_assets<A: DioxusAssetSync>(mut mirrors: ResMut<AssetMirrorMap
     }
 }
 
+/// Clear pending asset initialization requests.
 pub fn clear_asset_init_requests<A: DioxusAssetSync>(mut mirrors: ResMut<AssetMirrorMap<A>>) {
     mirrors.init_requests.clear();
 }
@@ -206,10 +228,11 @@ pub fn init_requested_asset_mirrors<A: DioxusAssetSync>(
                 Err(e) => e.as_string(),
             }
         );
-        entry.state.set_value(Arc::new(fetch));
+        entry.state.set_value(fetch);
     }
 }
 
+/// Synchronize bevy-side asset changes to the dioxus mirrors.
 pub fn sync_mirrors_to_assets<A: DioxusAssetSync>(
     mut events: MessageReader<AssetEvent<A>>,
     assets: Res<Assets<A>>,
@@ -229,12 +252,13 @@ pub fn sync_mirrors_to_assets<A: DioxusAssetSync>(
         }
         if let Some(entry) = mirrors.assets.get(id) {
             if let Some(a) = assets.get(*id) {
-                entry.state.set_value(Arc::new(Ok(a.clone())));
+                entry.state.set_value(Ok(a.clone()));
             }
         }
     }
 }
 
+/// Synchronize dioxus-side mirror changes back to the bevy assets.
 pub fn sync_assets_to_mirrors<A: DioxusAssetSync>(
     mut assets: ResMut<Assets<A>>,
     changed: Res<ChangedAssetMirrors<A>>,
@@ -256,6 +280,7 @@ pub fn sync_assets_to_mirrors<A: DioxusAssetSync>(
     }
 }
 
+/// Drain the changed-ID receiver into [`ChangedAssetMirrors`].
 pub fn collect_changed_ids<A: DioxusAssetSync>(
     rx: Res<ChangedIdsReceiver<A>>,
     mut changed: ResMut<ChangedAssetMirrors<A>>,
@@ -270,25 +295,31 @@ pub fn collect_changed_ids<A: DioxusAssetSync>(
     }
 }
 
+/// Clear the changed-asset flags after processing.
 pub fn clear_changed_flags<A: DioxusAssetSync>(mut changed: ResMut<ChangedAssetMirrors<A>>) {
     trace!("clearing changed assets");
     changed.bypass_change_detection().0.clear();
 }
 
 #[derive(Resource)]
+/// Marker resource indicating asset sync systems have been registered.
 pub struct AssetSyncInitialized<A: DioxusAssetSync> {
     _phantom: PhantomData<A>,
 }
 
 #[derive(Resource, Clone, Debug)]
+/// Response from a bevy asset mirror request, containing the signals.
 pub struct AssetMirrorRequestResponse<A: DioxusAssetSync> {
+    /// The asset's current state (loaded value or error).
     pub asset_state: QueuedSignal<Result<A, AssetNoneState>>,
+    /// Extra update metadata for the asset.
     pub extra_info: QueuedSignal<AssetUpdateExtraInfo<A>>,
     /// `true` when the mirror was just created (the initial reader
     /// is pre-counted and does not need to send a +1 tracking delta).
     pub first_reader: bool,
 }
 
+/// Command requesting a mirror for a specific bevy asset.
 pub struct RequestBevyAssetMirror<A: DioxusAssetSync> {
     response_tx: oneshot::Sender<AssetMirrorRequestResponse<A>>,
     asset_id: AssetId<A>,
@@ -414,6 +445,7 @@ impl<A: DioxusAssetSync> Command for RequestBevyAssetMirror<A> {
 }
 
 #[derive(Resource)]
+/// Accumulated tracking delta requests for batch processing.
 pub struct PendingAssetTrackingDeltas<A: DioxusAssetSync> {
     pending: Vec<(AssetId<A>, i32)>,
     _phantom: PhantomData<A>,
