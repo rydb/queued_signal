@@ -262,6 +262,11 @@ impl<'a, T: Clone + Send + Sync> Deref for TrackedReadGuard<'a, T> {
 }
 
 /// Driver for managing reads and writes for a QueuedSignal.
+///
+/// Owns the left-right [`WriteHandle`] and channels for
+/// receiving mutations. Call [`tick`](Self::tick) regularly (e.g.
+/// every frame or in a background thread) to drain pending
+/// operations, publish to the read side, and update health.
 pub struct WriterDriver<T: Clone + Send + Sync> {
     write_handle: WriteHandle<Absorbable<T>, SignalOp<T>>,
     set_value_rx: Receiver<SetValueOp<T>>,
@@ -276,10 +281,14 @@ pub struct WriterDriver<T: Clone + Send + Sync> {
     watchdog_timeout: Duration,
     last_publish: Instant,
     /// Sender for authoritative full-value replacements.
+    /// Sent values overwrite the entire signal state.
     pub set_value_tx: Sender<SetValueOp<T>>,
     /// Sender for authoritative closure mutations.
+    /// These are applied before relative mutations and may be
+    /// overridden by a later [`set_value_tx`](Self::set_value_tx) send.
     pub set_tx: Sender<MutationOp<T>>,
     /// Sender for relative closure mutations.
+    /// These are applied after all authoritative operations.
     pub add_tx: Sender<MutationOp<T>>,
     /// The read-side state that consumers subscribe to.
     pub queued_state: QueuedState<T>,
@@ -483,7 +492,11 @@ impl<T: Clone + Send + Sync + 'static> QueuedSignal<T> {
         self.state.read()
     }
 
-    /// Relative mutation. Applied after all authoritative operations.
+    /// Enqueue a relative mutation. Applied after all authoritative
+    /// operations within the same tick.
+    ///
+    /// Use for non-critical adjustments (e.g., incrementing a counter)
+    /// that should compose with authoritative changes.
     pub fn mutate<F>(&self, f: F)
     where
         F: Fn(&mut T) + Send + Sync + 'static,
@@ -491,7 +504,9 @@ impl<T: Clone + Send + Sync + 'static> QueuedSignal<T> {
         let _ = self.add_tx.send(Arc::new(f));
     }
 
-    /// Authoritative mutation (closure), may be overridden by a later `set_value`.
+    /// Enqueue an authoritative mutation (closure). Applied before
+    /// relative mutations but may be overridden by a later
+    /// [`set_value`](Self::set_value) in the same tick.
     pub fn mutate_set<F>(&self, f: F)
     where
         F: Fn(&mut T) + Send + Sync + 'static,
@@ -499,7 +514,12 @@ impl<T: Clone + Send + Sync + 'static> QueuedSignal<T> {
         let _ = self.set_tx.send(Arc::new(f));
     }
 
-    /// Authoritative full value replacement.
+    /// Enqueue an authoritative full-value replacement. Within a
+    /// single tick, `set_value` ops are applied first, followed by
+    /// [`mutate_set`](Self::mutate_set), then [`mutate`](Self::mutate).
+    ///
+    /// To discard all pending mutations and force a pure overwrite,
+    /// use [`WriterDriver::write_absolute`] instead.
     pub fn set_value(&self, value: Arc<T>) {
         let _ = self.set_value_tx.send(SetValueOp(value));
     }
@@ -593,12 +613,31 @@ pub fn use_queued_state_direct<T: Clone + Send + Sync + 'static>(
     (value_signal, health_signal)
 }
 
-// SAFETY: The underlying read and write handles use raw atomic pointers
-// and do not auto-derive Send/Sync. These types are thread-safe given
-// the bounds on T. Required for cross-thread signal usage.
+// SAFETY: Absorbable<T> is a newtype over Arc<T>. Arc<T> is Send when
+// T: Send + Sync, and our bound enforces both. The left-right crate's
+// ReadHandle/WriteHandle internally use Arc<AtomicCell<…>> which are
+// also Send + Sync given T: Send.
 unsafe impl<T: Clone + Send + Sync> Send for Absorbable<T> {}
+
+// SAFETY: Absorbable<T> is a newtype over Arc<T>. Arc<T> is Sync when
+// T: Send + Sync, and our bound enforces both. Shared references to
+// Absorbable<T> only permit cloning the inner Arc, which is safe to
+// share across threads.
 unsafe impl<T: Clone + Send + Sync> Sync for Absorbable<T> {}
+
+// SAFETY: QueuedState<T> contains:
+//   - ReadHandle<Absorbable<T>>: internally Arc<AtomicCell<…>>, Send when T: Send
+//   - watch::Receiver<u64>: Send + Sync
+//   - watch::Receiver<HealthStatus>: Send + Sync
+//   - Arc<ReaderRegistry>: Send + Sync (all fields are atomics or Mutex<HashMap<…>>)
+// Our bound T: Send + Sync satisfies all transitive requirements.
 unsafe impl<T: Clone + Send + Sync> Send for QueuedState<T> {}
+
+// SAFETY: QueuedState<T>'s fields are all Sync-safe:
+//   - ReadHandle uses Arc internally, reads are lock-free via atomics
+//   - watch::Receiver::borrow() takes a shared reference
+//   - ReaderRegistry uses Mutex for interior mutability
+// Shared access to QueuedState<T> is therefore sound when T: Sync.
 unsafe impl<T: Clone + Send + Sync> Sync for QueuedState<T> {}
 
 
@@ -624,5 +663,157 @@ impl<'a, T: 'static, R: dioxus_signals::Readable<Target = T> + 'static> std::ops
 
     fn deref(&self) -> &Self::Target {
         &self.guard
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn reader_registry_stall_detection() {
+        let registry = ReaderRegistry::new();
+        let id = registry.register();
+        registry.heartbeat(id);
+        assert!(registry.check_stalled(Duration::from_millis(100)).is_empty());
+
+        // Simulate a stalled reader by registering but never heartbeating,
+        // then waiting past the timeout.
+        let id2 = registry.register();
+        std::thread::sleep(Duration::from_millis(50));
+        let stalled = registry.check_stalled(Duration::from_millis(10));
+        assert!(stalled.contains(&id2));
+
+        // id is still heartbeating, should not be stalled.
+        registry.heartbeat(id);
+        assert!(registry.check_stalled(Duration::from_millis(100)).is_empty()
+            || registry.check_stalled(Duration::from_millis(100)) == vec![id2]);
+    }
+
+    #[test]
+    fn reader_registry_unregister() {
+        let registry = ReaderRegistry::new();
+        let id = registry.register();
+        assert!(!registry.check_stalled(Duration::from_millis(0)).is_empty());
+
+        registry.unregister(id);
+        assert!(registry.check_stalled(Duration::ZERO).is_empty());
+    }
+
+    /// Verify that within a single tick, operations are applied in
+    /// priority order: set_value first, then mutate_set, then mutate.
+    /// Full-value replacements do not drain the mutation channels
+    /// unless the `write_absolute` path is used.
+    #[test]
+    fn writer_driver_tick_ordering() {
+        let mut driver = WriterDriver::new(0i32);
+
+        // All three op types in one tick.
+        // Priority order: set_value_rx → set_rx → add_rx
+        driver.set_value_tx.send(SetValueOp(Arc::new(42))).unwrap();
+        driver.set_tx.send(Arc::new(|v: &mut i32| *v += 10)).unwrap();
+        driver.add_tx.send(Arc::new(|v: &mut i32| *v += 1)).unwrap();
+
+        driver.tick(Duration::ZERO);
+
+        // set_value(42) → mutate_set(+10) → mutate(+1) = 53
+        let val = driver.queued_state.read().clone();
+        assert_eq!(*val, 53i32);
+    }
+
+    /// A lone set_value should set the value directly.
+    #[test]
+    fn writer_driver_tick_set_value_alone() {
+        let mut driver = WriterDriver::new(0i32);
+
+        driver.set_value_tx.send(SetValueOp(Arc::new(99))).unwrap();
+
+        driver.tick(Duration::ZERO);
+
+        let val = driver.queued_state.read().clone();
+        assert_eq!(*val, 99i32);
+    }
+
+    /// Verify that mutate_set wins over mutate when no set_value is
+    /// present.
+    #[test]
+    fn writer_driver_tick_mutate_set_wins_over_mutate() {
+        let mut driver = WriterDriver::new(0i32);
+
+        // Relative mutation (applied second)
+        driver.add_tx.send(Arc::new(|v: &mut i32| *v += 1)).unwrap();
+        // Authoritative mutation (applied first, so result is 10 + 1 = 11)
+        driver.set_tx.send(Arc::new(|v: &mut i32| *v = 10)).unwrap();
+
+        driver.tick(Duration::ZERO);
+
+        let val = driver.queued_state.read().clone();
+        assert_eq!(*val, 11i32);
+    }
+
+    /// Verify health transitions: Healthy → Degraded → Stalled.
+    #[test]
+    fn health_status_transitions() {
+        let mut driver = WriterDriver::new(0i32);
+
+        // Initially healthy
+        assert_eq!(driver.queued_state.health(), HealthStatus::Healthy);
+
+        // Register one reader and let it go stale — should be Degraded
+        let _id = driver.registry.register();
+        // Set a very short watchdog timeout
+        driver.watchdog_timeout = Duration::from_millis(1);
+        std::thread::sleep(Duration::from_millis(10));
+
+        driver.tick(Duration::ZERO);
+        assert_eq!(
+            driver.queued_state.health(),
+            HealthStatus::Degraded { pinned_buffers: 1 }
+        );
+
+        // Register two more stale readers — should be Stalled
+        let _id2 = driver.registry.register();
+        let _id3 = driver.registry.register();
+        std::thread::sleep(Duration::from_millis(10));
+
+        driver.tick(Duration::ZERO);
+        assert_eq!(
+            driver.queued_state.health(),
+            HealthStatus::Stalled { pinned_buffers: 3 }
+        );
+    }
+
+    /// Absorbable absorb_first should clone the inner Arc for mutation
+    /// (via Arc::make_mut) and apply the operation.
+    #[test]
+    fn absorbable_absorb_first_fn() {
+        let mut absorbable = Absorbable(Arc::new(vec![1, 2, 3]));
+        let other = Absorbable(Arc::new(vec![]));
+
+        let mut op = SignalOp::Fn(Arc::new(|v: &mut Vec<i32>| v.push(4)));
+        absorbable.absorb_first(&mut op, &other);
+
+        assert_eq!(*absorbable.0, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn absorbable_absorb_first_set() {
+        let mut absorbable = Absorbable(Arc::new(vec![1, 2, 3]));
+        let other = Absorbable(Arc::new(vec![]));
+
+        let mut op = SignalOp::Set(SetValueOp(Arc::new(vec![9, 9, 9])));
+        absorbable.absorb_first(&mut op, &other);
+
+        assert_eq!(*absorbable.0, vec![9, 9, 9]);
+    }
+
+    #[test]
+    fn absorbable_sync_with_clones_inner() {
+        let first = Absorbable(Arc::new(42i32));
+        let mut second = Absorbable(Arc::new(0i32));
+
+        second.sync_with(&first);
+        assert_eq!(*second.0, 42i32);
     }
 }

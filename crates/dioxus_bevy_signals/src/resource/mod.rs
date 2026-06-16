@@ -98,7 +98,7 @@ impl<T: ResourceDioxusSync> Command for RequestBevyResource<T> {
                 add_systems_through_world(
                     world,
                     DioxusSyncPostUpdate,
-                    sync_resource_to_mirror::<T>.run_if(not(resource_changed::<T>)),
+                    sync_resource_to_mirror::<T>,
                 );
                 let mut map = world.get_resource_or_init::<RegisteredResourceSyncs>();
                 map.0.insert(TypeId::of::<T>());
@@ -111,28 +111,35 @@ impl<T: ResourceDioxusSync> Command for RequestBevyResource<T> {
 }
 
 /// Synchronizes the authoritative bevy resource into the signal mirror.
-/// Runs when the bevy resource has changed. If the dioxus side also
-/// modified the signal in the same frame, the bevy change takes precedence.
+/// Runs when the bevy resource has changed. When bevy and dioxus both
+/// modify the resource in the same frame, the bevy change takes precedence.
 fn sync_mirror_to_resource<T: ResourceDioxusSync>(
     resource: Res<T>,
     mut mirror: ResMut<ResourceQueuedSignalMirror<T>>,
 ) {
-    if resource.is_changed() {
-        let new_value = resource.clone();
-        // Send authoritative full replacement.
-        mirror
-            .bypass_change_detection()
-            .0
-            .set_value(new_value.into());
-    }
+    let new_value = resource.clone();
+    // Send authoritative full replacement.
+    mirror
+        .bypass_change_detection()
+        .0
+        .set_value(new_value.into());
 }
 
+/// Synchronizes a dioxus-side signal mutation back into the bevy resource.
+/// Only writes when the dioxus signal version advanced, avoiding unnecessary
+/// writes every frame.
 fn sync_resource_to_mirror<T: ResourceDioxusSync>(
     mut resource: ResMut<T>,
     mirror: Res<ResourceQueuedSignalMirror<T>>,
+    mut last_version: Local<u64>,
 ) {
+    let current = mirror.0.peek_version();
+    if current == *last_version {
+        return; // dioxus side hasn't published a new version
+    }
+    *last_version = current;
     let new_value = mirror.0.read().as_ref().clone();
-    *resource.bypass_change_detection() = new_value
+    *resource.bypass_change_detection() = new_value;
 }
 
 fn drive_signal<T: ResourceDioxusSync>(driver: Res<ResourceWriteDriver<T>>) {

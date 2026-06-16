@@ -12,7 +12,7 @@ queued_signal = {workspace = true}
 
 [dev-dependencies]
 dioxus-native = {workspace = true, features = ["system-fonts"]}
-dioxus = {workspace = true, features = ["asset", "desktop"]}
+dioxus = {workspace = true, features = ["asset", "desktop", "launch", "devtools", "document", "html"]}
 blitz-shell = {workspace = true}
 winit = {workspace = true}
 parley = {workspace = true}

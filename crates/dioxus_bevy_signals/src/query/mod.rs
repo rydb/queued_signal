@@ -702,26 +702,16 @@ impl<A: DioxusComponentSync, B: DioxusComponentSync> MirrorQueryData for (Entity
         delta: i32,
     ) {
         let id = query_to_tracking_id::<Self, F>();
-        let current_delta = item
-            .1
-            .tracking_counts
-            .entry(query_to_tracking_id::<Self, F>())
-            .or_insert(0);
-        *current_delta += delta;
 
-        if current_delta <= &mut 0 {
+        let current_delta = item.1.tracking_counts.entry(id).or_insert(0);
+        *current_delta += delta;
+        if *current_delta <= 0 {
             item.1.tracking_counts.remove(&id);
         }
 
-        let id = query_to_tracking_id::<Self, F>();
-        let current_delta = item
-            .2
-            .tracking_counts
-            .entry(query_to_tracking_id::<Self, F>())
-            .or_insert(0);
+        let current_delta = item.2.tracking_counts.entry(id).or_insert(0);
         *current_delta += delta;
-
-        if current_delta <= &mut 0 {
+        if *current_delta <= 0 {
             item.2.tracking_counts.remove(&id);
         }
     }

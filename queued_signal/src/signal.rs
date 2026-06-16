@@ -1,7 +1,10 @@
 use std::{
     any::{Any, TypeId},
     collections::HashMap,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -100,6 +103,7 @@ impl<T: Clone + Send + Sync + 'static> QueuedSignalHandle<T> {
 pub struct QueuedSignalHub {
     signals: Arc<Mutex<HashMap<TypeId, Box<dyn Any + Send>>>>,
     tickers: Arc<Mutex<Vec<Box<dyn FnMut() + Send>>>>,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl Clone for QueuedSignalHub {
@@ -107,19 +111,26 @@ impl Clone for QueuedSignalHub {
         Self {
             signals: self.signals.clone(),
             tickers: self.tickers.clone(),
+            shutdown: self.shutdown.clone(),
         }
     }
 }
 
 impl QueuedSignalHub {
     /// Create a new hub and start the background tick thread.
+    ///
+    /// The tick thread runs at ~60 Hz and stops when the last clone of the hub
+    /// is dropped.
     pub fn new() -> Self {
         let tickers: Arc<Mutex<Vec<Box<dyn FnMut() + Send>>>> =
             Arc::new(Mutex::new(Vec::new()));
 
+        let shutdown = Arc::new(AtomicBool::new(false));
+
         let tickers_clone = tickers.clone();
+        let shutdown_clone = shutdown.clone();
         std::thread::spawn(move || {
-            loop {
+            while !shutdown_clone.load(Ordering::Relaxed) {
                 {
                     let mut guard = tickers_clone.lock();
                     for ticker in guard.iter_mut() {
@@ -133,6 +144,7 @@ impl QueuedSignalHub {
         Self {
             signals: Arc::new(Mutex::new(HashMap::new())),
             tickers,
+            shutdown,
         }
     }
 
@@ -174,6 +186,16 @@ impl QueuedSignalHub {
             .get(&TypeId::of::<T>())
             .and_then(|boxed| boxed.downcast_ref::<QueuedSignal<T>>())
             .cloned()
+    }
+}
+
+impl Drop for QueuedSignalHub {
+    fn drop(&mut self) {
+        // Only shut down the background ticker thread when the last
+        // user-facing clone is dropped. 
+        if Arc::strong_count(&self.shutdown) == 2 {
+            self.shutdown.store(true, Ordering::Release);
+        }
     }
 }
 

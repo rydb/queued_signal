@@ -282,8 +282,11 @@ pub struct AssetSyncInitialized<A: DioxusAssetSync> {
 
 #[derive(Resource, Clone, Debug)]
 pub struct AssetMirrorRequestResponse<A: DioxusAssetSync> {
-    asset_state: QueuedSignal<Result<A, AssetNoneState>>,
-    extra_info: QueuedSignal<AssetUpdateExtraInfo<A>>,
+    pub asset_state: QueuedSignal<Result<A, AssetNoneState>>,
+    pub extra_info: QueuedSignal<AssetUpdateExtraInfo<A>>,
+    /// `true` when the mirror was just created (the initial reader
+    /// is pre-counted and does not need to send a +1 tracking delta).
+    pub first_reader: bool,
 }
 
 pub struct RequestBevyAssetMirror<A: DioxusAssetSync> {
@@ -339,14 +342,14 @@ impl<A: DioxusAssetSync> Command for RequestBevyAssetMirror<A> {
 
         let mut map = world.resource_mut::<AssetMirrorMap<A>>();
 
-        let (asset_state, extra_info) = match map.assets.get_mut(&self.asset_id) {
+        let (asset_state, extra_info, first_reader) = match map.assets.get_mut(&self.asset_id) {
             Some(asset) => {
                 trace!(
                     "requested new signal and set new tracking value for {} -> {}",
                     asset.tracking_signals,
                     asset.tracking_signals + 1
                 );
-                (asset.state.clone(), asset.extra_update_info.clone())
+                (asset.state.clone(), asset.extra_update_info.clone(), false)
             }
             None => {
                 let asset_state_driver = WriterDriver::new(Err(AssetNoneState::Fetching));
@@ -390,11 +393,14 @@ impl<A: DioxusAssetSync> Command for RequestBevyAssetMirror<A> {
                     state_driver: asset_state_driver_arc,
                     extra_update_info: extra_info.clone(),
                     extra_update_info_driver: extra_info_driver_arc,
-                    tracking_signals: 0,
+                    // Seed at 1 so a concurrent unmount delta cannot
+                    // drop the count below zero before the initial
+                    // reader's +1 command is processed.
+                    tracking_signals: 1,
                 };
                 map.assets.insert(self.asset_id, mirror);
                 map.init_requests.insert(self.asset_id);
-                (asset_state, extra_info)
+                (asset_state, extra_info, true)
             }
         };
 
@@ -402,6 +408,7 @@ impl<A: DioxusAssetSync> Command for RequestBevyAssetMirror<A> {
         let _ = self.response_tx.send(AssetMirrorRequestResponse {
             asset_state,
             extra_info,
+            first_reader,
         });
     }
 }
@@ -494,6 +501,7 @@ impl<A: DioxusAssetSync> AssetMaybeMirrorSignal<A> {
     {
         let signal_guard = self.signal.read();
         let Some(signal) = signal_guard.as_ref() else {
+            warn!("AssetMaybeMirrorSignal::mutate dropped: writer not yet available (Bevy round-trip pending)");
             return;
         };
         signal.mutate(move |state| {
@@ -621,16 +629,19 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
                 .state
                 .forward_to(extra_info_signal, health_signal, |arc| Ok(arc));
 
-            // Mount: send tracking increment.
-            let asset_id = resp.extra_info.read().asset_id;
-            trace!("asset signal mounted, sending +1 for {:?}", asset_id);
-            let mut q = CommandQueue::default();
-            q.push(UpdateTrackingAssets::<A> {
-                delta: 1,
-                asset_id,
-                _phantom: PhantomData,
-            });
-            let _ = ctx.tx.send(q);
+            // Mount: send tracking increment only for subsequent
+            // readers — the initial reader is pre-counted.
+            if !resp.first_reader {
+                let asset_id = resp.extra_info.read().asset_id;
+                trace!("asset signal mounted, sending +1 for {:?}", asset_id);
+                let mut q = CommandQueue::default();
+                q.push(UpdateTrackingAssets::<A> {
+                    delta: 1,
+                    asset_id,
+                    _phantom: PhantomData,
+                });
+                let _ = ctx.tx.send(q);
+            }
 
             tracking_active.set(true);
             writer_signal.set(Some(resp.asset_state.clone()));
