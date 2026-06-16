@@ -102,8 +102,8 @@ pub struct AssetMaybeMirror<A: DioxusAssetSync> {
     pub extra_update_info: QueuedSignal<AssetUpdateExtraInfo<A>>,
     state_driver: Arc<Mutex<WriterDriver<Result<A, AssetNoneState>>>>,
     extra_update_info_driver: Arc<Mutex<WriterDriver<AssetUpdateExtraInfo<A>>>>,
-    /// Number of signals actively reading this asset mirror. 
-    /// 
+    /// Number of signals actively reading this asset mirror.
+    ///
     /// Asset mirror is cleaned up when this hits zero.
     tracking_signals: i32,
 }
@@ -533,7 +533,9 @@ impl<A: DioxusAssetSync> AssetMaybeMirrorSignal<A> {
     {
         let signal_guard = self.signal.read();
         let Some(signal) = signal_guard.as_ref() else {
-            warn!("AssetMaybeMirrorSignal::mutate dropped: writer not yet available (Bevy round-trip pending)");
+            warn!(
+                "AssetMaybeMirrorSignal::mutate dropped: writer not yet available (Bevy round-trip pending)"
+            );
             return;
         };
         signal.mutate(move |state| {

@@ -218,4 +218,3 @@ pub fn use_bevy_command_queue() -> BevyCommandsSignal {
         command_queue_sender: Signal::new(command_queue),
     }
 }
-

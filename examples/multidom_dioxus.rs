@@ -1,15 +1,12 @@
 //! Example of a multi-dom scenario where queued_signal shares state across DOMs.
-//! 
-use blitz_shell::{create_default_event_loop, BlitzApplication, BlitzShellEvent, WindowConfig};
+//!
+use blitz_shell::{BlitzApplication, BlitzShellEvent, WindowConfig, create_default_event_loop};
 use dioxus::prelude::*;
 use dioxus_core::VirtualDom;
-use dioxus_native::{
-    DioxusDocument, DioxusNativeWindowRenderer, DocumentConfig,
-    WindowAttributes,
-};
+use dioxus_native::{DioxusDocument, DioxusNativeWindowRenderer, DocumentConfig, WindowAttributes};
 use parley::FontContext;
 use parley::fontique::Blob;
-use queued_signal::signal::{use_queued_signal, QueuedSignalHub};
+use queued_signal::signal::{QueuedSignalHub, use_queued_signal};
 use std::time::Duration;
 use tracing_chrome::ChromeLayerBuilder;
 use tracing_subscriber::prelude::*;
@@ -49,7 +46,7 @@ fn app_window_1() -> Element {
 
     rsx! {
         document::Stylesheet { href: asset!("assets/ui.css") }
-        div { 
+        div {
             h1 { "{hello_text}" }
             h2 { "Counter: {counter_text}" }
             p { "Health: {health_text}" }
@@ -66,12 +63,10 @@ fn app_window_2() -> Element {
     let hello = use_queued_signal::<HelloWorld>();
     let counter = use_queued_signal::<Counter>();
 
-    use_future(move || {
-        async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                counter.mutate(|n| n.0 += 1);
-            }
+    use_future(move || async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            counter.mutate(|n| n.0 += 1);
         }
     });
 
@@ -91,7 +86,7 @@ fn app_window_2() -> Element {
 
     rsx! {
         document::Stylesheet { href: asset!("assets/ui.css") }
-        div { 
+        div {
             h1 { "{hello_text}" }
             h2 { "Counter: {counter_text}" }
             p { "Health: {health_text}" }
@@ -123,7 +118,6 @@ impl App {
 impl ApplicationHandler<BlitzShellEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         self.inner.resumed(event_loop);
-
     }
 
     fn suspended(&mut self, event_loop: &ActiveEventLoop) {
@@ -153,9 +147,6 @@ impl ApplicationHandler<BlitzShellEvent> for App {
     }
 }
 
-
-
-
 pub fn setup() {
     // Chrome trace output for diagnosing reactivity.
     let (chrome_layer, _guard) = ChromeLayerBuilder::new()
@@ -182,7 +173,9 @@ pub fn setup() {
     if let Some((family_id, _)) = families.first() {
         use parley::fontique::GenericFamily::*;
         for generic in [Serif, SansSerif, Monospace, Cursive, Fantasy, SystemUi] {
-            font_ctx.collection.set_generic_families(generic, std::iter::once(*family_id));
+            font_ctx
+                .collection
+                .set_generic_families(generic, std::iter::once(*family_id));
         }
     }
 
@@ -210,8 +203,7 @@ pub fn setup() {
     app.add_window(WindowConfig::with_attributes(
         Box::new(doc1),
         renderer1,
-        WindowAttributes::default()
-            .with_title("Window 1")
+        WindowAttributes::default().with_title("Window 1"),
     ));
 
     let mut vdom2 = VirtualDom::new_with_props(app_window_2, ());
@@ -227,8 +219,7 @@ pub fn setup() {
     app.add_window(WindowConfig::with_attributes(
         Box::new(doc2),
         renderer2,
-        WindowAttributes::default()
-            .with_title("Window 2")
+        WindowAttributes::default().with_title("Window 2"),
     ));
 
     event_loop.run_app(&mut app).unwrap();

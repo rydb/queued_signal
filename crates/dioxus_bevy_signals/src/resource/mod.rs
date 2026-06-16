@@ -129,10 +129,7 @@ fn sync_mirror_to_resource<T: ResourceDioxusSync>(
 ) {
     let new_value = resource.clone();
     // Send authoritative full replacement.
-    mirror
-        .bypass_change_detection()
-        .0
-        .set_value(new_value);
+    mirror.bypass_change_detection().0.set_value(new_value);
 }
 
 /// Synchronizes a dioxus-side signal mutation back into the bevy resource.
@@ -181,7 +178,7 @@ impl<R: Clone + Send + Sync + 'static + Display> Display for ResourceMirrorSigna
 }
 
 impl<R: Clone + Send + Sync + 'static> ResourceMirrorSignal<R> {
-    /// Enqueue a relative mutation. 
+    /// Enqueue a relative mutation.
     pub fn mutate<F>(&self, f: F)
     where
         F: Fn(&mut R) + Send + Sync + 'static,
@@ -189,7 +186,9 @@ impl<R: Clone + Send + Sync + 'static> ResourceMirrorSignal<R> {
         if let Some(w) = self.writer.read().as_ref() {
             w.mutate(f);
         } else {
-            warn!("ResourceMirrorSignal::mutate dropped: writer not yet available (Bevy round-trip pending)");
+            warn!(
+                "ResourceMirrorSignal::mutate dropped: writer not yet available (Bevy round-trip pending)"
+            );
         }
     }
 
@@ -201,7 +200,9 @@ impl<R: Clone + Send + Sync + 'static> ResourceMirrorSignal<R> {
         if let Some(w) = self.writer.read().as_ref() {
             w.mutate_set(f);
         } else {
-            warn!("ResourceMirrorSignal::mutate_set dropped: writer not yet available (Bevy round-trip pending)");
+            warn!(
+                "ResourceMirrorSignal::mutate_set dropped: writer not yet available (Bevy round-trip pending)"
+            );
         }
     }
 
@@ -210,7 +211,9 @@ impl<R: Clone + Send + Sync + 'static> ResourceMirrorSignal<R> {
         if let Some(w) = self.writer.read().as_ref() {
             w.set_value(value);
         } else {
-            warn!("ResourceMirrorSignal::set_value dropped: writer not yet available (Bevy round-trip pending)");
+            warn!(
+                "ResourceMirrorSignal::set_value dropped: writer not yet available (Bevy round-trip pending)"
+            );
         }
     }
 

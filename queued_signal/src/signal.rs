@@ -87,7 +87,7 @@ impl<T: Clone + Send + Sync + 'static> QueuedSignalHandle<T> {
     pub fn read(&self) -> SignalReadGuard<'_, Result<Arc<T>, QueuedSignalNoneState>> {
         SignalReadGuard::new(self.value.read())
     }
-    
+
     /// Read and map the `Ok` variant, or pass through the error.
     pub fn read_ok<U>(&self, f: impl FnOnce(&T) -> U) -> Result<U, QueuedSignalNoneState> {
         let guard = self.value.read();
@@ -123,8 +123,7 @@ impl QueuedSignalHub {
     /// The tick thread runs at ~60 Hz and stops when the last clone of the hub
     /// is dropped.
     pub fn new() -> Self {
-        let tickers: Arc<Mutex<Vec<Box<dyn FnMut() + Send>>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let tickers: Arc<Mutex<Vec<Box<dyn FnMut() + Send>>>> = Arc::new(Mutex::new(Vec::new()));
 
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -205,7 +204,7 @@ impl Drop for QueuedSignalHub {
     }
 }
 
-/// Hook to obtain a [`QueuedSignalHandle`] for a globally-registered type `T`. 
+/// Hook to obtain a [`QueuedSignalHandle`] for a globally-registered type `T`.
 /// Returns a none-state if not initialized
 ///
 /// # Panics

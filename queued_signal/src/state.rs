@@ -576,7 +576,10 @@ impl<T: Clone + Send + Sync + 'static> QueuedSignal<T> {
 
     /// Subscribe dioxus signals to this queued signal's value and health,
     /// wrapping each value in `Ok(Arc<T>)`.
-    pub fn use_hook<E: 'static>(&self, error_state: E) -> (Signal<Result<Arc<T>, E>>, Signal<HealthStatus>) {
+    pub fn use_hook<E: 'static>(
+        &self,
+        error_state: E,
+    ) -> (Signal<Result<Arc<T>, E>>, Signal<HealthStatus>) {
         use_queued_state(self.state.clone(), error_state)
     }
 
@@ -671,7 +674,6 @@ unsafe impl<T: Clone + Send + Sync> Send for QueuedState<T> {}
 // Shared access to QueuedState<T> is therefore sound when T: Sync.
 unsafe impl<T: Clone + Send + Sync> Sync for QueuedState<T> {}
 
-
 /// Read guard for returning refs to inner signal values.
 pub struct SignalReadGuard<
     'a,
@@ -708,7 +710,11 @@ mod tests {
         let registry = ReaderRegistry::new();
         let id = registry.register();
         registry.heartbeat(id);
-        assert!(registry.check_stalled(Duration::from_millis(100)).is_empty());
+        assert!(
+            registry
+                .check_stalled(Duration::from_millis(100))
+                .is_empty()
+        );
 
         // Simulate a stalled reader by registering but never heartbeating,
         // then waiting past the timeout.
@@ -719,8 +725,12 @@ mod tests {
 
         // id is still heartbeating, should not be stalled.
         registry.heartbeat(id);
-        assert!(registry.check_stalled(Duration::from_millis(100)).is_empty()
-            || registry.check_stalled(Duration::from_millis(100)) == vec![id2]);
+        assert!(
+            registry
+                .check_stalled(Duration::from_millis(100))
+                .is_empty()
+                || registry.check_stalled(Duration::from_millis(100)) == vec![id2]
+        );
     }
 
     #[test]
@@ -744,7 +754,10 @@ mod tests {
         // All three op types in one tick.
         // Priority order: set_value_rx → set_rx → add_rx
         driver.set_value_tx.send(SetValueOp(Arc::new(42))).unwrap();
-        driver.set_tx.send(Arc::new(|v: &mut i32| *v += 10)).unwrap();
+        driver
+            .set_tx
+            .send(Arc::new(|v: &mut i32| *v += 10))
+            .unwrap();
         driver.add_tx.send(Arc::new(|v: &mut i32| *v += 1)).unwrap();
 
         driver.tick(Duration::ZERO);

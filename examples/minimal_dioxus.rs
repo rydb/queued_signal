@@ -1,4 +1,3 @@
-
 use std::time::Duration;
 
 use dioxus::prelude::*;
@@ -15,9 +14,7 @@ pub fn main() {
     hub.register(HelloWorld("Hello World".to_string()));
     hub.register(Counter(0));
 
-    dioxus::LaunchBuilder::new()
-    .with_context(hub)
-    .launch(app);
+    dioxus::LaunchBuilder::new().with_context(hub).launch(app);
 }
 
 #[component]
@@ -39,19 +36,16 @@ pub fn app() -> Element {
 
     let health_text = use_memo(move || format!("{:?}", counter.health()));
 
-
-    use_future(move || {
-        async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                counter.mutate(|n| n.0 += 1);
-            }
+    use_future(move || async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            counter.mutate(|n| n.0 += 1);
         }
     });
 
     rsx! {
         document::Stylesheet { href: asset!("assets/ui.css") }
-        div { 
+        div {
             h1 { "{hello_text}" }
             h2 { "Counter: {counter_text}" }
             p { "Health: {health_text}" }
@@ -61,5 +55,4 @@ pub fn app() -> Element {
             }
         }
     }
-
 }
