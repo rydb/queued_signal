@@ -1,36 +1,11 @@
-[package]
-name = "queued_signal"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+resolver = "3"
+members = ["./crates/*", "examples", "queued_signal"]
 
-[dependencies]
-dioxus = {workspace = true, features = ["desktop", "html", "document", "launch", "devtools", "macro"]}
-dioxus-signals = {workspace = true}
-dioxus-core = {workspace = true}
-dioxus-hooks = {workspace = true}
-
-# dioxus-core-macro = {workspace = true}
-# dioxus-html = {workspace = true}
-# dioxus_elements = {workspace = true}
-flume = {workspace = true}
-tokio = {workspace = true, features = ["rt", "time", "sync"]}
-flashmap = {workspace = true}
-bevy_ecs = {workspace = true}
-bevy_app = {workspace = true}
-bevy_transform = {workspace = true}
-bevy_log = {workspace = true, optional = true}
-glam = {workspace = true}
-bytemuck = {workspace = true}
-variadics_please = {workspace = true}
-left-right = {workspace = true}
-futures = {workspace = true}
-crossbeam-epoch = {workspace = true}
-parking_lot = {workspace = true}
-anyhow = {workspace = true}
-macro-v = {workspace = true}
 
 [workspace.dependencies]
 dioxus_bevy_signals = {path = "crates/dioxus_bevy_signals", default-features = false}
+
 dioxus = {version = "0.7.4", default-features = false}
 dioxus-core = {version = "0.7.4"}
 dioxus-signals = {version = "0.7.4"}
@@ -44,7 +19,7 @@ crossbeam-epoch = "0.9"
 tokio = "1.51"
 futures = "0.3"
 parking_lot = "0.12.5"
-flashmap = "0.2"
+# flashmap = "0.2"
 bevy_ecs = {version = "0.17"}
 bevy_app = {version = "0.17"}
 bevy_asset = {version = "0.17"}
@@ -53,37 +28,22 @@ bevy_pbr = {version = "0.17"}
 bevy_transform = {version = "0.17"}
 bevy_time = {version = "0.17"}
 bevy_log = {version = "0.17"}
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 glam = {version = "0.30"}
 trait-set = {version = "0.3"}
 bytemuck = {version = "1.25", features = ["derive"]}
 variadics_please = "1.1.0"
-queued_signal = {path = "./"}
+queued_signal = {path = "./queued_signal"}
 left-right = "0.11.7"
 cfg-if = "1.0"
 macro-v = "0.1.4"
+dioxus-native = "0.7"
+blitz-shell = "0.2"
+winit = "0.30"
+parley = { version = "0.6", features = ["std"] }
 tracing-subscriber = "0.3"
 tracing-chrome = "0.7"
 
-[features]
-resource_example = ["bevy_signal_tests/resource_tests"]
-query_example   = ["bevy_signal_tests/query_tests"]
-asset_example = ["bevy_signal_tests/asset_tests"]
-tracing = ["bevy_log"]
-
-[workspace]
-members = ["./crates/*", "crates/dioxus_bevy_signals", "examples/*"]
-
-[dev-dependencies]
-bevy_signal_tests = { path = "./examples/bevy_signal_tests", default-features = false  }
-
-[[example]]
-name = "resource_signal"
-required-features = ["resource_example"]
-
-[[example]]
-name = "query_signal"
-required-features = ["query_example"]
-
-[[example]]
-name = "asset_signal"
-required-features = ["asset_example"]
+# [[example]]
+# name = "minimal_dioxus"
+# required-features = [""]

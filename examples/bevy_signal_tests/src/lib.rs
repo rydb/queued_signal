@@ -34,17 +34,14 @@ cfg_if::cfg_if! {
     }
 }
 
-/// plugin that also includes a dioxus ui element relative to it
+/// Plugin that includes a dioxus UI element.
 pub trait DioxusTestPlugin: Plugin + 'static {
     fn included_element(&self) -> Element;
 
     fn register_plugin(&self, app: &mut App);
 }
 
-/// Shared tick timer resource, driven by [`bevy_time::Time`] delta.
-///
-/// Both the resource counter and the single-query counter tick on
-/// the same cadence via this timer.
+/// Shared tick timer resource driven by time delta.
 #[derive(Resource)]
 pub struct TickTimer(pub Timer);
 
@@ -54,13 +51,13 @@ impl Default for TickTimer {
     }
 }
 
-/// plugin that setups infastructure to run all tests
+/// Plugin that sets up the infrastructure for running all tests.
 #[derive(Clone)]
 pub struct SignalTestsPlugin {
-    /// call this to create minimal dioxus context to run plugins
+    /// Creates a minimal dioxus context for running test plugins.
     cmd_channels: BevyCommandChannels,
 
-    /// collection of all plugins that hold tests
+    /// Collection of all plugins containing tests.
     pub test_plugin_list: fn() -> Vec<Box<dyn DioxusTestPlugin>>,
 }
 
@@ -139,9 +136,9 @@ pub fn run_signal_tests() {
 
     subscriber.init();
 
-    let signal_tests_plguin = SignalTestsPlugin::default();
+    let signal_tests_plugin = SignalTestsPlugin::default();
 
-    let r = signal_tests_plguin.clone();
+    let r = signal_tests_plugin.clone();
     let bevy_thread = thread::spawn(move || {
         let mut app = App::new();
         app
@@ -152,7 +149,7 @@ pub fn run_signal_tests() {
     });
 
     LaunchBuilder::new()
-        .with_context(signal_tests_plguin)
+        .with_context(signal_tests_plugin)
         .launch(signal_tests_app);
 
     bevy_thread.join().unwrap();
@@ -162,10 +159,10 @@ pub fn run_signal_tests() {
 pub struct AppDocument(pub Signal<Rc<dyn dioxus_document::Document>>);
 
 pub fn signal_tests_app() -> Element {
-    let tests_plguin = use_context::<SignalTestsPlugin>();
+    let tests_plugin = use_context::<SignalTestsPlugin>();
 
     let command_queue_sender = CommandQueueSender {
-        tx: tests_plguin.cmd_channels.clone().tx(),
+        tx: tests_plugin.cmd_channels.clone().tx(),
     };
 
     let _document = use_context_provider(|| AppDocument(Signal::new(dioxus_document::document())));
@@ -173,7 +170,7 @@ pub fn signal_tests_app() -> Element {
     use_context_provider(|| command_queue_sender);
 
     let mut elements = Vec::new();
-    for plugin in (tests_plguin.test_plugin_list)() {
+    for plugin in (tests_plugin.test_plugin_list)() {
         elements.push(plugin.included_element());
     }
 

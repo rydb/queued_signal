@@ -5,7 +5,7 @@ use dioxus::prelude::*;
 use dioxus_bevy_signals::resource::use_bevy_resource;
 use dioxus_core::Element;
 use dioxus_hooks::use_memo;
-use queued_signal::signal::HealthStatus;
+use queued_signal::state::HealthStatus;
 
 use crate::{DioxusTestPlugin, TickTimer};
 
@@ -25,7 +25,7 @@ pub fn bevy_tick_counter(
     }
 }
 
-/// plugin for intiailizing bevy resource <-> dioxus QueuedSignal syncronization test.
+/// Plugin for initializing the bevy resource synchronization test.
 pub struct CounterResourceTestPlugin;
 
 impl Plugin for CounterResourceTestPlugin {
@@ -35,7 +35,7 @@ impl Plugin for CounterResourceTestPlugin {
     }
 }
 
-/// setup for all resource signal interop tests
+/// Setup for all resource signal interop tests.
 #[derive(Clone)]
 pub struct ResourceTestsPlugin;
 
@@ -63,7 +63,7 @@ impl DioxusTestPlugin for ResourceTestsPlugin {
     }
 }
 
-/// bevy resource <-> dioxus sync test
+/// Bevy resource and dioxus sync test.
 #[component]
 pub fn CounterResource() -> Element {
     let counter = use_bevy_resource::<Counter>();

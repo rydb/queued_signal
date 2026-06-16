@@ -1,4 +1,5 @@
 use dioxus::prelude::*;
+use dioxus::signals::Signal;
 use flume::{Receiver, Sender};
 use left_right::{Absorb, ReadHandle, WriteHandle};
 use parking_lot::Mutex;
@@ -66,14 +67,14 @@ impl ReaderRegistry {
     }
 }
 
-/// Closure mutation (used by Dioxus `mutate` and `mutate_set`)
+/// Closure mutation operation.
 pub type MutationOp<T> = Arc<dyn Fn(&mut T) + Send + Sync>;
 
-/// Full-value replacement op
+/// Full-value replacement operation.
 #[derive(Clone)]
 pub struct SetValueOp<T>(pub Arc<T>);
 
-/// Unified operation for left‑right always operates on `Arc<T>` inside `Absorbable`.
+/// Unified operation that always operates on `Arc<T>`.
 #[derive(Clone)]
 pub enum SignalOp<T: Clone + Send + Sync> {
     Fn(MutationOp<T>),
@@ -83,14 +84,13 @@ pub enum SignalOp<T: Clone + Send + Sync> {
 impl<T: Debug + Clone + Send + Sync> Debug for SignalOp<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Fn(_arg0) => f.debug_tuple("Fn").field(&"{annoymous function}").finish(),
-            Self::Set(_arg0) => f.debug_tuple("Set").field(&"{annoymous function}").finish(),
+            Self::Fn(_arg0) => f.debug_tuple("Fn").field(&"{anonymous function}").finish(),
+            Self::Set(_arg0) => f.debug_tuple("Set").field(&"{anonymous function}").finish(),
         }
     }
 }
 
 #[derive(Clone)]
-#[repr(transparent)]
 pub struct Absorbable<T: Clone>(pub Arc<T>);
 
 impl<T: Clone + Debug> Debug for Absorbable<T> {
@@ -143,7 +143,7 @@ impl<T: Clone + Send + Sync> Absorb<SignalOp<T>> for Absorbable<T> {
     }
 }
 
-/// Inner state of QueuedSignal
+/// Inner state of a QueuedSignal.
 pub struct QueuedState<T: Clone + Send + Sync> {
     pub read_handle: ReadHandle<Absorbable<T>>,
     pub notify_rx: watch::Receiver<u64>,
@@ -174,7 +174,7 @@ impl<T: Clone + Send + Sync> Clone for QueuedState<T> {
 }
 
 impl<T: Clone + Send + Sync> QueuedState<T> {
-    /// Returns a tracked guard that dereferences to `Arc<T>`.
+    /// Returns a tracked read guard.
     pub fn read(&self) -> TrackedReadGuard<'_, T> {
         let guard = self.read_handle.enter().unwrap();
         TrackedReadGuard::new(guard, self.registry.clone())
@@ -186,17 +186,14 @@ impl<T: Clone + Send + Sync> QueuedState<T> {
         self.notify_rx.clone()
     }
 
-    /// Peek the current version without entering the read side or cloning.
-    /// Returns the latest published version number (u64 counter).
-    /// O(1) — just reads the watch channel's current value.
+    /// Peek the current version without entering the read side.
     pub fn peek_version(&self) -> u64 {
         *self.notify_rx.borrow()
     }
 }
 
 impl<T: Clone + Send + Sync + 'static> QueuedState<T> {
-    /// Spawn a background task that forwards values from this `QueuedState`
-    /// into existing Dioxus signals.  
+    /// Spawn a background task forwarding values into existing dioxus signals.
     pub fn forward_to<V: 'static>(
         &self,
         value_signal: Signal<V>,
@@ -204,8 +201,7 @@ impl<T: Clone + Send + Sync + 'static> QueuedState<T> {
         map: impl Fn(Arc<T>) -> V + 'static,
     ) {
         let state = self.clone();
-        // Use Dioxus's local spawn (not tokio::spawn) because `Signal`
-        // is not `Send` (it uses `RefCell` internally).
+        // Use dioxus local spawn since Signal is not Send.
         spawn(async move {
             let mut value_signal = value_signal;
             let mut health_signal = health_signal;
@@ -231,7 +227,7 @@ impl<T: Clone + Send + Sync + 'static> QueuedState<T> {
     }
 }
 
-/// QueuedSignal Read guard.
+/// Read guard for a QueuedSignal.
 pub struct TrackedReadGuard<'a, T: Clone + Send + Sync> {
     guard: left_right::ReadGuard<'a, Absorbable<T>>,
     registry: Arc<ReaderRegistry>,
@@ -265,7 +261,7 @@ impl<'a, T: Clone + Send + Sync> Deref for TrackedReadGuard<'a, T> {
     }
 }
 
-/// Driver for how reads/writes are managed between QueuedSignal and a given state front end (Dioxus, and others)
+/// Driver for managing reads and writes for a QueuedSignal.
 pub struct WriterDriver<T: Clone + Send + Sync> {
     write_handle: WriteHandle<Absorbable<T>, SignalOp<T>>,
     set_value_rx: Receiver<SetValueOp<T>>,
@@ -279,9 +275,13 @@ pub struct WriterDriver<T: Clone + Send + Sync> {
     registry: Arc<ReaderRegistry>,
     watchdog_timeout: Duration,
     last_publish: Instant,
+    /// Sender for authoritative full-value replacements.
     pub set_value_tx: Sender<SetValueOp<T>>,
+    /// Sender for authoritative closure mutations.
     pub set_tx: Sender<MutationOp<T>>,
+    /// Sender for relative closure mutations.
     pub add_tx: Sender<MutationOp<T>>,
+    /// The read-side state that consumers subscribe to.
     pub queued_state: QueuedState<T>,
     publish_counter: Option<Arc<AtomicU64>>,
 }
@@ -295,6 +295,8 @@ impl<T: Debug + Clone + Send + Sync> Debug for WriterDriver<T> {
             .field("add_rx", &self.add_rx)
             .field("abs_slot", &self.abs_slot)
             .field("notify_tx", &self.notify_tx)
+            .field("version", &self.version)
+            .field("last_health", &self.last_health)
             .field("health_tx", &self.health_tx)
             .field("registry", &self.registry)
             .field("watchdog_timeout", &self.watchdog_timeout)
@@ -357,7 +359,7 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
         self.publish_counter = Some(counter);
     }
 
-    /// drains all buffers and replaces with the given `T`.
+    /// Drains all buffers and replaces with the given value.
     pub fn write_absolute(&self, value: T) {
         let arc = Arc::new(value);
         let mut slot = self.abs_slot.lock();
@@ -423,7 +425,7 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
                 pinned_buffers: pinned,
             },
         };
-        // don't starve future by updating health every frame when no new changes are made
+        // Don't update health every frame when no changes are made.
         if status != self.last_health {
             self.last_health = status;
             let _ = self.health_tx.send(status);
@@ -506,21 +508,18 @@ impl<T: Clone + Send + Sync + 'static> QueuedSignal<T> {
         self.state.health()
     }
 
-    pub fn use_hook<E: 'static>(
-        &self,
-        error_state: E,
-    ) -> (Signal<Result<Arc<T>, E>>, Signal<HealthStatus>) {
-        use_queued_signal(self.state.clone(), error_state)
+    pub fn use_hook<E: 'static>(&self, error_state: E) -> (Signal<Result<Arc<T>, E>>, Signal<HealthStatus>) {
+        use_queued_state(self.state.clone(), error_state)
     }
 
     /// Like [`use_hook`], but passes `Arc<T>` directly without wrapping in `Ok()`.
     pub fn use_hook_direct(&self, initial: T) -> (Signal<Arc<T>>, Signal<HealthStatus>) {
-        use_queued_signal_direct(self.state.clone(), initial)
+        use_queued_state_direct(self.state.clone(), initial)
     }
 }
 
 /// Subscribe a [`Signal`] to a [`QueuedState`], wrapping each value in `Ok(Arc<T>)`.
-pub fn use_queued_signal<T: Clone + Send + Sync + 'static, E: 'static>(
+pub fn use_queued_state<T: Clone + Send + Sync + 'static, E: 'static>(
     state: QueuedState<T>,
     error_state: E,
 ) -> (Signal<Result<Arc<T>, E>>, Signal<HealthStatus>) {
@@ -537,7 +536,9 @@ pub fn use_queued_signal<T: Clone + Send + Sync + 'static, E: 'static>(
             loop {
                 tokio::select! {
                     Ok(()) = notify_rx.changed() => {
-                        let Some(guard) = read_handle.enter() else { break };
+                        let Some(guard) = read_handle.enter() else {
+                            break;
+                        };
                         let reader_id = registry.register();
                         registry.heartbeat(reader_id);
                         value_signal.set(Ok(guard.0.clone()));
@@ -556,7 +557,7 @@ pub fn use_queued_signal<T: Clone + Send + Sync + 'static, E: 'static>(
     (value_signal, health_signal)
 }
 
-pub fn use_queued_signal_direct<T: Clone + Send + Sync + 'static>(
+pub fn use_queued_state_direct<T: Clone + Send + Sync + 'static>(
     state: QueuedState<T>,
     initial: T,
 ) -> (Signal<Arc<T>>, Signal<HealthStatus>) {
@@ -592,7 +593,36 @@ pub fn use_queued_signal_direct<T: Clone + Send + Sync + 'static>(
     (value_signal, health_signal)
 }
 
+// SAFETY: The underlying read and write handles use raw atomic pointers
+// and do not auto-derive Send/Sync. These types are thread-safe given
+// the bounds on T. Required for cross-thread signal usage.
 unsafe impl<T: Clone + Send + Sync> Send for Absorbable<T> {}
 unsafe impl<T: Clone + Send + Sync> Sync for Absorbable<T> {}
 unsafe impl<T: Clone + Send + Sync> Send for QueuedState<T> {}
 unsafe impl<T: Clone + Send + Sync> Sync for QueuedState<T> {}
+
+
+/// Read guard for returning refs to inner signal values.
+pub struct SignalReadGuard<
+    'a,
+    T: 'static,
+    R: dioxus_signals::Readable<Target = T> + 'static = dioxus_signals::Signal<T>,
+> {
+    guard: dioxus_signals::ReadableRef<'a, R>,
+}
+
+impl<'a, T: 'static, R: dioxus_signals::Readable<Target = T> + 'static> SignalReadGuard<'a, T, R> {
+    pub fn new(guard: dioxus_signals::ReadableRef<'a, R>) -> Self {
+        Self { guard }
+    }
+}
+
+impl<'a, T: 'static, R: dioxus_signals::Readable<Target = T> + 'static> std::ops::Deref
+    for SignalReadGuard<'a, T, R>
+{
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}

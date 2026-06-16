@@ -30,12 +30,12 @@ pub type CommandSender = Sender<CommandQueue>;
 pub type CommandReceiver = Receiver<CommandQueue>;
 
 #[derive(Resource)]
-pub struct CommandQueueReciever {
+pub struct CommandQueueReceiver {
     pub rx: CommandReceiver,
 }
-/// Adds system to bevy through &mut World instead of &mut App
+/// Adds a system to bevy through `&mut World` instead of `&mut App`.
 ///
-/// !!! Do not add systems that run before Pre-Update via this method or they wont run !!!
+/// !!! Do not add systems that run before `PreUpdate` via this method, or they will not run. !!!
 pub fn add_systems_through_world<T>(
     world: &mut World,
     schedule: impl ScheduleLabel,
@@ -44,25 +44,22 @@ pub fn add_systems_through_world<T>(
     let mut schedules = world.get_resource_mut::<Schedules>().unwrap();
 
     // schedules that don't work when added via world.
-    let schedule_blacklist = [format!("{:#?}", PreUpdate), format!("{:#?}", PreStartup)];
-
-    for bad_schedule in schedule_blacklist {
-        if format!("{:#?}", schedule) == bad_schedule {
-            panic!("
-                Systems that run before update do not run when added through world. 
-                Re-structure your command plugin to not use systems that run before update in the mean time. 
+    let interned = schedule.intern();
+    if interned == PreUpdate.intern() || interned == PreStartup.intern() {
+        panic!("
+                Systems that run before update do not run when added through world.
+                Re-structure your command plugin to not use systems that run before update in the mean time.
                 TODO: fix this
                 
                 Offending Schedule:
-                {:#?}
+                {schedule:#?}
 
                 Offending system set:
-                {:#?}
+                {systems:#?}
                 ",
-                bad_schedule,
-                type_name_of_val(&systems)
-            );
-        };
+            schedule = format!("{:#?}", interned),
+            systems = type_name_of_val(&systems)
+        );
     }
 
     let schedule = schedules.entry(schedule);
@@ -70,22 +67,22 @@ pub fn add_systems_through_world<T>(
     schedule.add_systems(systems);
 }
 
-pub fn process_commands(command_rx: ResMut<CommandQueueReciever>, mut commands: Commands) {
+pub fn process_commands(command_rx: ResMut<CommandQueueReceiver>, mut commands: Commands) {
     while let Ok(mut cmd) = command_rx.rx.try_recv() {
         commands.append(&mut cmd);
     }
 }
 
-/// command queue to send commands to bevy
+/// Command queue for sending commands to bevy.
 #[derive(Clone, Resource)]
 pub struct CommandQueueSender {
     pub tx: CommandSender,
 }
 
 impl CommandQueueSender {
-    /// Synchronously send a command to bevy and block for the response (up to 10s).
-    /// Prefer [`send_command_async`] in async contexts (e.g., Dioxus hooks) to avoid
-    /// blocking the runtime.
+    /// Synchronously sends a command to bevy and blocks for the response, with a
+    /// 10 second timeout. Prefer [`send_command_async`] in async contexts, such as
+    /// dioxus hooks, to avoid blocking the runtime.
     pub fn send_command<R: Send + 'static>(
         &self,
         make_command: impl FnOnce(Sender<R>) -> CommandQueue,
@@ -100,12 +97,10 @@ impl CommandQueueSender {
             .map_err(|err| format!("{}, {}, {}", err.to_string(), file!(), line!()))
     }
 
-    /// Async variant of [`send_command`]. Uses a `tokio::sync::oneshot` channel so the
-    /// caller can `.await` the response without blocking any OS thread.
-    ///
-    /// No explicit timeout is used — Dioxus's `use_future` runs on a manually-polled
-    /// virtual DOM without a tokio reactor, so `tokio::time::timeout` would hang.
-    /// The oneshot resolves once Bevy processes the command (typically next frame).
+    /// Async variant of [`send_command`]. Uses a oneshot channel so the caller can
+    /// `.await` the response without blocking any OS thread. No explicit timeout is
+    /// used; the oneshot resolves once bevy processes the command, typically on the
+    /// next frame.
     pub async fn send_command_async<R: Send + 'static>(
         &self,
         make_command: impl FnOnce(oneshot::Sender<R>) -> CommandQueue,
@@ -120,7 +115,7 @@ impl CommandQueueSender {
     }
 }
 
-/// bevy commands tx/rx channels need to be visible outside of the app thread in order to be inserted into dioxus, so this exists to create them
+/// Bevy command channels that can be shared with dioxus for cross-thread communication.
 #[derive(Clone)]
 pub struct BevyCommandChannels {
     tx: CommandSender,
@@ -139,12 +134,12 @@ impl BevyCommandChannels {
     }
 }
 
-/// plugin for mirroring state from the bevy world into the dioxus world
+/// Plugin for mirroring state from the bevy world into dioxus.
 pub struct DioxusBevyMirrorPlugin {
     pub bevy_command_txrx: BevyCommandChannels,
-    /// The target frames-per-second for the Dioxus sync schedules.
-    /// Determines how many times per second the resource, query, and asset
-    /// sync systems run.  Default: 60.
+    /// The target frames per second for the dioxus sync schedules.
+    /// Determines how many times per second the sync systems run.
+    /// Default: 60.
     pub dioxus_sync_fps: u32,
 }
 
@@ -161,7 +156,7 @@ impl Plugin for DioxusBevyMirrorPlugin {
     fn build(&self, app: &mut App) {
         use schedules::*;
 
-        // Register the Dioxus sync fixed-timestep schedules.
+        // Register the dioxus sync fixed-timestep schedules.
         app.add_schedule(Schedule::new(DioxusSyncMain))
             .add_schedule(Schedule::new(DioxusSyncPreUpdate))
             .add_schedule(Schedule::new(DioxusSyncUpdate))
@@ -170,32 +165,27 @@ impl Plugin for DioxusBevyMirrorPlugin {
             .insert_resource(DioxusSyncConfig::from_fps(self.dioxus_sync_fps))
             .insert_resource(DioxusSyncAccumulator::default())
             .init_resource::<DioxusSyncMainScheduleOrder>()
-            // The runner is checked every frame (via PostUpdate) but only ticks
-            // the Dioxus sync schedules when enough time has accumulated.
-            // PostUpdate ensures user Update systems (animate, etc.) run first,
-            // so the latest component state is synced to Dioxus signals without
-            // requiring explicit .before() ordering from end users.
             .add_systems(PostUpdate, DioxusSyncMain::run_dioxus_sync_main);
 
-        app.insert_resource(CommandQueueReciever {
+        app.insert_resource(CommandQueueReceiver {
             rx: self.bevy_command_txrx.rx.clone(),
         })
         .insert_resource(CommandQueueSender {
             tx: self.bevy_command_txrx.tx.clone(),
         });
-        // process_commands is now handled inside DioxusSyncMain::run_dioxus_sync_main
-        // (before the sub-schedule loop) so dynamically-registered systems from
-        // command processing are available for the current frame.
+        // Process commands inside the dioxus sync main runner so that
+        // dynamically registered systems from command processing are available
+        // for the current frame.
     }
 }
 
-/// Dioxus accessible command queue for bevy commands
+/// Dioxus-accessible command queue for sending commands to bevy.
 #[derive(Clone, Copy)]
 pub struct BevyCommandsSignal {
     pub command_queue_sender: Signal<CommandQueueSender>,
 }
 
-/// Macro to ergonomically push and send a group of bevy commands to bevy
+/// Macro for pushing and sending a group of commands to bevy.
 ///
 /// Usage:
 /// ```rust
@@ -211,7 +201,7 @@ macro_rules! push_and_send {
     }};
 }
 
-/// signal to get a convienience struct for sending commands
+/// Signal providing a convenience struct for sending commands to bevy.
 pub fn use_bevy_command_queue() -> BevyCommandsSignal {
     let command_queue = use_context::<CommandQueueSender>();
 
@@ -220,27 +210,3 @@ pub fn use_bevy_command_queue() -> BevyCommandsSignal {
     }
 }
 
-/// Thin read guard to a readable value (works with both [`Signal`] and [`Memo`]).
-pub struct SignalReadGuard<
-    'a,
-    T: 'static,
-    R: dioxus_signals::Readable<Target = T> + 'static = dioxus_signals::Signal<T>,
-> {
-    guard: dioxus_signals::ReadableRef<'a, R>,
-}
-
-impl<'a, T: 'static, R: dioxus_signals::Readable<Target = T> + 'static> SignalReadGuard<'a, T, R> {
-    pub(crate) fn new(guard: dioxus_signals::ReadableRef<'a, R>) -> Self {
-        Self { guard }
-    }
-}
-
-impl<'a, T: 'static, R: dioxus_signals::Readable<Target = T> + 'static> std::ops::Deref
-    for SignalReadGuard<'a, T, R>
-{
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        &self.guard
-    }
-}

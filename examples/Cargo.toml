@@ -1,0 +1,49 @@
+[package]
+name = "examples"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "MIT"
+
+
+[dependencies]
+bevy_signal_tests = {path = "./bevy_signal_tests", default-features = false, optional = true}
+queued_signal = {workspace = true}
+
+[dev-dependencies]
+dioxus-native = {workspace = true, features = ["system-fonts"]}
+dioxus = {workspace = true, features = ["asset", "desktop"]}
+blitz-shell = {workspace = true}
+winit = {workspace = true}
+parley = {workspace = true}
+tracing-chrome = {workspace = true}
+tracing-subscriber = {workspace = true}
+tokio = {workspace = true}
+
+[[example]]
+name = "resource_signal"
+required-features = ["resource_example"]
+path = "resource_signal.rs"
+
+[[example]]
+name = "query_signal"
+required-features = ["query_example"]
+path = "query_signal.rs"
+
+[[example]]
+name = "asset_signal"
+required-features = ["asset_example"]
+path = "asset_signal.rs"
+
+[[example]]
+name = "multidom_dioxus"
+path = "multidom_dioxus.rs"
+
+[[example]]
+name = "minimal_dioxus"
+path = "minimal_dioxus.rs"
+
+[features]
+resource_example = ["bevy_signal_tests/resource_tests"]
+query_example = ["bevy_signal_tests/query_tests"]
+asset_example = ["bevy_signal_tests/asset_tests"]

@@ -9,7 +9,6 @@ use bevy_ecs::prelude::*;
 use bevy_pbr::{MeshMaterial3d, StandardMaterial};
 use dioxus::prelude::*;
 use dioxus_bevy_signals::asset::{AssetNoneState, use_bevy_asset};
-// use dioxus_bevy_signals::asset::use_bevy_asset;
 use dioxus_bevy_signals::query::use_bevy_query;
 use dioxus_hooks::{use_memo, use_signal};
 use dioxus_signals::{ReadableExt, WritableExt};
@@ -137,7 +136,7 @@ pub fn ToggleableAsset() -> Element {
     }
 }
 
-/// component to test removing unmonitored assets from AssetsMirror
+/// Component for testing cleanup of unmonitored asset mirrors.
 #[component]
 pub fn AssetCleanupDemo() -> Element {
     let mut color_toggled = use_signal(|| true);
@@ -147,7 +146,7 @@ pub fn AssetCleanupDemo() -> Element {
 
     rsx! {
         h2 {
-            "unwatched assets cleanup test:"
+            "Unwatched assets cleanup test:"
         }
         button {
             onclick: _toggle_handle,
@@ -208,7 +207,7 @@ pub fn AssetColorPicker() -> Element {
     }
 }
 
-/// demos to test bevy asset <-> dioxus sync
+/// Demos for testing bevy asset synchronization with dioxus.
 #[component]
 pub fn AssetDemos() -> Element {
     rsx! {

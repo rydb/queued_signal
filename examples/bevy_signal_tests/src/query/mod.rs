@@ -33,7 +33,7 @@ pub struct DebugPrintTimer {
 #[derive(Component)]
 pub struct Examined;
 
-/// marks entity as a part of the query toggle on/off test for query artifact cleanup
+/// Marks an entity as part of the query toggle test for artifact cleanup.
 #[derive(Component, Clone)]
 pub struct ToggleTestMarker;
 
@@ -93,7 +93,7 @@ impl Command for RemoveNames {
     }
 }
 
-/// test removing names from query to see if they reflect in QueryMirror
+/// Tests removal of names from a query to verify reflection in the mirror.
 pub fn remove_names(mut commands: Commands, names: Query<(Entity, &Name, &Greets), ()>) {
     for (entity, ..) in names {
         commands.entity(entity).despawn();
@@ -142,7 +142,7 @@ impl DioxusTestPlugin for QueryTestsPlugin {
     fn included_element(&self) -> Element {
         rsx! {
             TenNamesQuery {  }
-            // SingleQuery {}
+            SingleQuery {}
         }
     }
 
@@ -180,7 +180,7 @@ pub fn ToggleableQuery() -> Element {
     }
 }
 
-/// bevy query <-> dioxus sync test
+/// Bevy query <-> dioxus sync test.
 #[component]
 pub fn TenNamesQuery() -> Element {
     let names = use_bevy_query::<(Entity, &mut Name, &mut Greets), ()>();
@@ -317,7 +317,7 @@ impl Plugin for SingleQuerySetup {
     }
 }
 
-/// test for use_bevy_single Single<T> mirror
+/// Test for the use_bevy_single mirror.
 #[component]
 pub fn SingleQuery() -> Element {
     let counter = use_bevy_single::<(Entity, &mut SingleCounter), ()>();
@@ -349,24 +349,27 @@ pub fn SingleQuery() -> Element {
     });
 
     rsx! {
-        h1 {
-            "Single query sync test"
-        }
         div {
-            h2 {
-                {format!("single match: {}", counter_str)}
+            style: "border: 2px solid black; background-color: #f0f0f0; padding: 16px; border-radius: 8px;",
+            h1 {
+                "Single query sync test"
             }
-            button {
-                onclick: increment_counter,
-                "increment counter"
+            div {
+                h2 {
+                    {format!("single match: {}", counter_str)}
+                }
+                button {
+                    onclick: increment_counter,
+                    "increment counter"
+                }
             }
-        }
 
-        h2 {
-            {format!("no match: {}", no_match_str)}
-        }
-        h2 {
-            {format!("more then one match: {}", more_then_one_match_str)}
+            h2 {
+                {format!("no match: {}", no_match_str)}
+            }
+            h2 {
+                {format!("more then one match: {}", more_then_one_match_str)}
+            }
         }
     }
 }

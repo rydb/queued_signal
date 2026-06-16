@@ -1,13 +1,5 @@
-/// Declarative macro implementing [`MirrorQueryData`](super::MirrorQueryData) for a tuple of
+/// Implements [`MirrorQueryData`](super::MirrorQueryData) for tuples of
 /// `(Entity, &mut T1, &mut T2, ..., &mut TN)`.
-///
-/// Invoked via [`variadics_please::all_tuples!`] to stamp out implementations for multiple arities.
-///
-/// Arms (in priority order):
-/// 1. Size 2 — no-op, handled by the manual impl in `mod.rs`.
-/// 2. Size 1 — uses bare `Without<>` / `Changed<>` (Bevy's `Or` doesn't implement
-///    `QueryFilter` for 1-tuples).
-/// 3. Sizes 3+ — uses `Or<(...)>` for filter types.
 
 macro_rules! impl_mirror_query_data {
     ($T0:ident, $T1:ident) => {};
@@ -20,7 +12,7 @@ macro_rules! impl_mirror_query_data {
 
             type MirrorSignalsQueryDataImMut = (Entity, &'static DioxusMirror<$T>);
 
-            // Bevy's `Or` does not implement `QueryFilter` for 1-tuples, so use bare filters.
+            // Or does not implement QueryFilter for 1-tuples, so use bare filters.
             type MirrorSignalsWithoutFilter = Without<DioxusMirror<$T>>;
 
             type MirrorItemHandles = (Entity, DioxusMirrorHandle<$T>);
@@ -216,7 +208,7 @@ macro_rules! impl_mirror_query_data {
                 let v0 = $first.version.load(std::sync::atomic::Ordering::Relaxed);
                 let v1 = $second.version.load(std::sync::atomic::Ordering::Relaxed);
                 let v2 = $third.version.load(std::sync::atomic::Ordering::Relaxed);
-                // Combine via XOR + rotate to avoid collisions between different version tuples
+                // Combine via XOR and rotate to avoid collisions between version tuples.
                 let mut combined = v0 ^ v1.rotate_left(21) ^ v2.rotate_left(42);
                 $(
                     let v = $rest.version.load(std::sync::atomic::Ordering::Relaxed);

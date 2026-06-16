@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-# todo, remove bevy_reflect post testing
 bevy_ecs = {workspace = true}
 bevy_app = {workspace = true}
 bevy_asset = {workspace = true}

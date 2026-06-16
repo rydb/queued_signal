@@ -1,6 +1,3 @@
-#[cfg(feature = "tracing")]
-use bevy_log::tracing;
-
 #[cfg(not(feature = "tracing"))]
 use macro_v::macro_v;
 

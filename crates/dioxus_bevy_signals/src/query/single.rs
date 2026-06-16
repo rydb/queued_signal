@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use bevy_ecs::{prelude::*, query::QueryFilter};
 use dioxus_hooks::{use_effect, use_memo, use_signal};
 use dioxus_signals::{Memo, ReadableExt, Signal, WritableExt};
-use queued_signal::signal::{HealthStatus, QueuedSignal};
+use queued_signal::state::{HealthStatus, QueuedSignal};
 
 use super::{
     DioxusQuerySync, MirrorQuery, MirrorQueryData, QueryNoneState, SignalReadGuard, use_bevy_query,
@@ -12,13 +12,13 @@ use super::{
 /// Error when a single-entity query doesn't resolve to exactly one match.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SingleQueryError {
-    /// The mirror signal hasn't been initialized yet (Bevy round-trip pending).
+    /// The mirror signal has not been initialized yet.
     NotInitialized,
     /// The query matched zero entities.
     NoMatchingEntity,
     /// The query matched more than one entity. Contains all matching [`Entity`] IDs.
     MoreThanOneEntity { entities: Vec<Entity> },
-    /// no upper bound found on the size hint for the query size
+    /// No upper bound found on the size hint for the query.
     NoUpperBound,
 }
 
@@ -28,20 +28,20 @@ impl From<SingleQueryError> for String {
             SingleQueryError::NotInitialized => "Not initialized".into(),
             SingleQueryError::NoMatchingEntity => "No matching entities".into(),
             SingleQueryError::MoreThanOneEntity { entities } => {
-                format!("more then one matching entities: {:#?}", entities)
+                format!("more than one matching entity: {:#?}", entities)
             }
             SingleQueryError::NoUpperBound => "No upper bound for query size found".into(),
         }
     }
 }
 
-/// Handle to a single-entity mirrored Bevy query,
+/// Handle to a single-entity mirrored bevy query.
 pub struct MirrorQuerySingleHandle<Q: MirrorQueryData, F: QueryFilter> {
     /// The single matched item, or an error describing why resolution failed.
     item: Signal<Result<Q::MirrorItemHandles, SingleQueryError>>,
     /// Health of the underlying signal.
     pub health: Signal<HealthStatus>,
-    /// `None` until the Bevy round-trip completes (non-blocking).
+    /// None until the bevy round-trip completes.
     pub writer: Signal<Option<QueuedSignal<MirrorQuery<Q, F>>>>,
     _filter: PhantomData<F>,
 }
@@ -76,7 +76,8 @@ impl<Q: MirrorQueryData + 'static, F: QueryFilter + 'static> MirrorQuerySingleHa
     }
 }
 
-/// Query for a mirror bevy [`Single<Q>`], resolves an error when read if there more or less then one result.
+/// Query for a single mirrored bevy entity.
+/// Resolves to an error if there is not exactly one matching result.
 pub fn use_bevy_single<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>()
 -> MirrorQuerySingleHandle<Q, F> {
     let query_handle = use_bevy_query::<Q, F>();
@@ -87,10 +88,8 @@ pub fn use_bevy_single<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>()
     let mut last_version: Signal<u64> = use_signal(|| 0);
 
     use_memo(move || {
-        // Always read to register the reactive dependency on the query signal,
-        // even when we early-return. Without this, Dioxus's reset_and_run_in
-        // clears the subscriber registration and subsequent updates from Bevy
-        // never trigger this memo
+        // Always read to register the reactive dependency,
+        // so that subsequent updates from bevy trigger this memo.
         let dep = query_handle.read();
 
         // Check if the query signal has published a new version

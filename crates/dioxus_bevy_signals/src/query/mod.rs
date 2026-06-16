@@ -25,21 +25,19 @@ use dioxus_core::{use_drop, use_hook};
 use dioxus_hooks::{use_context, use_effect, use_future, use_signal};
 use dioxus_signals::{ReadableExt, Signal, WritableExt};
 use parking_lot::Mutex;
-use queued_signal::signal::{HealthStatus, QueuedSignal, WriterDriver};
+use queued_signal::state::{HealthStatus, QueuedSignal, SignalReadGuard, WriterDriver};
 use tokio::sync::oneshot;
 use trait_set::trait_set;
 
-use crate::{CommandQueueSender, SignalReadGuard, add_systems_through_world};
+use crate::{CommandQueueSender, add_systems_through_world};
 
 trait_set! {
-    /// Component that is syncable with dioxus
-    ///
-    /// TODO: support immutable components as well
+    /// Component that can be synced with dioxus.
     pub trait DioxusComponentSync = Component<Mutability = Mutable> + Clone + 'static;
     pub trait DioxusQuerySync = MirrorQueryData + Send + Sync;
 }
 
-/// Error state for a query signal that hasn't been initialized yet.
+/// Error state for an uninitialized query signal.
 #[derive(Clone, Debug)]
 pub enum QueryNoneState {
     NotInitialized,
@@ -54,8 +52,8 @@ fn drive_component_signals<T: DioxusComponentSync>(mut components: Query<&mut Di
             guard.tick(Duration::ZERO);
         }
         let new_version = component.version.load(std::sync::atomic::Ordering::Relaxed);
-        // Only mark as changed if the signal actually published (avoids unnecessary
-        // Changed<DioxusMirror<T>> matches on idle ticks).
+        // Only mark as changed if the signal published,
+        // avoiding unnecessary change detection on idle ticks.
         if new_version != old_version {
             component.set_changed();
         }
@@ -69,12 +67,12 @@ fn drive_query_signal<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>(
     guard.tick(Duration::ZERO);
 }
 
-/// mirrored version of bevy component + infastructure for queries
+/// Mirrored version of a bevy component with query infrastructure.
 #[derive(Component)]
 pub struct DioxusMirror<T: DioxusComponentSync> {
     pub value: QueuedSignal<T>,
 
-    /// driver for this component to make signal associated with it tick
+    /// Driver for ticking the signal associated with this component.
     pub(crate) driver: Arc<Mutex<WriterDriver<T>>>,
 
     pub version: Arc<AtomicU64>,
@@ -103,13 +101,13 @@ impl<T: DioxusComponentSync> DioxusMirror<T> {
     }
 }
 
-/// dioxus handle to bevy side DioxusMirror
+/// Dioxus handle for a bevy-side mirrored component.
 #[derive(Clone)]
 pub struct DioxusMirrorHandle<T: DioxusComponentSync> {
     pub value: QueuedSignal<T>,
 }
 
-/// Total number of active Dioxus components using this query.
+/// Total number of active dioxus components using this query.
 #[derive(Resource)]
 pub struct MirrorQueryHandleCount<Q: MirrorQueryData, F: QueryFilter> {
     pub count: i32,
@@ -125,7 +123,7 @@ impl<Q: MirrorQueryData, F: QueryFilter> Default for MirrorQueryHandleCount<Q, F
     }
 }
 
-/// Whether any Dioxus component currently needs this query.
+/// Whether any dioxus component currently needs this query.
 #[derive(Resource)]
 pub struct MirrorQueryActive<Q: MirrorQueryData, F: QueryFilter> {
     pub active: bool,
@@ -198,20 +196,20 @@ impl<T: DioxusComponentSync> DioxusMirror<T> {
     }
 }
 
-/// Copies the current value of a Dioxus‑side signal back into the Bevy component,
+/// Copies a dioxus-side signal value back into the bevy component.
 fn sync_component_to_mirror<T: DioxusComponentSync>(
     components: Query<(Entity, &mut DioxusMirror<T>, &mut T), Changed<DioxusMirror<T>>>,
     mut last_versions: Local<HashMap<Entity, u64>>,
 ) {
     for (entity, mut mirror, mut value) in components {
         let current_version = mirror.version.load(Ordering::Acquire);
-        // Use current_version as default instead of 0 to avoid spurious write-back
-        // on the first tick after initialization (version goes from 0→1 due to setup).
-        let last = last_versions
-            .get(&entity)
-            .copied()
-            .unwrap_or(current_version);
-        if current_version != last {
+        // First time seeing this entity: always sync so that no
+        // dioxus-side mutation is silently dropped.
+        let is_changed = match last_versions.get(&entity) {
+            Some(last) => &current_version != last,
+            None => true,
+        };
+        if is_changed {
             *value.bypass_change_detection() = mirror.value.read().as_ref().clone();
             mirror.set_changed();
             last_versions.insert(entity, current_version);
@@ -233,7 +231,7 @@ fn delete_unused_mirrors<T: DioxusComponentSync>(
     }
 }
 
-/// sync components to their changed mirrors
+/// Sync bevy components to their changed mirrors.
 fn sync_mirror_to_component<T: DioxusComponentSync>(
     mut components: Query<(&T, &DioxusMirror<T>), Changed<T>>,
 ) {
@@ -245,7 +243,7 @@ fn sync_mirror_to_component<T: DioxusComponentSync>(
 /// Accumulates tracking delta requests for batch processing.
 #[derive(Resource)]
 struct PendingQueryTrackingDeltas<Q: MirrorQueryData, F: QueryFilter> {
-    /// cummulative tracking delta
+    /// Cumulative tracking delta.
     pending: i32,
     _querydata: fn() -> PhantomData<Q>,
     _filter: fn() -> PhantomData<F>,
@@ -275,7 +273,7 @@ impl<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static> Command
     }
 }
 
-/// apply any new tracking queries increment/decrement deltas on relevant DioxusMirrors
+/// Apply tracking query deltas to relevant mirrored components.
 fn apply_tracking_queries_delta<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>(
     mirror_components: Query<Q::TrackingQueriesQuerydataMut, F>,
     mut pending_tracking_delta: ResMut<PendingQueryTrackingDeltas<Q, F>>,
@@ -295,7 +293,7 @@ fn apply_tracking_queries_delta<Q: DioxusQuerySync + 'static, F: QueryFilter + '
 }
 
 #[derive(Resource)]
-pub struct QueryMirrorInitailized<Q: QueryData, F: QueryFilter> {
+pub struct QueryMirrorInitialized<Q: QueryData, F: QueryFilter> {
     initialized: bool,
     _querydata: fn() -> PhantomData<Q>,
     _filter: fn() -> PhantomData<F>,
@@ -306,16 +304,16 @@ pub fn sync_query_mirror_to_signal<T: DioxusQuerySync + 'static, F: QueryFilter 
     mirror_components: Query<T::MirrorSignalsQueryDataImMut, F>,
     mirror_signal: ResMut<MirrorQuerySignal<T, F>>,
     mut commands: Commands,
-    mut init_status: ResMut<QueryMirrorInitailized<T, F>>,
+    mut init_status: ResMut<QueryMirrorInitialized<T, F>>,
     // Track last-seen entity count to skip removal detection when stable
     mut last_entity_count: Local<usize>,
     // Track per-entity combined version for cheap change detection (single u64, no alloc)
     mut last_versions: Local<HashMap<Entity, u64>>,
 ) {
-    // Pre-init: spawn mirrors + wait for all entities to be ready
+    // Pre-init: spawn mirrors and wait for all entities to be ready.
     if !init_status.initialized {
-        // The expensive Without+Or filter is only paid on pre-init ticks.
-        // Once init completes, this entire block is skipped.
+        // Expensive Without+Or filter is only paid on pre-init ticks.
+        // Once init completes, this block is skipped.
         if components_without_signals.count() <= 0 {
             let current_map = mirror_components
                 .iter()
@@ -349,9 +347,7 @@ pub fn sync_query_mirror_to_signal<T: DioxusQuerySync + 'static, F: QueryFilter 
         return;
     }
 
-    // Post-init: detect new entities needing mirrors
-    // Must run every tick so spawned entities get mirrors on the next sync.
-    // When no new entities exist, this is a fast archetype walk with 0 iterations.
+    // Post-init: detect new entities needing mirrors.
     for item in components_without_signals {
         trace!("component without signal found");
         let entity = T::get_query_entity(&item);
@@ -359,10 +355,8 @@ pub fn sync_query_mirror_to_signal<T: DioxusQuerySync + 'static, F: QueryFilter 
         commands.entity(entity).insert_if_new(bundle);
     }
 
-    // Combined entity count + atomic version scan
-    // Single pass over mirror_components: count entities while detecting changes.
-    // This eliminates a separate Query::count() call (saves ~2000-5000ns).
-    // The version scan replaces Changed<T> query iteration with cheap atomic loads.
+    // Single pass over mirror components to count entities
+    // while detecting changes via atomic version loads.
     let mut current_count: usize = 0;
     let mut has_changes = false;
     let mut changed_entities: Vec<(Entity, T::MirrorItemHandles)> = Vec::new();
@@ -388,7 +382,7 @@ pub fn sync_query_mirror_to_signal<T: DioxusQuerySync + 'static, F: QueryFilter 
     let count_changed = current_count != *last_entity_count;
     *last_entity_count = current_count;
 
-    // On count change, detect removals and seed new entity versions
+    // Detect removals and seed new entity versions on count change.
     if count_changed {
         // Seed versions for any new entities that weren't in the scan above
         for item in mirror_components.iter() {
@@ -399,7 +393,7 @@ pub fn sync_query_mirror_to_signal<T: DioxusQuerySync + 'static, F: QueryFilter 
         }
     }
 
-    // Entity removal detection (only when count changed)
+    // Entity removal detection when count changed.
     let mut removed_entities: Vec<Entity> = Vec::new();
     if count_changed {
         for (&entity, _) in last_versions.iter() {
@@ -412,8 +406,7 @@ pub fn sync_query_mirror_to_signal<T: DioxusQuerySync + 'static, F: QueryFilter 
         }
     }
 
-    // Apply mutations
-    // Direct map insert/remove without intermediate HashMap allocation.
+    // Apply insertions and removals directly into the signal map.
     if has_changes || !removed_entities.is_empty() {
         mirror_signal.0.mutate_set(move |n| {
             let map = &mut n.value;
@@ -520,7 +513,7 @@ impl<T: DioxusQuerySync + 'static, F: QueryFilter> Command for RequestQueryMirro
 
                     world.insert_resource(MirrorQueryWriteDriver(driver_arc));
                     world.insert_resource(MirrorQuerySignal(signal.clone()));
-                    world.insert_resource(QueryMirrorInitailized::<T, F> {
+                    world.insert_resource(QueryMirrorInitialized::<T, F> {
                         initialized: false,
                         _querydata: || PhantomData::default(),
                         _filter: || PhantomData::default(),
@@ -542,17 +535,18 @@ impl<T: DioxusQuerySync + 'static, F: QueryFilter> Command for RequestQueryMirro
     }
 }
 
+/// Query data trait for mirroring bevy queries to dioxus signals.
 /// query that corresponds to the mirorred signals that correspond to the underlying bevy value,
 /// ```
 /// let signal = MirrorQuery<(Entity, &mut A, &mut B)> -> Query<(Entity, &mut DioxusMirror<A>, &mut DioxusMirror<B>)> -> HashMap<Entity, (Entity, DioxusMirror<A>, DioxusMirror<B>)> -> QueuedQuerySignal
 /// ```
 pub trait MirrorQueryData: QueryData {
-    /// query item results for mirror items of query;
+    /// Mirrored query item type.
     ///
     /// E.G;
     type MirrorItem: Send + Sync + 'static;
 
-    /// query item handles to the results for mirror items of query,
+    /// Handle type for the mirrored query item results.
     ///
     /// E.G; if `MirrorItem` is
     /// ```rust
@@ -564,7 +558,7 @@ pub trait MirrorQueryData: QueryData {
     /// ```
     type MirrorItemHandles: Clone + Send + Sync + 'static;
 
-    /// query as its DioxusMirror<T> encapsulated variant.
+    /// Query data type for reading the mirrored signals.
     ///
     /// E.G; if MirrorQueryData is
     ///
@@ -577,52 +571,21 @@ pub trait MirrorQueryData: QueryData {
     /// ```rust
     /// Query<(Entity, &mut DioxusMirror<A>, &mut DioxusMirror<B>)>
     /// ```
-    ///
-
-    /// immutable version of [`MirrorSignalsQueryDataMut`]
     type MirrorSignalsQueryDataImMut: QueryData;
 
-    /// Query filter version of query data signals to check for components which DON'T, have DioxusMirrors attached which should.
+    /// Filter for components that are missing their mirrors.
     type MirrorSignalsWithoutFilter: QueryFilter;
 
-    /// the max number of entries this query is allowed to track.
-    ///
-    /// if there exists more matches then this number, then query is cleared and no longer tracked.
-    ///
-    /// This exists in order to prevent un-optimized queries from marking every single world component to sync.
-    ///
-    /// E.G:
-    /// ```rust
-    /// QueryMirror<Entity, &mut A> // -> 2 million entities with A -> 2 million A(s) marked for sync on update.
-    /// ```
-    ///
-    ///
-    /// vs
-    ///
-    /// ```rust
-    /// QueryMirror<Entity, &mut A, With<Marker>> //-> 20 entries with A + marker -> 20 A(s) marked for sync on update.
-    /// ```
-    ///
-    /// entities in a query iter are un-ordered, so its not possible to make a "shallow iterator" that could go from x..y range of entries
-    ///
-    /// What can be garunteed though, is that there are x or less number of entries. So this exists as a stop-gap for optimization.
-    ///
-    /// TODO: Implement a better solution
-    const MAX_TRACKED_COUNT: usize = 2000;
-
-    /// filter for entities with changed MirrorComponents.
-    ///
-    /// used for query sync to only sync when work has been done
+    /// Filter for entities with changed mirrored components.
     type MirrorSignalsChangedFilter: QueryFilter;
 
-    /// queries that are tracking the components in [`MirrorItem`], e.g;
+    /// Query type for tracking reference counts per component.
     ///
-    /// if query is:
+    /// E.G; if the query is:
     ///
     /// ```rust
     /// Query<(Entity, &mut A, &mut B)>
     /// ```
-    ///
     ///
     /// this will be
     /// ```rust
@@ -630,10 +593,10 @@ pub trait MirrorQueryData: QueryData {
     /// ```
     type TrackingQueriesQuerydataMut: QueryData;
 
-    /// queues commands for dioxus mirror <-> bevy value sync setup
+    /// Register the sync systems for this mirror query.
     fn register_mirror_sync_systems<F: QueryFilter>(world: &mut World);
 
-    /// get the entity of the mirror version of the bevy query
+    /// Get the entity from a mirrored query item.
     ///
     /// E.G, for:
     ///
@@ -644,23 +607,23 @@ pub trait MirrorQueryData: QueryData {
             's,
         >,
     ) -> Entity;
-    /// get the entity of the original bevy query:
+    /// Get the entity from the original bevy query item.
     ///
     /// E.G, for:
     /// QueryMirror<(Entity, &mut A, &mut B)>
     fn get_query_entity<'w, 's>(item: &Self::Item<'w, 's>) -> Entity;
 
-    /// get the mirrored components as an insertable bundle
+    /// Create an insertable bundle of mirror components.
     fn get_mirror_bundle<'w, 's, F: QueryFilter + 'static>(item: Self::Item<'w, 's>)
     -> impl Bundle;
 
-    /// increment/decrement the number of tracking queries per mirror item
+    /// Adjust the tracking reference count per mirror item.
     fn apply_tracking_delta<'w, 's, F: QueryFilter + 'static>(
         item: <Self::TrackingQueriesQuerydataMut as QueryData>::Item<'w, 's>,
         delta: i32,
     );
 
-    /// clone `Query<(&mut DioxusMirror<A>, ...)>::Item<'w, 's>`(borrowed `MirrorItem`) to owned `MirrorItem`
+    /// Clone a borrowed mirror query item into owned handles.
     fn clone_dioxus_signals<'w, 's>(
         item: &<<Self::MirrorSignalsQueryDataImMut as QueryData>::ReadOnly as QueryData>::Item<
             'w,
@@ -668,10 +631,7 @@ pub trait MirrorQueryData: QueryData {
         >,
     ) -> Self::MirrorItemHandles;
 
-    /// Extract a combined version identifier from all mirrored components in this query item.
-    /// Each component's version is loaded from `DioxusMirror<T>::version` (an `AtomicU64`
-    /// incremented on each signal publish) and combined via XOR+rotate into a single u64.
-    /// Used for cheap zero-alloc change detection without `Changed<T>` queries.
+    /// Extract a combined version identifier from mirrored components.
     fn extract_version<'w, 's>(
         item: &<<Self::MirrorSignalsQueryDataImMut as QueryData>::ReadOnly as QueryData>::Item<
             'w,
@@ -802,7 +762,7 @@ where
     type Item = &'a Q::MirrorItemHandles;
     type IntoIter = std::collections::hash_map::Values<'a, Entity, Q::MirrorItemHandles>;
 
-    /// Yields shared references to each `MirrorItem` tuple without cloning.
+    /// Yields shared references to each mirror item.
     fn into_iter(self) -> Self::IntoIter {
         self.value.values()
     }
@@ -829,21 +789,21 @@ impl<T: MirrorQueryData, F: QueryFilter> Default for MirrorQuery<T, F> {
         }
     }
 }
-/// A mirror version of bevy query, that holds `QueuedSignal<T>` of matching components
+/// A mirrored bevy query holding signals for matching components.
 #[derive(Resource)]
 pub struct MirrorQuerySignal<Q: MirrorQueryData, F: QueryFilter>(QueuedSignal<MirrorQuery<Q, F>>);
 
-/// write driver to make query updates tick for QuerySignal
+/// Write driver for ticking query signal updates.
 #[derive(Resource)]
 pub struct MirrorQueryWriteDriver<Q: DioxusQuerySync, F: QueryFilter>(
     Arc<Mutex<WriterDriver<MirrorQuery<Q, F>>>>,
 );
 
-/// Handle to mirror version of bevy query, that can be used from dioxus.
+/// Handle to a mirrored bevy query, usable from dioxus.
 pub struct MirrorQuerySignalHandle<Q: MirrorQueryData, F: QueryFilter> {
     pub(crate) signal: Signal<Result<Arc<MirrorQuery<Q, F>>, QueryNoneState>>,
     pub health: Signal<HealthStatus>,
-    /// `None` until the Bevy round-trip completes (non-blocking).
+    /// None until the bevy round-trip completes.
     pub writer: Signal<Option<QueuedSignal<MirrorQuery<Q, F>>>>,
     _filter: PhantomData<F>,
 }
@@ -879,10 +839,8 @@ impl<Q: MirrorQueryData, F: QueryFilter> Iterator for MirrorQueryIter<Q, F> {
 }
 
 impl<Q: MirrorQueryData + 'static, F: QueryFilter + 'static> MirrorQuerySignalHandle<Q, F> {
-    /// Read the query with zero refcount bump.
-    ///
-    /// Returns a [`SignalReadGuard`] that derefs to `Result<Arc<MirrorQuery<Q, F>>, QueryNoneState>`,
-    /// so callers write `&*self.read()` to get `&Result<Arc<MirrorQuery<Q, F>>, QueryNoneState>`.
+    /// Read into a guard of the query. Use `&*self.read()` to obtain
+    /// a reference to the inner result.
     pub fn read(&self) -> SignalReadGuard<'_, Result<Arc<MirrorQuery<Q, F>>, QueryNoneState>> {
         SignalReadGuard::new(self.signal.read())
     }
@@ -901,7 +859,7 @@ impl<Q: MirrorQueryData + 'static, F: QueryFilter + 'static> MirrorQuerySignalHa
     }
 }
 
-/// Create or fetch a [`MirrorQuery`] signal of mirrored components
+/// Create or fetch a mirrored query signal.
 pub fn use_bevy_query<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>()
 -> MirrorQuerySignalHandle<Q, F> {
     let ctx = use_context::<CommandQueueSender>();

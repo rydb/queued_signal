@@ -16,17 +16,17 @@ use dioxus_hooks::{use_context, use_effect, use_signal};
 use dioxus_signals::{Memo, ReadableExt, Signal, WritableExt};
 use flume::{Receiver, Sender};
 use parking_lot::Mutex;
-use queued_signal::signal::{HealthStatus, QueuedSignal, WriterDriver};
+use queued_signal::state::{HealthStatus, QueuedSignal, SignalReadGuard, WriterDriver};
 use tokio::sync::oneshot;
 use trait_set::trait_set;
 
-use crate::{CommandQueueSender, SignalReadGuard, add_systems_through_world};
+use crate::{CommandQueueSender, add_systems_through_world};
 
 trait_set! {
     pub trait DioxusAssetSync = Asset + Clone + Send + Sync + 'static;
 }
 
-/// current state of asset in the asset server
+/// Current state of an asset in the asset server.
 #[derive(Clone, Debug)]
 pub enum AssetState<A: DioxusAssetSync> {
     Loaded(A),
@@ -34,7 +34,7 @@ pub enum AssetState<A: DioxusAssetSync> {
 }
 
 impl<A: DioxusAssetSync> AssetState<A> {
-    /// for printing asset state without Debug on A
+    /// Returns a string describing the asset state.
     pub fn as_string(&self) -> &'static str {
         match self {
             AssetState::Loaded(_n) => "Loaded",
@@ -77,21 +77,18 @@ pub struct AssetUpdateExtraInfo<A: DioxusAssetSync> {
     asset_id: AssetId<A>,
 }
 
-/// stores a dioxus mirror of what may be a mirror to a real bevy asset.
-///
-/// due to dioxus hook rules, hooks cannot optionally exist, but assets may or may not exist when requested(they were despawned, asset id is wrong, etc..)
-///
-/// so, when an AssetId is requested you might get an asset, or you'll get an error that it doesn't exist/despawned, etc..
+/// Stores a dioxus signal that mirrors a bevy asset.
+/// Dioxus hooks cannot conditionally exist, so this returns either
+/// the asset or a none-state when the asset is unavailable.
 pub struct AssetMaybeMirror<A: DioxusAssetSync> {
     pub state: QueuedSignal<Result<A, AssetNoneState>>,
-    /// second signal for extra info needed for updating assets (change detection, asset id, etc..)
-    /// kept seperate to not clone channels on update
+    /// Extra metadata needed for updating assets.
     pub extra_update_info: QueuedSignal<AssetUpdateExtraInfo<A>>,
     state_driver: Arc<Mutex<WriterDriver<Result<A, AssetNoneState>>>>,
     extra_update_info_driver: Arc<Mutex<WriterDriver<AssetUpdateExtraInfo<A>>>>,
-    /// number of signals that are actively reading this asset mirror.
-    ///
-    /// once this hits zero(last dioxus component reading this is dropped), the asset mirror map clears this entry from it self.
+    /// Number of signals actively reading this asset mirror. 
+    /// 
+    /// Asset mirror is cleaned up when this hits zero.
     tracking_signals: i32,
 }
 
@@ -139,7 +136,7 @@ pub fn clear_asset_init_requests<A: DioxusAssetSync>(mut mirrors: ResMut<AssetMi
     mirrors.init_requests.clear();
 }
 
-/// initialize asset from requested id.
+/// Initialize an asset mirror from a requested ID.
 pub fn init_requested_asset_mirrors<A: DioxusAssetSync>(
     mut mirrors: ResMut<AssetMirrorMap<A>>,
     asset_server: Res<AssetServer>,
@@ -220,12 +217,12 @@ pub fn sync_mirrors_to_assets<A: DioxusAssetSync>(
     changed: Res<ChangedAssetMirrors<A>>,
 ) {
     for event in events.read() {
-        trace!("recieved event trace for {:#?}", event);
+        trace!("received event trace for {:#?}", event);
         let id = match event {
             AssetEvent::Modified { id } | AssetEvent::LoadedWithDependencies { id } => id,
             _ => continue,
         };
-        // dont re-set the asset on the same frame that it was set to a new value to stop infinite loops
+        // don't sync mirror asset to asset on the same frame it was set in order to stop an infinite change loop
         if changed.0.contains(id) == true {
             trace!("chhanged includes {}, skipping", id);
             continue;
@@ -433,7 +430,7 @@ fn apply_tracking_queries_delta<A: DioxusAssetSync>(
         let clear = {
             let Some(entry) = mirrors.assets.get_mut(&id) else {
                 error!(
-                    "delta change request recieved by asset doesn't exist in map? How did this happen?"
+                    "delta change request received by asset doesn't exist in map? How did this happen?"
                 );
                 continue;
             };
@@ -476,16 +473,13 @@ impl<A: DioxusAssetSync> Command for UpdateTrackingAssets<A> {
     }
 }
 
-/// an asset that may or may not exist when requested.
-///
-/// due to hook rules, hooks cannot conditionally exist,
-///
-/// so this signal will either will return an underlying asset or an error that the provided asset id for it doesn't exist
+/// An asset that may or may not exist when requested.
+/// Returns either the underlying asset or an none-state.
 #[derive(Clone)]
 pub struct AssetMaybeMirrorSignal<A: DioxusAssetSync> {
     value: Signal<Arc<Result<A, AssetNoneState>>>,
-    /// `None` until the Bevy round-trip completes (non-blocking). Writes are
-    /// silently ignored while the signal is still pending.
+    /// None until the bevy round-trip completes.
+    /// Writes are silently ignored while pending.
     signal: Signal<Option<QueuedSignal<Result<A, AssetNoneState>>>>,
     extra_info: Signal<Result<Arc<AssetUpdateExtraInfo<A>>, AssetNoneState>>,
     health: Signal<HealthStatus>,
@@ -538,14 +532,10 @@ impl<A: DioxusAssetSync> AssetMaybeMirrorSignal<A> {
 
 use std::fmt::Debug;
 
-/// Returns immediately with `Fetching` state.  The real mirror is fetched
-/// asynchronously once the asset ID becomes available via the `id` memo,
-/// and installed when the Bevy world processes the request.
-///
-/// Unlike the previous implementation, this does NOT use a placeholder UUID
-/// and swap mechanism — it defers creation of the Bevy-side mirror until
-/// the real [`AssetId`] is known, eliminating a class of race conditions
-/// where the mirror could get stuck in a `NonAsset` state.
+/// Returns immediately with a `Fetching` state.
+/// The real mirror is fetched asynchronously once the
+/// asset ID becomes available and installed when bevy
+/// processes the request.
 pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
     id: Memo<Result<AssetId<A>, AssetNoneState>>,
 ) -> AssetMaybeMirrorSignal<A> {
@@ -564,16 +554,7 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
     let mut sent_id = use_signal(|| None::<AssetId<A>>);
     let mut tracking_active = use_signal(|| false);
 
-    // ---- Deferred mirror creation: wait for a real AssetId ----
-    //
-    // Previously this used a random UUID placeholder + swap mechanism
-    // (InitializeSignalAssetIdRequest + update_signals_with_initialized_ids).
-    // That created a race window where init_requested_asset_mirrors would
-    // process the placeholder UUID, set NonAsset, and the subsequent swap
-    // to the real ID could leave the asset stuck at NonAsset.
-    //
-    // Now we simply wait until `id` resolves to Ok(real_asset_id) before
-    // creating the mirror — no placeholder, no swap, no race.
+    // Wait for a real AssetId before creating the mirror.
     let ctx2 = ctx.clone();
     use_effect(move || {
         let Ok(asset_id) = id.read().clone() else {
@@ -619,15 +600,9 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
                 }
             };
 
-            // Eagerly set signals from current queued state values so they
-            // are immediately available (e.g. extra_info_signal needed by
-            // mutate() to send change notifications back to Bevy), then
-            // subscribe to future changes via forward_to.
-            //
-            // forward_to uses nr.changed() which only fires on the *next*
-            // publish; by the time we subscribe here the driver may already
-            // have published the initial value, so we'd miss it and the
-            // signals would stay at their initial Fetching/Err state.
+            // Eagerly set signals from current values so they
+            // are immediately available, then subscribe to
+            // future changes.
             let extra_info_arc = resp.extra_info.read().clone();
             extra_info_signal.set(Ok(extra_info_arc));
             let asset_arc = resp.asset_state.read().clone();
@@ -638,7 +613,7 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
                 *asset_value_signal.read()
             );
 
-            // Forward future changes into the hook signals
+            // Forward future changes into the hook signals.
             resp.asset_state
                 .state
                 .forward_to(asset_value_signal, health_signal, |arc| arc);
@@ -646,7 +621,7 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
                 .state
                 .forward_to(extra_info_signal, health_signal, |arc| Ok(arc));
 
-            // Mount: send +1 tracking
+            // Mount: send tracking increment.
             let asset_id = resp.extra_info.read().asset_id;
             trace!("asset signal mounted, sending +1 for {:?}", asset_id);
             let mut q = CommandQueue::default();
@@ -663,7 +638,7 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
         });
     });
 
-    // Unmount: send -1 tracking (only if +1 was sent)
+    // Unmount: send tracking decrement.
     let r = ctx.clone();
     use_drop(move || {
         if !*tracking_active.read() {

@@ -15,7 +15,7 @@ bevy_asset = {workspace = true}
 dioxus-hooks = {workspace = true}
 dioxus-document = {workspace = true}
 dioxus-signals = {workspace = true}
-dioxus = {workspace = true, features = ["lib"]}
+dioxus = {workspace = true, features = ["lib", "desktop", "document", "devtools", "launch"]}
 flume = {workspace = true}
 queued_signal = {workspace = true}
 dioxus_bevy_signals = {workspace = true}
