@@ -37,15 +37,16 @@ pub struct ReaderRegistry {
     next_id: AtomicU64,
 }
 
-impl ReaderRegistry {
-    /// Create a new empty registry.
-    pub fn new() -> Self {
-        Self {
-            readers: Mutex::new(HashMap::new()),
-            next_id: AtomicU64::new(1),
+impl Default for ReaderRegistry {
+    fn default() -> Self {
+        Self { 
+            readers: Mutex::new(HashMap::new()), 
+            next_id: AtomicU64::new(1) 
         }
     }
+}
 
+impl ReaderRegistry {
     /// Register a new reader and return its unique ID.
     pub fn register(&self) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -359,7 +360,7 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
         let (set_tx, set_rx) = flume::unbounded();
         let (add_tx, add_rx) = flume::unbounded();
 
-        let registry = Arc::new(ReaderRegistry::new());
+        let registry = Arc::new(ReaderRegistry::default());
 
         let state = QueuedState {
             read_handle,
@@ -707,7 +708,7 @@ mod tests {
 
     #[test]
     fn reader_registry_stall_detection() {
-        let registry = ReaderRegistry::new();
+        let registry = ReaderRegistry::default();
         let id = registry.register();
         registry.heartbeat(id);
         assert!(
@@ -735,7 +736,7 @@ mod tests {
 
     #[test]
     fn reader_registry_unregister() {
-        let registry = ReaderRegistry::new();
+        let registry = ReaderRegistry::default();
         let id = registry.register();
         assert!(!registry.check_stalled(Duration::from_millis(0)).is_empty());
 

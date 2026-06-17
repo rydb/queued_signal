@@ -14,6 +14,9 @@ use parking_lot::Mutex;
 
 use crate::state::{HealthStatus, QueuedSignal, SignalReadGuard, WriterDriver};
 
+/// A thread-safe list of boxed ticker callbacks with no arguments.
+type TickerList = Arc<Mutex<Vec<Box<dyn FnMut() + Send>>>>;
+
 /// Error state for an uninitialized queued signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueuedSignalNoneState {
@@ -41,13 +44,7 @@ pub struct QueuedSignalHandle<T: Clone + Send + Sync + 'static> {
 impl<T: Clone + Send + Sync + 'static> Copy for QueuedSignalHandle<T> {}
 
 impl<T: Clone + Send + Sync + 'static> Clone for QueuedSignalHandle<T> {
-    fn clone(&self) -> Self {
-        Self {
-            value: self.value,
-            health: self.health,
-            writer: self.writer,
-        }
-    }
+    fn clone(&self) -> Self { *self }
 }
 
 impl<T: Clone + Send + Sync + 'static> QueuedSignalHandle<T> {
@@ -93,7 +90,7 @@ impl<T: Clone + Send + Sync + 'static> QueuedSignalHandle<T> {
         let guard = self.value.read();
         match &*guard {
             Ok(arc) => Ok(f(arc.as_ref())),
-            Err(e) => Err(e.clone()),
+            Err(e) => Err(*e),
         }
     }
 }
@@ -103,7 +100,7 @@ impl<T: Clone + Send + Sync + 'static> QueuedSignalHandle<T> {
 /// Components call [`use_queued_signal::<T>()`] to obtain a handle.
 pub struct QueuedSignalHub {
     signals: Arc<Mutex<HashMap<TypeId, Box<dyn Any + Send>>>>,
-    tickers: Arc<Mutex<Vec<Box<dyn FnMut() + Send>>>>,
+    tickers: TickerList,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -117,13 +114,15 @@ impl Clone for QueuedSignalHub {
     }
 }
 
-impl QueuedSignalHub {
+
+
+impl Default for QueuedSignalHub {
     /// Create a new hub and start the background tick thread.
     ///
     /// The tick thread runs at ~60 Hz and stops when the last clone of the hub
     /// is dropped.
-    pub fn new() -> Self {
-        let tickers: Arc<Mutex<Vec<Box<dyn FnMut() + Send>>>> = Arc::new(Mutex::new(Vec::new()));
+    fn default() -> Self {
+        let tickers: TickerList = Arc::new(Mutex::new(Vec::new()));
 
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -147,7 +146,9 @@ impl QueuedSignalHub {
             shutdown,
         }
     }
+}
 
+impl QueuedSignalHub {
     /// Register a queued signal with its initial value.
     ///
     /// Register a signal type with its initial value.

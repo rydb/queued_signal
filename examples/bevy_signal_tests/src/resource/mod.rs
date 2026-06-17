@@ -36,14 +36,9 @@ impl Plugin for CounterResourceTestPlugin {
 }
 
 /// Setup for all resource signal interop tests.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct ResourceTestsPlugin;
 
-impl Default for ResourceTestsPlugin {
-    fn default() -> Self {
-        Self {}
-    }
-}
 
 impl Plugin for ResourceTestsPlugin {
     fn build(&self, app: &mut App) {

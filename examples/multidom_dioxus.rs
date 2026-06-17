@@ -155,7 +155,7 @@ pub fn setup() {
         .build();
     tracing_subscriber::registry().with(chrome_layer).init();
 
-    let hub = QueuedSignalHub::new();
+    let hub = QueuedSignalHub::default();
     hub.register(HelloWorld("Hello World".to_string()));
     hub.register(Counter(0));
 

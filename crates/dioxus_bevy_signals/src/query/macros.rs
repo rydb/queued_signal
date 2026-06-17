@@ -1,5 +1,5 @@
-/// Implements [`MirrorQueryData`](super::MirrorQueryData) for tuples of
-/// `(Entity, &mut T1, &mut T2, ..., &mut TN)`.
+//! Implements [`MirrorQueryData`](super::MirrorQueryData) for tuples of
+//! `(Entity, &mut T1, &mut T2, ..., &mut TN)`.
 
 macro_rules! impl_mirror_query_data {
     ($T0:ident, $T1:ident) => {};

@@ -40,7 +40,7 @@ pub struct ToggleTestMarker;
 pub struct AddTenNames;
 
 impl Command for AddTenNames {
-    fn apply(self, world: &mut World) -> () {
+    fn apply(self, world: &mut World) {
         world
             .commands()
             .spawn((Name::new("Name1"), Greets::default(), Examined));
@@ -79,7 +79,7 @@ impl Command for AddTenNames {
 pub struct RemoveNames;
 
 impl Command for RemoveNames {
-    fn apply(self, world: &mut World) -> () {
+    fn apply(self, world: &mut World) {
         let mut names = world.query::<(Entity, &Name, &Greets)>();
 
         let mut remove_list = Vec::new();
@@ -329,7 +329,7 @@ pub fn SingleQuery() -> Element {
     });
 
     let increment_counter = move |_evt| {
-        let _ = counter
+        counter
             .read_ok(|value| value.1.mutate(|counter| counter.0 += 10))
             .unwrap_or_else(|err| println!("tried to increment counter but: {:#?}", err));
     };

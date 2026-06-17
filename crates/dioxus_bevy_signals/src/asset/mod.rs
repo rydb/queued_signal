@@ -137,7 +137,7 @@ pub struct ChangedIdsSender<A: DioxusAssetSync>(Sender<AssetId<A>>);
 
 /// Tick all asset mirror drivers.
 pub fn drive_maybe_assets<A: DioxusAssetSync>(mut mirrors: ResMut<AssetMirrorMap<A>>) {
-    for (_id, asset) in &mut mirrors.assets {
+    for asset in mirrors.assets.values_mut() {
         let mut guard = asset.state_driver.lock();
         guard.tick(Duration::ZERO);
 
@@ -170,7 +170,8 @@ pub fn init_requested_asset_mirrors<A: DioxusAssetSync>(
         };
         let fetch = match asset_server.get_load_state(id) {
             Some(state) => {
-                let asset_fetch = match state {
+                
+                match state {
                     LoadState::NotLoaded => Err(AssetNoneState::NotLoaded),
                     LoadState::Loading => Err(AssetNoneState::Loading),
                     LoadState::Loaded => {
@@ -192,8 +193,7 @@ pub fn init_requested_asset_mirrors<A: DioxusAssetSync>(
                     LoadState::Failed(asset_load_error) => {
                         Err(AssetNoneState::Error(asset_load_error.to_string()))
                     }
-                };
-                asset_fetch
+                }
             }
             // get_load_state returns None for procedurally-generated assets
             // (those added via Assets::add() rather than loaded through the
@@ -239,15 +239,14 @@ pub fn sync_mirrors_to_assets<A: DioxusAssetSync>(
             _ => continue,
         };
         // don't sync mirror asset to asset on the same frame it was set in order to stop an infinite change loop
-        if changed.0.contains(id) == true {
+        if changed.0.contains(id) {
             trace!("chhanged includes {}, skipping", id);
             continue;
         }
-        if let Some(entry) = mirrors.assets.get(id) {
-            if let Some(a) = assets.get(*id) {
+        if let Some(entry) = mirrors.assets.get(id)
+            && let Some(a) = assets.get(*id) {
                 entry.state.set_value(Ok(a.clone()));
             }
-        }
     }
 }
 
@@ -319,7 +318,7 @@ pub struct RequestBevyAssetMirror<A: DioxusAssetSync> {
 }
 
 impl<A: DioxusAssetSync> Command for RequestBevyAssetMirror<A> {
-    fn apply(self, world: &mut World) -> () {
+    fn apply(self, world: &mut World) {
         match world.get_resource::<AssetSyncInitialized<A>>() {
             Some(_) => {}
             None => {
@@ -475,11 +474,7 @@ fn apply_tracking_queries_delta<A: DioxusAssetSync>(
 
             entry.tracking_signals += delta;
 
-            if entry.tracking_signals <= 0 {
-                true
-            } else {
-                false
-            }
+            entry.tracking_signals <= 0
         };
         if clear {
             trace!(
@@ -499,7 +494,7 @@ pub struct UpdateTrackingAssets<A: DioxusAssetSync> {
 }
 
 impl<A: DioxusAssetSync> Command for UpdateTrackingAssets<A> {
-    fn apply(self, world: &mut World) -> () {
+    fn apply(self, world: &mut World) {
         let mut pending_delta = world.get_resource_or_init::<PendingAssetTrackingDeltas<A>>();
         pending_delta.pending.push((self.asset_id, self.delta));
     }
@@ -656,7 +651,7 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
                 .forward_to(asset_value_signal, health_signal, |arc| arc);
             resp.extra_info
                 .state
-                .forward_to(extra_info_signal, health_signal, |arc| Ok(arc));
+                .forward_to(extra_info_signal, health_signal, Ok);
 
             // Mount: send tracking increment only for subsequent
             // readers — the initial reader is pre-counted.

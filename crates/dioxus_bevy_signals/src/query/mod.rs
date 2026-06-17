@@ -213,6 +213,7 @@ impl<T: DioxusComponentSync> DioxusMirror<T> {
 }
 
 /// Copies a dioxus-side signal value back into the bevy component.
+#[allow(clippy::type_complexity)]
 fn sync_component_to_mirror<T: DioxusComponentSync>(
     components: Query<(Entity, &mut DioxusMirror<T>, &mut T), Changed<DioxusMirror<T>>>,
     mut last_versions: Local<HashMap<Entity, u64>>,
@@ -252,7 +253,7 @@ fn sync_mirror_to_component<T: DioxusComponentSync>(
     mut components: Query<(&T, &DioxusMirror<T>), Changed<T>>,
 ) {
     for (value, mirror) in &mut components {
-        let _ = mirror.value.set_value(value.clone().into());
+        mirror.value.set_value(value.clone());
     }
 }
 
@@ -285,7 +286,7 @@ pub struct UpdateTrackingQueries<Q: DioxusQuerySync, F: QueryFilter> {
 impl<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static> Command
     for UpdateTrackingQueries<Q, F>
 {
-    fn apply(self, world: &mut World) -> () {
+    fn apply(self, world: &mut World) {
         let mut pending_delta = world.get_resource_or_init::<PendingQueryTrackingDeltas<Q, F>>();
         pending_delta.pending += self.delta;
     }
@@ -334,14 +335,14 @@ pub fn sync_query_mirror_to_signal<T: DioxusQuerySync + 'static, F: QueryFilter 
     if !init_status.initialized {
         // Expensive Without+Or filter is only paid on pre-init ticks.
         // Once init completes, this block is skipped.
-        if components_without_signals.count() <= 0 {
+        if components_without_signals.count() == 0 {
             let current_map = mirror_components
                 .iter()
                 .map(|item| (T::get_mirror_entity(&item), T::clone_dioxus_signals(&item)))
                 .collect::<HashMap<_, _>>();
             mirror_signal.0.set_value(MirrorQuery {
                 value: current_map,
-                _marker: PhantomData::default(),
+                _marker: PhantomData,
             });
             init_status.initialized = true;
 
@@ -459,9 +460,9 @@ impl<T: DioxusComponentSync> Default for RequestComponentsMirror<T> {
 }
 
 impl<T: DioxusComponentSync> Command for RequestComponentsMirror<T> {
-    fn apply(self, world: &mut World) -> () {
+    fn apply(self, world: &mut World)  {
         let mut mirrored_components =
-            world.get_resource_or_insert_with(|| MirroredComponents::default());
+            world.get_resource_or_insert_with(MirroredComponents::default);
         if !mirrored_components.0.contains(&TypeId::of::<T>()) {
             // Mark T as mirrored before adding systems so subsequent
             // requests for the same component type are no-ops.
@@ -487,7 +488,7 @@ pub struct RequestQueryMirror<T: DioxusQuerySync, F: QueryFilter + 'static> {
 }
 
 impl<T: DioxusQuerySync + 'static, F: QueryFilter> Command for RequestQueryMirror<T, F> {
-    fn apply(self, world: &mut World) -> () {
+    fn apply(self, world: &mut World) {
         let signal_to_send: QueuedSignal<MirrorQuery<T, F>> =
             match world.get_resource::<MirrorQuerySignal<T, F>>() {
                 Some(signal) => signal.0.clone(),
@@ -505,7 +506,7 @@ impl<T: DioxusQuerySync + 'static, F: QueryFilter> Command for RequestQueryMirro
                             sync_query_mirror_to_signal::<T, F>.run_if(resource_equals(
                                 MirrorQueryActive::<T, F> {
                                     active: true,
-                                    _phantom: || PhantomData::default(),
+                                    _phantom: || PhantomData,
                                 },
                             )),
                             drive_query_signal::<T, F>,
@@ -538,16 +539,16 @@ impl<T: DioxusQuerySync + 'static, F: QueryFilter> Command for RequestQueryMirro
                     world.insert_resource(MirrorQuerySignal(signal.clone()));
                     world.insert_resource(QueryMirrorInitialized::<T, F> {
                         initialized: false,
-                        _querydata: || PhantomData::default(),
-                        _filter: || PhantomData::default(),
+                        _querydata: || PhantomData,
+                        _filter: || PhantomData,
                     });
                     world.insert_resource(MirrorQueryActive::<T, F> {
                         active: false,
-                        _phantom: || PhantomData::default(),
+                        _phantom: || PhantomData,
                     });
                     world.insert_resource(MirrorQueryHandleCount::<T, F> {
                         count: 0,
-                        _phantom: || PhantomData::default(),
+                        _phantom: || PhantomData,
                     });
                     world.init_resource::<PendingQueryTrackingDeltas<T, F>>();
                     signal
@@ -763,7 +764,7 @@ impl<Q: MirrorQueryData, F: QueryFilter> Clone for MirrorQuery<Q, F> {
     fn clone(&self) -> Self {
         Self {
             value: self.value.clone(),
-            _marker: self._marker.clone(),
+            _marker: self._marker,
         }
     }
 }
@@ -824,14 +825,7 @@ pub struct MirrorQuerySignalHandle<Q: MirrorQueryData, F: QueryFilter> {
 }
 
 impl<Q: MirrorQueryData, F: QueryFilter> Clone for MirrorQuerySignalHandle<Q, F> {
-    fn clone(&self) -> Self {
-        Self {
-            signal: self.signal.clone(),
-            health: self.health.clone(),
-            writer: self.writer.clone(),
-            _filter: self._filter.clone(),
-        }
-    }
+    fn clone(&self) -> Self { *self }
 }
 
 impl<Q: MirrorQueryData, F: QueryFilter> Copy for MirrorQuerySignalHandle<Q, F> {}
@@ -924,7 +918,7 @@ pub fn use_bevy_query<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>()
                 Ok(signal) => {
                     signal
                         .state
-                        .forward_to(value_signal, health_signal, |arc| Ok(arc));
+                        .forward_to(value_signal, health_signal, Ok);
                     writer.set(Some(signal));
                 }
                 Err(err) => warn!("use_bevy_query: {}", err),
@@ -936,6 +930,6 @@ pub fn use_bevy_query<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>()
         signal: value_signal,
         health: health_signal,
         writer,
-        _filter: PhantomData::default(),
+        _filter: PhantomData,
     }
 }

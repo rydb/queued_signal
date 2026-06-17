@@ -72,19 +72,19 @@ impl Default for SignalTestsPlugin {
                 #[cfg(feature = "resource_tests")]
                 {
                     debug!("resource tests added");
-                    list.push(Box::new(ResourceTestsPlugin::default()));
+                    list.push(Box::new(ResourceTestsPlugin));
                 }
 
                 #[cfg(feature = "query_tests")]
                 {
                     debug!("query tests added");
-                    list.push(Box::new(QueryTestsPlugin::default()));
+                    list.push(Box::new(QueryTestsPlugin));
                 }
 
                 #[cfg(feature = "asset_tests")]
                 {
                     debug!("asset_tests added");
-                    list.push(Box::new(AssetTestPlugin::default()));
+                    list.push(Box::new(AssetTestPlugin));
                 }
                 list
             },

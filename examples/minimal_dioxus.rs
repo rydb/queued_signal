@@ -10,7 +10,7 @@ pub struct HelloWorld(pub String);
 pub struct Counter(pub i32);
 
 pub fn main() {
-    let hub = QueuedSignalHub::new();
+    let hub = QueuedSignalHub::default();
     hub.register(HelloWorld("Hello World".to_string()));
     hub.register(Counter(0));
 

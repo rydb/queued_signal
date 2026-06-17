@@ -97,10 +97,10 @@ impl CommandQueueSender {
         let cmd = make_command(response_tx);
         self.tx
             .send(cmd)
-            .map_err(|err| format!("{}, {}, {}", err.to_string(), file!(), line!()))?;
+            .map_err(|err| format!("{}, {}, {}", err, file!(), line!()))?;
         response_rx
             .recv_timeout(Duration::from_millis(10000))
-            .map_err(|err| format!("{}, {}, {}", err.to_string(), file!(), line!()))
+            .map_err(|err| format!("{}, {}, {}", err, file!(), line!()))
     }
 
     /// Async variant of [`send_command`]. Uses a oneshot channel so the caller can
@@ -117,7 +117,7 @@ impl CommandQueueSender {
 
         response_rx
             .await
-            .map_err(|_| format!("sender dropped before responding"))
+            .map_err(|err| format!("sender dropped before responding: {}", err))
     }
 }
 
