@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use dioxus::prelude::*;
-use queued_signal::signal::{QueuedSignalHub, use_queued_signal};
+use queued_signal::signal::{create_queued_signal_hub, use_queued_signal};
 
 #[derive(Clone, Debug)]
 pub struct HelloWorld(pub String);
@@ -10,11 +10,11 @@ pub struct HelloWorld(pub String);
 pub struct Counter(pub i32);
 
 pub fn main() {
-    let hub = QueuedSignalHub::default();
-    hub.register(HelloWorld("Hello World".to_string()));
-    hub.register(Counter(0));
+    let sender = create_queued_signal_hub();
+    sender.register(HelloWorld("Hello World".to_string()));
+    sender.register(Counter(0));
 
-    dioxus::LaunchBuilder::new().with_context(hub).launch(app);
+    dioxus::LaunchBuilder::new().with_context(sender).launch(app);
 }
 
 #[component]

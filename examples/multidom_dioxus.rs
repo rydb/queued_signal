@@ -6,7 +6,7 @@ use dioxus_core::VirtualDom;
 use dioxus_native::{DioxusDocument, DioxusNativeWindowRenderer, DocumentConfig, WindowAttributes};
 use parley::FontContext;
 use parley::fontique::Blob;
-use queued_signal::signal::{QueuedSignalHub, use_queued_signal};
+use queued_signal::signal::{create_queued_signal_hub, use_queued_signal};
 use std::time::Duration;
 use tracing_chrome::ChromeLayerBuilder;
 use tracing_subscriber::prelude::*;
@@ -155,9 +155,9 @@ pub fn setup() {
         .build();
     tracing_subscriber::registry().with(chrome_layer).init();
 
-    let hub = QueuedSignalHub::default();
-    hub.register(HelloWorld("Hello World".to_string()));
-    hub.register(Counter(0));
+    let sender = create_queued_signal_hub();
+    sender.register(HelloWorld("Hello World".to_string()));
+    sender.register(Counter(0));
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -191,7 +191,7 @@ pub fn setup() {
     let mut app = App::new(proxy);
 
     let mut vdom1 = VirtualDom::new_with_props(app_window_1, ());
-    vdom1.insert_any_root_context(Box::new(hub.clone()));
+    vdom1.insert_any_root_context(Box::new(sender.clone()));
     let mut doc1 = DioxusDocument::new(
         vdom1,
         DocumentConfig {
@@ -207,7 +207,7 @@ pub fn setup() {
     ));
 
     let mut vdom2 = VirtualDom::new_with_props(app_window_2, ());
-    vdom2.insert_any_root_context(Box::new(hub.clone()));
+    vdom2.insert_any_root_context(Box::new(sender.clone()));
     let mut doc2 = DioxusDocument::new(
         vdom2,
         DocumentConfig {

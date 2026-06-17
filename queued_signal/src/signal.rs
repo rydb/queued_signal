@@ -10,23 +10,25 @@ use std::{
 
 use dioxus::prelude::*;
 use dioxus_signals::Signal;
+use flume::{Receiver, Sender};
 use parking_lot::Mutex;
+use tokio::sync::oneshot;
 
 use crate::state::{HealthStatus, QueuedSignal, SignalReadGuard, WriterDriver};
 
-/// A thread-safe list of boxed ticker callbacks with no arguments.
-type TickerList = Arc<Mutex<Vec<Box<dyn FnMut() + Send>>>>;
-
-/// Error state for an uninitialized queued signal.
+/// Error state for a queued signal that has not yet resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueuedSignalNoneState {
-    /// The signal has been requested but the upstream provider hasn't registered it yet.
+    /// No registration call has been made for this type.
+    NotRegistered,
+    /// A request has been sent to the hub and the response is pending.
     Fetching,
 }
 
 impl From<QueuedSignalNoneState> for String {
     fn from(value: QueuedSignalNoneState) -> Self {
         match value {
+            QueuedSignalNoneState::NotRegistered => "Not Registered".into(),
             QueuedSignalNoneState::Fetching => "Fetching".into(),
         }
     }
@@ -34,9 +36,9 @@ impl From<QueuedSignalNoneState> for String {
 
 /// Handle to a globally registered queued signal.
 pub struct QueuedSignalHandle<T: Clone + Send + Sync + 'static> {
-    /// The current value (or `Err(Fetching)` if not yet registered).
+    /// Current value, or an error state if not yet resolved.
     pub value: Signal<Result<Arc<T>, QueuedSignalNoneState>>,
-    /// The health status of the underlying signal.
+    /// Health status of the underlying signal.
     pub health: Signal<HealthStatus>,
     writer: Signal<Option<QueuedSignal<T>>>,
 }
@@ -44,11 +46,13 @@ pub struct QueuedSignalHandle<T: Clone + Send + Sync + 'static> {
 impl<T: Clone + Send + Sync + 'static> Copy for QueuedSignalHandle<T> {}
 
 impl<T: Clone + Send + Sync + 'static> Clone for QueuedSignalHandle<T> {
-    fn clone(&self) -> Self { *self }
+    fn clone(&self) -> Self {
+        *self
+    }
 }
 
 impl<T: Clone + Send + Sync + 'static> QueuedSignalHandle<T> {
-    /// Relative mutation. Applied after all authoritative operations.
+    /// Enqueue a relative mutation, applied after all authoritative operations.
     pub fn mutate<F>(&self, f: F)
     where
         F: Fn(&mut T) + Send + Sync + 'static,
@@ -58,7 +62,7 @@ impl<T: Clone + Send + Sync + 'static> QueuedSignalHandle<T> {
         }
     }
 
-    /// Authoritative mutation (closure). May be overridden by a later [`set_value`](Self::set_value).
+    /// Enqueue an authoritative closure mutation.
     pub fn mutate_set<F>(&self, f: F)
     where
         F: Fn(&mut T) + Send + Sync + 'static,
@@ -68,14 +72,14 @@ impl<T: Clone + Send + Sync + 'static> QueuedSignalHandle<T> {
         }
     }
 
-    /// Authoritative full value replacement.
+    /// Enqueue an authoritative full value replacement.
     pub fn set_value(&self, value: T) {
         if let Some(w) = self.writer.read().as_ref() {
             w.set_value(value);
         }
     }
 
-    /// Returns the current [`HealthStatus`] of the underlying signal.
+    /// Current health status of the underlying signal.
     pub fn health(&self) -> HealthStatus {
         *self.health.read()
     }
@@ -85,7 +89,7 @@ impl<T: Clone + Send + Sync + 'static> QueuedSignalHandle<T> {
         SignalReadGuard::new(self.value.read())
     }
 
-    /// Read and map the `Ok` variant, or pass through the error.
+    /// Read the `Ok` variant, mapping the inner value through `f`.
     pub fn read_ok<U>(&self, f: impl FnOnce(&T) -> U) -> Result<U, QueuedSignalNoneState> {
         let guard = self.value.read();
         match &*guard {
@@ -95,66 +99,26 @@ impl<T: Clone + Send + Sync + 'static> QueuedSignalHandle<T> {
     }
 }
 
-/// Context hub for standalone queued signals.
-/// Register types and provide it via dioxus launch context.
-/// Components call [`use_queued_signal::<T>()`] to obtain a handle.
-pub struct QueuedSignalHub {
-    signals: Arc<Mutex<HashMap<TypeId, Box<dyn Any + Send>>>>,
-    tickers: TickerList,
-    shutdown: Arc<AtomicBool>,
+/// Type-erased command processed by the background hub.
+trait HubCommand: Send + 'static {
+    fn execute(self: Box<Self>, hub: &mut InnerHub);
 }
 
-impl Clone for QueuedSignalHub {
-    fn clone(&self) -> Self {
-        Self {
-            signals: self.signals.clone(),
-            tickers: self.tickers.clone(),
-            shutdown: self.shutdown.clone(),
+/// Command to register a new signal type with its initial value.
+struct RegisterCommand<T: Clone + Send + Sync + 'static> {
+    initial: T,
+}
+
+impl<T: Clone + Send + Sync + 'static> HubCommand for RegisterCommand<T> {
+    fn execute(self: Box<Self>, hub: &mut InnerHub) {
+        let this = *self;
+        let type_id = TypeId::of::<T>();
+
+        if hub.signals.contains_key(&type_id) {
+            return;
         }
-    }
-}
 
-
-
-impl Default for QueuedSignalHub {
-    /// Create a new hub and start the background tick thread.
-    ///
-    /// The tick thread runs at ~60 Hz and stops when the last clone of the hub
-    /// is dropped.
-    fn default() -> Self {
-        let tickers: TickerList = Arc::new(Mutex::new(Vec::new()));
-
-        let shutdown = Arc::new(AtomicBool::new(false));
-
-        let tickers_clone = tickers.clone();
-        let shutdown_clone = shutdown.clone();
-        std::thread::spawn(move || {
-            while !shutdown_clone.load(Ordering::Relaxed) {
-                {
-                    let mut guard = tickers_clone.lock();
-                    for ticker in guard.iter_mut() {
-                        ticker();
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(16));
-            }
-        });
-
-        Self {
-            signals: Arc::new(Mutex::new(HashMap::new())),
-            tickers,
-            shutdown,
-        }
-    }
-}
-
-impl QueuedSignalHub {
-    /// Register a queued signal with its initial value.
-    ///
-    /// Register a signal type with its initial value.
-    /// Must be called before the dioxus app launches.
-    pub fn register<T: Clone + Send + Sync + 'static>(&self, initial: T) {
-        let driver = WriterDriver::new(initial);
+        let driver = WriterDriver::new(this.initial);
         let set_value_tx = driver.set_value_tx.clone();
         let set_tx = driver.set_tx.clone();
         let add_tx = driver.add_tx.clone();
@@ -170,77 +134,176 @@ impl QueuedSignalHub {
             set_value_tx,
         );
 
-        self.signals
-            .lock()
-            .insert(TypeId::of::<T>(), Box::new(signal));
+        hub.signals.insert(type_id, Box::new(signal));
 
         let tick_driver = driver_arc;
-        self.tickers.lock().push(Box::new(move || {
+        hub.drivers.push(Box::new(move || {
             tick_driver.lock().tick(Duration::ZERO);
         }));
-    }
 
-    /// Retrieve a previously registered [`QueuedSignal`] by type.
-    pub(crate) fn get<T: Clone + Send + Sync + 'static>(&self) -> Option<QueuedSignal<T>> {
-        self.signals
-            .lock()
-            .get(&TypeId::of::<T>())
-            .and_then(|boxed| boxed.downcast_ref::<QueuedSignal<T>>())
-            .cloned()
-    }
-}
-
-impl Drop for QueuedSignalHub {
-    fn drop(&mut self) {
-        // The shutdown Arc starts with strong_count == 2:
-        //   1. self.shutdown (this hub field)
-        //   2. shutdown_clone (moved into the background ticker thread)
-        // When the last hub clone is dropped, only the thread's reference
-        // remains, so strong_count drops to 1 at that point.  We check for
-        // == 2 here because this method runs *before* the field is dropped,
-        // while both references still exist.
-        if Arc::strong_count(&self.shutdown) == 2 {
-            self.shutdown.store(true, Ordering::Release);
+        // Replay any requests that were parked while waiting for
+        // this registration. They will now find the signal.
+        if let Some(pending) = hub.pending.remove(&type_id) {
+            for cmd in pending {
+                cmd.execute(hub);
+            }
         }
     }
 }
 
-/// Hook to obtain a [`QueuedSignalHandle`] for a globally-registered type `T`.
-/// Returns a none-state if not initialized
+/// Command to request an existing signal from the hub.
+struct GetSignalCommand<T: Clone + Send + Sync + 'static> {
+    response: oneshot::Sender<QueuedSignal<T>>,
+}
+
+impl<T: Clone + Send + Sync + 'static> HubCommand for GetSignalCommand<T> {
+    fn execute(self: Box<Self>, hub: &mut InnerHub) {
+        let type_id = TypeId::of::<T>();
+
+        match hub.signals.get(&type_id) {
+            Some(boxed) => {
+                let signal = boxed
+                    .downcast_ref::<QueuedSignal<T>>()
+                    .expect("signal stored under TypeId::of::<T>() must be QueuedSignal<T>")
+                    .clone();
+                let _ = self.response.send(signal);
+            }
+            None => {
+                // Signal not registered yet. Park this request so it
+                // resolves when a RegisterCommand arrives for this type.
+                hub.pending.entry(type_id).or_default().push(self);
+            }
+        }
+    }
+}
+
+/// Lightweight handle for communicating with the background signal hub.
+///
+/// Provide this via dioxus context at launch. Components retrieve it
+/// through the context to request signal handles from the hub.
+#[derive(Clone)]
+pub struct QueuedSignalSender {
+    tx: Sender<Box<dyn HubCommand>>,
+}
+
+impl QueuedSignalSender {
+    /// Register a signal type with its initial value.
+    ///
+    /// Safe to call at any time. Components already waiting in a
+    /// fetching state will receive the signal once registration
+    /// completes.
+    pub fn register<T: Clone + Send + Sync + 'static>(&self, initial: T) {
+        let cmd = RegisterCommand { initial };
+        let _ = self.tx.send(Box::new(cmd));
+    }
+
+    /// Request a signal handle for type `T` from the hub.
+    ///
+    /// Returns a receiver that resolves when the signal is available.
+    /// If the type has not been registered yet the request is parked
+    /// and resolves when registration occurs.
+    pub(crate) fn request<T: Clone + Send + Sync + 'static>(
+        &self,
+    ) -> oneshot::Receiver<QueuedSignal<T>> {
+        let (tx, rx) = oneshot::channel();
+        let cmd = GetSignalCommand { response: tx };
+        let _ = self.tx.send(Box::new(cmd));
+        rx
+    }
+}
+
+/// Internal hub owning all registered signals and driver tickers.
+struct InnerHub {
+    signals: HashMap<TypeId, Box<dyn Any + Send>>,
+    drivers: Vec<Box<dyn FnMut() + Send>>,
+    requests: Receiver<Box<dyn HubCommand>>,
+    shutdown: Arc<AtomicBool>,
+    /// Requests parked until a matching registration arrives.
+    pending: HashMap<TypeId, Vec<Box<dyn HubCommand>>>,
+}
+
+/// Create a new queued signal hub running in a background thread.
+///
+/// Returns a [`QueuedSignalSender`] to place into the dioxus context.
+/// The hub thread stops when all sender clones are dropped and the
+/// channel closes.
+pub fn create_queued_signal_hub() -> QueuedSignalSender {
+    let (tx, rx) = flume::unbounded::<Box<dyn HubCommand>>();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_clone = shutdown.clone();
+
+    let weak_tx = tx.downgrade();
+    std::thread::spawn(move || {
+        let mut hub = InnerHub {
+            signals: HashMap::new(),
+            drivers: Vec::new(),
+            requests: rx,
+            shutdown: shutdown_clone,
+            pending: HashMap::new(),
+        };
+
+        while !hub.shutdown.load(Ordering::Relaxed) {
+            let pending: Vec<Box<dyn HubCommand>> = hub.requests.drain().collect();
+            for cmd in pending {
+                cmd.execute(&mut hub);
+            }
+
+            for ticker in &mut hub.drivers {
+                ticker();
+            }
+
+            if weak_tx.upgrade().is_none() {
+                hub.shutdown.store(true, Ordering::Release);
+                break;
+            }
+
+            std::thread::sleep(Duration::from_millis(16));
+        }
+    });
+
+    QueuedSignalSender { tx }
+}
+
+/// Hook to obtain a [`QueuedSignalHandle`] for type `T`.
+///
+/// Returns either the signal or a [`QueuedNoneState] until it exists
 ///
 /// # Panics
-/// Panics if no [`QueuedSignalHub`] was provided to the dioxus context.
+///
+/// Panics if no [`QueuedSignalSender`] was provided to the dioxus context.
 pub fn use_queued_signal<T: Clone + Send + Sync + 'static>() -> QueuedSignalHandle<T> {
-    let hub = use_context::<QueuedSignalHub>();
+    let sender = use_context::<QueuedSignalSender>();
 
-    match hub.get::<T>() {
-        Some(signal) => {
-            // Eagerly set the initial value so the first
-            // render shows the real data.
-            let (mut value_signal, health_signal) =
-                signal.use_hook(QueuedSignalNoneState::Fetching);
-            let current = signal.read().clone();
-            value_signal.set(Ok(current));
+    let mut value: Signal<Result<Arc<T>, QueuedSignalNoneState>> =
+        use_signal(|| Err(QueuedSignalNoneState::NotRegistered));
+    let health: Signal<HealthStatus> = use_signal(|| HealthStatus::Healthy);
+    let mut writer: Signal<Option<QueuedSignal<T>>> = use_signal(|| None);
 
-            let writer: Signal<Option<QueuedSignal<T>>> = use_signal(|| Some(signal));
+    let sender = sender.clone();
+    use_future(move || {
+        let sender = sender.clone();
+        async move {
+            value.set(Err(QueuedSignalNoneState::Fetching));
 
-            QueuedSignalHandle {
-                value: value_signal,
-                health: health_signal,
-                writer,
+            let rx = sender.request::<T>();
+            match rx.await {
+                Ok(signal) => {
+                    let current = signal.read().clone();
+                    value.set(Ok(current));
+
+                    signal.state.forward_to(value, health, Ok);
+                    writer.set(Some(signal));
+                }
+                Err(_) => {
+                    value.set(Err(QueuedSignalNoneState::NotRegistered));
+                }
             }
         }
-        None => {
-            let value: Signal<Result<Arc<T>, QueuedSignalNoneState>> =
-                use_signal(|| Err(QueuedSignalNoneState::Fetching));
-            let health: Signal<HealthStatus> = use_signal(|| HealthStatus::Healthy);
-            let writer: Signal<Option<QueuedSignal<T>>> = use_signal(|| None);
+    });
 
-            QueuedSignalHandle {
-                value,
-                health,
-                writer,
-            }
-        }
+    QueuedSignalHandle {
+        value,
+        health,
+        writer,
     }
 }
