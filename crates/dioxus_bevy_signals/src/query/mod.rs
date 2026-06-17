@@ -460,7 +460,7 @@ impl<T: DioxusComponentSync> Default for RequestComponentsMirror<T> {
 }
 
 impl<T: DioxusComponentSync> Command for RequestComponentsMirror<T> {
-    fn apply(self, world: &mut World)  {
+    fn apply(self, world: &mut World) {
         let mut mirrored_components =
             world.get_resource_or_insert_with(MirroredComponents::default);
         if !mirrored_components.0.contains(&TypeId::of::<T>()) {
@@ -825,7 +825,9 @@ pub struct MirrorQuerySignalHandle<Q: MirrorQueryData, F: QueryFilter> {
 }
 
 impl<Q: MirrorQueryData, F: QueryFilter> Clone for MirrorQuerySignalHandle<Q, F> {
-    fn clone(&self) -> Self { *self }
+    fn clone(&self) -> Self {
+        *self
+    }
 }
 
 impl<Q: MirrorQueryData, F: QueryFilter> Copy for MirrorQuerySignalHandle<Q, F> {}
@@ -916,9 +918,7 @@ pub fn use_bevy_query<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>()
                 .await
             {
                 Ok(signal) => {
-                    signal
-                        .state
-                        .forward_to(value_signal, health_signal, Ok);
+                    signal.state.forward_to(value_signal, health_signal, Ok);
                     writer.set(Some(signal));
                 }
                 Err(err) => warn!("use_bevy_query: {}", err),

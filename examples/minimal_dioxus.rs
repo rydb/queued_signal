@@ -14,7 +14,9 @@ pub fn main() {
     sender.register(HelloWorld("Hello World".to_string()));
     sender.register(Counter(0));
 
-    dioxus::LaunchBuilder::new().with_context(sender).launch(app);
+    dioxus::LaunchBuilder::new()
+        .with_context(sender)
+        .launch(app);
 }
 
 #[component]

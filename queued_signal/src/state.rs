@@ -39,9 +39,9 @@ pub struct ReaderRegistry {
 
 impl Default for ReaderRegistry {
     fn default() -> Self {
-        Self { 
-            readers: Mutex::new(HashMap::new()), 
-            next_id: AtomicU64::new(1) 
+        Self {
+            readers: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
         }
     }
 }

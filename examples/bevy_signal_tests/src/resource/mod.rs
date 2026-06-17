@@ -39,7 +39,6 @@ impl Plugin for CounterResourceTestPlugin {
 #[derive(Clone, Default)]
 pub struct ResourceTestsPlugin;
 
-
 impl Plugin for ResourceTestsPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(CounterResourceTestPlugin);

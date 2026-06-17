@@ -273,9 +273,7 @@ where
                     // static resources are available immediately.
                     let current = signal.read().clone();
                     value_signal.set(Ok(current));
-                    signal
-                        .state
-                        .forward_to(value_signal, health_signal, Ok);
+                    signal.state.forward_to(value_signal, health_signal, Ok);
                     writer.set(Some(signal));
                 }
                 Err(err) => warn!("use_bevy_resource: {}", err),

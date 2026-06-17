@@ -47,7 +47,9 @@ pub struct MirrorQuerySingleHandle<Q: MirrorQueryData, F: QueryFilter> {
 }
 
 impl<Q: MirrorQueryData, F: QueryFilter> Clone for MirrorQuerySingleHandle<Q, F> {
-    fn clone(&self) -> Self { *self }
+    fn clone(&self) -> Self {
+        *self
+    }
 }
 
 impl<Q: MirrorQueryData, F: QueryFilter> Copy for MirrorQuerySingleHandle<Q, F> {}

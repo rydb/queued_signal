@@ -169,32 +169,29 @@ pub fn init_requested_asset_mirrors<A: DioxusAssetSync>(
             continue;
         };
         let fetch = match asset_server.get_load_state(id) {
-            Some(state) => {
-                
-                match state {
-                    LoadState::NotLoaded => Err(AssetNoneState::NotLoaded),
-                    LoadState::Loading => Err(AssetNoneState::Loading),
-                    LoadState::Loaded => {
-                        let asset_opt = assets.get(id);
-                        match asset_opt {
-                            Some(asset) => Ok(asset.clone()),
-                            None => {
-                                error!(
-                                    "how was this asset marked as loaded without Assets<A> holding the asset? {}",
-                                    type_name::<A>()
-                                );
-                                Err(AssetNoneState::Error(
-                                    "asset marked as loaded, but Assets<A> didn't have the asset"
-                                        .into(),
-                                ))
-                            }
+            Some(state) => match state {
+                LoadState::NotLoaded => Err(AssetNoneState::NotLoaded),
+                LoadState::Loading => Err(AssetNoneState::Loading),
+                LoadState::Loaded => {
+                    let asset_opt = assets.get(id);
+                    match asset_opt {
+                        Some(asset) => Ok(asset.clone()),
+                        None => {
+                            error!(
+                                "how was this asset marked as loaded without Assets<A> holding the asset? {}",
+                                type_name::<A>()
+                            );
+                            Err(AssetNoneState::Error(
+                                "asset marked as loaded, but Assets<A> didn't have the asset"
+                                    .into(),
+                            ))
                         }
                     }
-                    LoadState::Failed(asset_load_error) => {
-                        Err(AssetNoneState::Error(asset_load_error.to_string()))
-                    }
                 }
-            }
+                LoadState::Failed(asset_load_error) => {
+                    Err(AssetNoneState::Error(asset_load_error.to_string()))
+                }
+            },
             // get_load_state returns None for procedurally-generated assets
             // (those added via Assets::add() rather than loaded through the
             // AssetServer). The asset may still exist in Assets<A> — check
@@ -244,9 +241,10 @@ pub fn sync_mirrors_to_assets<A: DioxusAssetSync>(
             continue;
         }
         if let Some(entry) = mirrors.assets.get(id)
-            && let Some(a) = assets.get(*id) {
-                entry.state.set_value(Ok(a.clone()));
-            }
+            && let Some(a) = assets.get(*id)
+        {
+            entry.state.set_value(Ok(a.clone()));
+        }
     }
 }
 
