@@ -1,13 +1,13 @@
+//! Implementation for [`Single<Q, F>`] mirror
+
 use std::marker::PhantomData;
 
 use bevy_ecs::{prelude::*, query::QueryFilter};
-use dioxus_hooks::{use_effect, use_memo, use_signal};
-use dioxus_signals::{Memo, ReadableExt, Signal, WritableExt};
+use dioxus_hooks::{use_memo, use_signal};
+use dioxus_signals::{ReadableExt, Signal, WritableExt};
 use queued_signal::state::{HealthStatus, QueuedSignal};
 
-use super::{
-    DioxusQuerySync, MirrorQuery, MirrorQueryData, QueryNoneState, SignalReadGuard, use_bevy_query,
-};
+use super::{DioxusQuerySync, MirrorQuery, MirrorQueryData, SignalReadGuard, use_bevy_query};
 
 /// Error when a single-entity query doesn't resolve to exactly one match.
 #[derive(Clone, Debug, PartialEq)]
@@ -17,7 +17,7 @@ pub enum SingleQueryError {
     /// The query matched zero entities.
     NoMatchingEntity,
     /// The query matched more than one entity. Contains all matching [`Entity`] IDs.
-    MoreThanOneEntity { entities: Vec<Entity> },
+    MoreThanOneEntity(Vec<Entity>),
     /// No upper bound found on the size hint for the query.
     NoUpperBound,
 }
@@ -27,7 +27,7 @@ impl From<SingleQueryError> for String {
         match value {
             SingleQueryError::NotInitialized => "Not initialized".into(),
             SingleQueryError::NoMatchingEntity => "No matching entities".into(),
-            SingleQueryError::MoreThanOneEntity { entities } => {
+            SingleQueryError::MoreThanOneEntity(entities) => {
                 format!("more than one matching entity: {:#?}", entities)
             }
             SingleQueryError::NoUpperBound => "No upper bound for query size found".into(),
@@ -60,10 +60,12 @@ impl<Q: MirrorQueryData, F: QueryFilter> Clone for MirrorQuerySingleHandle<Q, F>
 impl<Q: MirrorQueryData, F: QueryFilter> Copy for MirrorQuerySingleHandle<Q, F> {}
 
 impl<Q: MirrorQueryData + 'static, F: QueryFilter + 'static> MirrorQuerySingleHandle<Q, F> {
+    /// Aquires a read guard on the inner read value of the signal
     pub fn read(&self) -> SignalReadGuard<'_, Result<Q::MirrorItemHandles, SingleQueryError>> {
         SignalReadGuard::new(self.item.read())
     }
 
+    /// Combination of .read() + .map()
     pub fn read_ok<U>(
         &self,
         f: impl FnOnce(&Q::MirrorItemHandles) -> U,
@@ -110,7 +112,7 @@ pub fn use_bevy_single<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>()
                 }
                 _ => {
                     let entities: Vec<Entity> = mq.value.keys().copied().collect();
-                    Err(SingleQueryError::MoreThanOneEntity { entities })
+                    Err(SingleQueryError::MoreThanOneEntity(entities))
                 }
             },
         };

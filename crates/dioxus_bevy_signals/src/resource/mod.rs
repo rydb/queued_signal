@@ -5,7 +5,6 @@
 
 pub(crate) use crate::macros::*;
 use crate::schedules::{DioxusSyncPostUpdate, DioxusSyncUpdate};
-use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
 use bevy_ecs::world::CommandQueue;
 use dioxus::prelude::*;
@@ -38,13 +37,22 @@ pub enum ResourceNoneState {
     NotInitialized,
 }
 
-impl From<ResourceNoneState> for String {
-    fn from(value: ResourceNoneState) -> Self {
-        match value {
-            ResourceNoneState::NotInitialized => "Not Initialized".into(),
-        }
+impl Display for ResourceNoneState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            ResourceNoneState::NotInitialized => "Not Initialized",
+        };
+        write!(f, "{}", value)
     }
 }
+
+// impl From<ResourceNoneState> for String {
+//     fn from(value: ResourceNoneState) -> Self {
+//         match value {
+//             ResourceNoneState::NotInitialized => "Not Initialized".into(),
+//         }
+//     }
+// }
 
 /// Write driver for ticking resource signal updates.
 #[derive(Resource)]
@@ -172,7 +180,7 @@ impl<R: Clone + Send + Sync + 'static + Display> Display for ResourceMirrorSigna
             f,
             "{}",
             self.read_ok(|n| format!("{}", n))
-                .unwrap_or_else(|n| n.into())
+                .unwrap_or_else(|n| n.to_string())
         )
     }
 }
@@ -245,7 +253,7 @@ where
     let ctx = use_context::<CommandQueueSender>();
 
     let mut value_signal = use_signal(|| Err(ResourceNoneState::NotInitialized));
-    let mut health_signal = use_signal(|| HealthStatus::Healthy);
+    let health_signal = use_signal(|| HealthStatus::Healthy);
     let mut writer: Signal<Option<QueuedSignal<T>>> = use_signal(|| None);
 
     let ctx_clone = ctx.clone();

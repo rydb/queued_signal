@@ -17,7 +17,7 @@ pub(crate) use crate::macros::*;
 use crate::schedules::{DioxusSyncLast, DioxusSyncPostUpdate, DioxusSyncUpdate};
 use bevy_asset::{Asset, AssetEvent, AssetId, AssetServer, Assets, LoadState};
 use bevy_ecs::{prelude::*, world::CommandQueue};
-use dioxus_core::{spawn, use_drop, use_hook};
+use dioxus_core::{spawn, use_drop};
 use dioxus_hooks::{use_context, use_effect, use_signal};
 use dioxus_signals::{Memo, ReadableExt, Signal, WritableExt};
 use flume::{Receiver, Sender};
@@ -67,8 +67,8 @@ pub enum AssetNoneState {
     Error(String),
 }
 
-impl AssetNoneState {
-    pub fn as_string(&self) -> String {
+impl Display for AssetNoneState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let value = match self {
             AssetNoneState::Loading => "Loading",
             AssetNoneState::NonAsset => "NonAsset",
@@ -76,13 +76,7 @@ impl AssetNoneState {
             AssetNoneState::NotLoaded => "NotLoaded",
             AssetNoneState::Fetching => "Fetching",
         };
-        value.into()
-    }
-}
-
-impl From<AssetNoneState> for String {
-    fn from(value: AssetNoneState) -> Self {
-        value.as_string()
+        write!(f, "{}", value)
     }
 }
 
@@ -97,9 +91,8 @@ pub struct AssetUpdateExtraInfo<A: DioxusAssetSync> {
 /// Dioxus hooks cannot conditionally exist, so this returns either
 /// the asset or a none-state when the asset is unavailable.
 pub struct AssetMaybeMirror<A: DioxusAssetSync> {
-    pub state: QueuedSignal<Result<A, AssetNoneState>>,
-    /// Extra metadata needed for updating assets.
-    pub extra_update_info: QueuedSignal<AssetUpdateExtraInfo<A>>,
+    state: QueuedSignal<Result<A, AssetNoneState>>,
+    extra_update_info: QueuedSignal<AssetUpdateExtraInfo<A>>,
     state_driver: Arc<Mutex<WriterDriver<Result<A, AssetNoneState>>>>,
     extra_update_info_driver: Arc<Mutex<WriterDriver<AssetUpdateExtraInfo<A>>>>,
     /// Number of signals actively reading this asset mirror.
@@ -225,7 +218,7 @@ pub fn init_requested_asset_mirrors<A: DioxusAssetSync>(
             id,
             match &fetch {
                 Ok(_) => "Ok(asset)".to_string(),
-                Err(e) => e.as_string(),
+                Err(e) => e.to_string(),
             }
         );
         entry.state.set_value(fetch);
@@ -527,6 +520,7 @@ pub struct AssetMaybeMirrorSignal<A: DioxusAssetSync> {
 impl<A: DioxusAssetSync> Copy for AssetMaybeMirrorSignal<A> {}
 
 impl<A: DioxusAssetSync> AssetMaybeMirrorSignal<A> {
+    /// Enqueues a relative mutation
     pub fn mutate<F>(&self, f: F)
     where
         F: Fn(&mut A) + Send + Sync + 'static,
@@ -558,6 +552,7 @@ impl<A: DioxusAssetSync> AssetMaybeMirrorSignal<A> {
     pub fn read(&self) -> SignalReadGuard<'_, Arc<Result<A, AssetNoneState>>> {
         SignalReadGuard::new(self.value.read())
     }
+    /// Returns signal health
     pub fn health(&self) -> HealthStatus {
         *self.health.read()
     }
@@ -572,7 +567,7 @@ impl<A: DioxusAssetSync> AssetMaybeMirrorSignal<A> {
     }
 }
 
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
 
 /// Returns immediately with a `Fetching` state.
 /// The real mirror is fetched asynchronously once the
@@ -585,7 +580,7 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
 
     // Value/health signals start in Fetching state — same as before.
     let mut asset_value_signal = use_signal(|| Arc::new(Err(AssetNoneState::Fetching)));
-    let mut health_signal = use_signal(|| HealthStatus::Healthy);
+    let health_signal = use_signal(|| HealthStatus::Healthy);
     let mut extra_info_signal: Signal<Result<Arc<AssetUpdateExtraInfo<A>>, AssetNoneState>> =
         use_signal(|| Err(AssetNoneState::Fetching));
     let mut writer_signal: Signal<Option<QueuedSignal<Result<A, AssetNoneState>>>> =

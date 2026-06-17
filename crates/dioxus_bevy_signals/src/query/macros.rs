@@ -209,6 +209,8 @@ macro_rules! impl_mirror_query_data {
                 let v1 = $second.version.load(std::sync::atomic::Ordering::Relaxed);
                 let v2 = $third.version.load(std::sync::atomic::Ordering::Relaxed);
                 // Combine via XOR and rotate to avoid collisions between version tuples.
+                // rust-analyzer complains about this being mut without unused_mut?
+                #[allow(unused_mut)]
                 let mut combined = v0 ^ v1.rotate_left(21) ^ v2.rotate_left(42);
                 $(
                     let v = $rest.version.load(std::sync::atomic::Ordering::Relaxed);

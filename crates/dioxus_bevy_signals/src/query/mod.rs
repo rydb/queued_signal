@@ -19,14 +19,14 @@ pub(crate) use crate::macros::*;
 mod macros;
 pub mod single;
 
-use crate::schedules::{DioxusSyncLast, DioxusSyncPostUpdate, DioxusSyncUpdate};
+use crate::schedules::{DioxusSyncLast, DioxusSyncPostUpdate};
 use bevy_ecs::{
     component::Mutable,
     prelude::*,
     query::{QueryData, QueryFilter},
     world::CommandQueue,
 };
-use dioxus_core::{use_drop, use_hook};
+use dioxus_core::use_drop;
 use dioxus_hooks::{use_context, use_effect, use_future, use_signal};
 use dioxus_signals::{ReadableExt, Signal, WritableExt};
 use parking_lot::Mutex;
@@ -46,6 +46,7 @@ trait_set! {
 /// Error state for an uninitialized query signal.
 #[derive(Clone, Debug)]
 pub enum QueryNoneState {
+    /// Query not yet initialized down stream
     NotInitialized,
 }
 
@@ -904,8 +905,8 @@ pub fn use_bevy_query<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>()
         let _ = r.tx.send(queue);
     });
 
-    let mut value_signal = use_signal(|| Err(QueryNoneState::NotInitialized));
-    let mut health_signal = use_signal(|| HealthStatus::Healthy);
+    let value_signal = use_signal(|| Err(QueryNoneState::NotInitialized));
+    let health_signal = use_signal(|| HealthStatus::Healthy);
     let mut writer: Signal<Option<QueuedSignal<MirrorQuery<Q, F>>>> = use_signal(|| None);
 
     let ctx2 = ctx.clone();

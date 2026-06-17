@@ -1,9 +1,9 @@
 #![warn(missing_docs)]
 //! Crate for mirroring bevy state to and from dioxus using QueuedSignals.
 
-use std::{any::type_name_of_val, sync::Arc, time::Duration};
+use std::{any::type_name_of_val, time::Duration};
 
-use bevy_app::{ScheduleRunnerPlugin, prelude::*};
+use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
 use bevy_ecs::{
     schedule::{IntoScheduleConfigs, Schedule, ScheduleLabel, Schedules},
@@ -16,7 +16,7 @@ use flume::{Receiver, Sender, unbounded};
 use tokio::sync::oneshot;
 
 pub(crate) mod macros;
-pub(crate) use crate::macros::{debug, error, info, trace, warn};
+pub(crate) use crate::macros::warn;
 
 /// Fixed-timestep schedules for dioxus-bevy synchronization.
 pub mod schedules;
