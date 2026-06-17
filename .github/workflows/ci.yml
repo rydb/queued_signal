@@ -16,8 +16,6 @@ jobs:
           extra-conf: |
             experimental-features = nix-command flakes
 
-      - uses: DeterminateSystems/magic-nix-cache-action@main
-
       - name: Cache Cargo deps
         uses: actions/cache@v4
         with:

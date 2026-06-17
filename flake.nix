@@ -1,22 +1,17 @@
 {
-  description = "queued_signal — Dioxus signal with wait-free reads and queued writes";
+  description = "project flake";
 
   inputs = {
-    nixpkgs.url      = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url      = "github:NixOS/nixpkgs/nixpkgs-unstable";
     rust-overlay.url = "github:oxalica/rust-overlay";
     flake-utils.url  = "github:numtide/flake-utils";
-    wild = {
-      url = "github:wild-linker/wild";
-      flake = false;
-    };
   };
 
-  outputs = { self, nixpkgs, rust-overlay, flake-utils, wild, ... }:
+  outputs = { self, nixpkgs, rust-overlay, flake-utils, ... }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         overlays = [
           (import rust-overlay)
-          (import wild)
         ];
 
         pkgs = import nixpkgs { inherit system overlays; };
@@ -29,34 +24,40 @@
         wildStdenv = pkgs.useWildLinker pkgs.stdenv;
         mkShellWild = pkgs.mkShell.override { stdenv = wildStdenv; };
 
+        commonBuildInputs = with pkgs; [
+          rustStable
+          gcc
+          systemd
+          alsa-lib
+          pkg-config
+          binutils
+          gnumake
+          openssl
+          glib
+          pango
+          gdk-pixbuf
+          cairo
+          atk
+          gtk3
+          webkitgtk_4_1
+          zlib
+          libxkbcommon
+          vulkan-loader
+          wayland
+        ];
+
+        commonRpath = lib.makeLibraryPath (with pkgs; [
+          libxkbcommon
+          vulkan-loader
+          wayland
+        ]);
+
       in
       with pkgs;
       {
         devShells.default = mkShellWild {
-          buildInputs = [
-            rustStable
-            gcc
-            systemd
-            alsa-lib
-            pkg-config
-            binutils
-            gnumake
-            openssl
-            glib
-            pango
-            gdk-pixbuf
-            cairo
-            atk
-            gtk3
-            webkitgtk_4_1
-            xdotool
-            zlib
-            python3
-            libxkbcommon
-            vulkan-loader
-            wayland
-          ];
-          env.RUSTFLAGS = "-C link-arg=-Wl,-rpath,${lib.makeLibraryPath (with pkgs; [ libxkbcommon vulkan-loader wayland ])}";
+          buildInputs = commonBuildInputs ++ [ xdotool python3 ];
+          env.RUSTFLAGS = "-C link-arg=-Wl,-rpath,${commonRpath}";
         };
       }
     ) // {
