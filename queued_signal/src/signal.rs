@@ -177,10 +177,7 @@ impl<T: Clone + Send + Sync + 'static> HubCommand for GetSignalCommand<T> {
     }
 }
 
-/// Lightweight handle for communicating with the background signal hub.
-///
-/// Provide this via dioxus context at launch. Components retrieve it
-/// through the context to request signal handles from the hub.
+/// Handle for communicating with the background signal hub.
 #[derive(Clone)]
 pub struct QueuedSignalSender {
     tx: Sender<Box<dyn HubCommand>>,
@@ -188,20 +185,12 @@ pub struct QueuedSignalSender {
 
 impl QueuedSignalSender {
     /// Register a signal type with its initial value.
-    ///
-    /// Safe to call at any time. Components already waiting in a
-    /// fetching state will receive the signal once registration
-    /// completes.
     pub fn register<T: Clone + Send + Sync + 'static>(&self, initial: T) {
         let cmd = RegisterCommand { initial };
         let _ = self.tx.send(Box::new(cmd));
     }
 
     /// Request a signal handle for type `T` from the hub.
-    ///
-    /// Returns a receiver that resolves when the signal is available.
-    /// If the type has not been registered yet the request is parked
-    /// and resolves when registration occurs.
     pub(crate) fn request<T: Clone + Send + Sync + 'static>(
         &self,
     ) -> oneshot::Receiver<QueuedSignal<T>> {
@@ -223,10 +212,6 @@ struct InnerHub {
 }
 
 /// Create a new queued signal hub running in a background thread.
-///
-/// Returns a [`QueuedSignalSender`] to place into the dioxus context.
-/// The hub thread stops when all sender clones are dropped and the
-/// channel closes.
 pub fn create_queued_signal_hub() -> QueuedSignalSender {
     let (tx, rx) = flume::unbounded::<Box<dyn HubCommand>>();
     let shutdown = Arc::new(AtomicBool::new(false));
