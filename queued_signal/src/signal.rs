@@ -1,6 +1,7 @@
 use std::{
     any::{Any, TypeId},
     collections::HashMap,
+    fmt::Display,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -41,6 +42,17 @@ pub struct QueuedSignalHandle<T: Clone + Send + Sync + 'static> {
     /// Health status of the underlying signal.
     pub health: Signal<HealthStatus>,
     writer: Signal<Option<QueuedSignal<T>>>,
+}
+
+impl<T: Clone + Send + Sync + Display + 'static> Display for QueuedSignalHandle<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            self.read_ok(|n| format!("{n}"))
+                .unwrap_or_else(|err| err.into())
+        )
+    }
 }
 
 impl<T: Clone + Send + Sync + 'static> Copy for QueuedSignalHandle<T> {}

@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{fmt::Display, time::Duration};
 
 use dioxus::prelude::*;
 use queued_signal::signal::{create_queued_signal_hub, use_queued_signal};
@@ -6,8 +6,20 @@ use queued_signal::signal::{create_queued_signal_hub, use_queued_signal};
 #[derive(Clone, Debug)]
 pub struct HelloWorld(pub String);
 
+impl Display for HelloWorld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Counter(pub i32);
+
+impl Display for Counter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 pub fn main() {
     let sender = create_queued_signal_hub();
@@ -24,18 +36,6 @@ pub fn app() -> Element {
     let hello = use_queued_signal::<HelloWorld>();
     let counter = use_queued_signal::<Counter>();
 
-    let hello_text = use_memo(move || {
-        hello
-            .read_ok(|h| h.0.clone())
-            .unwrap_or_else(|err| err.into())
-    });
-
-    let counter_text = use_memo(move || {
-        counter
-            .read_ok(|c| c.0.to_string())
-            .unwrap_or_else(|err| err.into())
-    });
-
     let health_text = use_memo(move || format!("{:?}", counter.health()));
 
     use_future(move || async move {
@@ -48,8 +48,8 @@ pub fn app() -> Element {
     rsx! {
         document::Stylesheet { href: asset!("assets/ui.css") }
         div {
-            h1 { "{hello_text}" }
-            h2 { "Counter: {counter_text}" }
+            h1 { "{hello}" }
+            h2 { "Counter: {counter}" }
             p { "Health: {health_text}" }
             button {
                 onclick: move |_| counter.mutate(|n| n.0 += 10),
