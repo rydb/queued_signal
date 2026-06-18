@@ -14,7 +14,7 @@ pub use std::{
 };
 
 pub(crate) use crate::macros::*;
-use crate::schedules::{DioxusSyncLast, DioxusSyncPostUpdate, DioxusSyncUpdate};
+use crate::schedules::{DioxusSyncLast, DioxusSyncPostUpdate, DioxusSyncPreUpdate, DioxusSyncUpdate};
 use bevy_asset::{Asset, AssetEvent, AssetId, AssetServer, Assets, LoadState};
 use bevy_ecs::{prelude::*, world::CommandQueue};
 use dioxus_core::{spawn, use_drop};
@@ -335,7 +335,7 @@ impl<A: DioxusAssetSync> Command for RequestBevyAssetMirror<A> {
                     DioxusSyncPostUpdate,
                     init_requested_asset_mirrors::<A>,
                 );
-                add_systems_through_world(world, DioxusSyncPostUpdate, sync_mirrors_to_assets::<A>);
+                add_systems_through_world(world, DioxusSyncPreUpdate, sync_mirrors_to_assets::<A>);
                 add_systems_through_world(
                     world,
                     DioxusSyncPostUpdate,

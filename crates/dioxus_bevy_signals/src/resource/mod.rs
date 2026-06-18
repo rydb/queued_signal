@@ -4,7 +4,7 @@
 //! of bevy resources, with automatic bidirectional synchronization.
 
 pub(crate) use crate::macros::*;
-use crate::schedules::{DioxusSyncPostUpdate, DioxusSyncUpdate};
+use crate::schedules::{DioxusSyncPreUpdate, DioxusSyncPostUpdate, DioxusSyncUpdate};
 use bevy_ecs::prelude::*;
 use bevy_ecs::world::CommandQueue;
 use dioxus::prelude::*;
@@ -31,7 +31,7 @@ trait_set! {
 }
 
 /// Error state for a resource signal that hasn't been initialized yet.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ResourceNoneState {
     /// The resource mirror has not been requested from bevy yet.
     NotInitialized,
@@ -107,10 +107,9 @@ impl<T: ResourceDioxusSync> Command for RequestBevyResource<T> {
                 world.insert_resource(ResourceWriteDriver(driver_arc));
 
                 add_systems_through_world(world, DioxusSyncUpdate, drive_signal::<T>);
-                // Also add the authoritative sync system, but **after** command processing.
                 add_systems_through_world(
                     world,
-                    DioxusSyncPostUpdate,
+                    DioxusSyncPreUpdate,
                     sync_mirror_to_resource::<T>.run_if(resource_changed::<T>),
                 );
                 add_systems_through_world(

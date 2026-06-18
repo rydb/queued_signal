@@ -44,7 +44,7 @@ trait_set! {
 }
 
 /// Error state for an uninitialized query signal.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum QueryNoneState {
     /// Query not yet initialized down stream
     NotInitialized,
@@ -472,9 +472,9 @@ impl<T: DioxusComponentSync> Command for RequestComponentsMirror<T> {
                 world,
                 DioxusSyncPostUpdate,
                 (
-                    sync_component_to_mirror::<T>,
                     sync_mirror_to_component::<T>,
                     drive_component_signals::<T>,
+                    sync_component_to_mirror::<T>,
                     delete_unused_mirrors::<T>,
                 )
                     .chain(),
