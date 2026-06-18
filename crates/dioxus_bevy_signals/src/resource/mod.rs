@@ -4,7 +4,7 @@
 //! of bevy resources, with automatic bidirectional synchronization.
 
 pub(crate) use crate::macros::*;
-use crate::schedules::{DioxusSyncPreUpdate, DioxusSyncPostUpdate, DioxusSyncUpdate};
+use crate::schedules::{DioxusSyncPostUpdate, DioxusSyncPreUpdate, DioxusSyncUpdate};
 use bevy_ecs::prelude::*;
 use bevy_ecs::world::CommandQueue;
 use dioxus::prelude::*;

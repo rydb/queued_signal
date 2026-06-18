@@ -14,7 +14,9 @@ pub use std::{
 };
 
 pub(crate) use crate::macros::*;
-use crate::schedules::{DioxusSyncLast, DioxusSyncPostUpdate, DioxusSyncPreUpdate, DioxusSyncUpdate};
+use crate::schedules::{
+    DioxusSyncLast, DioxusSyncPostUpdate, DioxusSyncPreUpdate, DioxusSyncUpdate,
+};
 use bevy_asset::{Asset, AssetEvent, AssetId, AssetServer, Assets, LoadState};
 use bevy_ecs::{prelude::*, world::CommandQueue};
 use dioxus_core::{spawn, use_drop};
