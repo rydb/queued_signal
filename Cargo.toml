@@ -1,10 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["./crates/*", "examples", "queued_signal"]
+members = ["./crates/*", "examples", "queued_signal", "crates/queued_signal_tracing"]
 
 
 [workspace.dependencies]
 dioxus_bevy_signals = {path = "crates/dioxus_bevy_signals", default-features = false}
+queued_signal_tracing = { path = "crates/queued_signal_tracing" }
 
 dioxus = {version = "0.7.4", default-features = false}
 dioxus-core = {version = "0.7.4"}

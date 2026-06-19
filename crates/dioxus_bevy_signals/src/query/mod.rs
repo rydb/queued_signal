@@ -15,9 +15,10 @@ use std::{
     time::Duration,
 };
 
-pub(crate) use crate::macros::*;
 mod macros;
 pub mod single;
+
+use crate::macros::*;
 
 use crate::schedules::{DioxusSyncLast, DioxusSyncPostUpdate};
 use bevy_ecs::{

@@ -22,8 +22,7 @@ left-right = {workspace = true}
 parking_lot = {workspace = true}
 anyhow = {workspace = true}
 macro-v = {workspace = true}
-tracing = {workspace = true, optional = true}
-
+queued_signal_tracing = { workspace = true }
 
 [features]
-trace = ["tracing"]
+trace = ["queued_signal_tracing/trace"]

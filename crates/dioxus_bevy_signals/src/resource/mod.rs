@@ -3,7 +3,6 @@
 //! Provides [`use_bevy_resource`] to create dioxus-side signal mirrors
 //! of bevy resources, with automatic bidirectional synchronization.
 
-pub(crate) use crate::macros::*;
 use crate::schedules::{DioxusSyncPostUpdate, DioxusSyncPreUpdate, DioxusSyncUpdate};
 use bevy_ecs::prelude::*;
 use bevy_ecs::world::CommandQueue;
@@ -19,6 +18,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
 use trait_set::trait_set;
+
+use crate::macros::*;
 
 use crate::{CommandQueueSender, add_systems_through_world};
 

@@ -1,0 +1,14 @@
+[package]
+name = "queued_signal_tracing"
+version = "0.1.0"
+edition = "2024"
+description = "Conditional tracing macros shared across the queued_signal workspace"
+repository = "https://github.com/rydb/queued_signal"
+license = "Apache-2.0"
+
+[dependencies]
+tracing = { workspace = true, optional = true }
+macro-v = { workspace = true }
+
+[features]
+trace = ["dep:tracing"]

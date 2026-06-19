@@ -24,13 +24,12 @@ flume = {workspace = true}
 tokio = {workspace = true}
 queued_signal = {workspace = true}
 trait-set = {workspace = true}
-bevy_log = {workspace = true, optional = true}
-macro-v = {workspace = true}
+queued_signal_tracing = { workspace = true}
 variadics_please = {workspace = true}
 
 [features]
 asset = []
 query = []
 resource = []
-tracing = ["bevy_log"]
+trace = ["queued_signal_tracing/trace"]
 default = ["asset", "query", "resource"]

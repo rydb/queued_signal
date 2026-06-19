@@ -27,8 +27,8 @@ tracing-chrome = {workspace = true}
 sysinfo = "0.39.3"
 
 [features]
-tracing = ["dioxus_bevy_signals/tracing"]
-resource_tests = ["dioxus_bevy_signals/resource", "tracing"]
-query_tests = ["dioxus_bevy_signals/query", "tracing"]
-asset_tests = ["dioxus_bevy_signals/asset", "dioxus_bevy_signals/query", "tracing"]
+trace = ["dioxus_bevy_signals/trace"]
+resource_tests = ["dioxus_bevy_signals/resource", "trace"]
+query_tests = ["dioxus_bevy_signals/query", "trace"]
+asset_tests = ["dioxus_bevy_signals/asset", "dioxus_bevy_signals/query", "trace"]
 default = ["resource_tests", "query_tests", "asset_tests"]

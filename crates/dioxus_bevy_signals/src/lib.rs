@@ -15,8 +15,8 @@ use dioxus_signals::Signal;
 use flume::{Receiver, Sender, unbounded};
 use tokio::sync::oneshot;
 
-pub(crate) mod macros;
-pub(crate) use crate::macros::warn;
+/// tracing for library
+pub mod macros;
 
 /// Fixed-timestep schedules for dioxus-bevy synchronization.
 pub mod schedules;
@@ -206,7 +206,7 @@ macro_rules! push_and_send {
         let mut q = CommandQueue::default();
         let tx = $signal.command_queue_sender.clone();
         $( q.push($cmd); )*
-        let _ = tx.read().tx.send(q).inspect_err(|err| println!("couldn't send command_queue to bevy {}", err));
+        let _ = tx.read().tx.send(q).inspect_err(|err| $crate::macros::warn!("couldn't send command_queue to bevy {}", err));
     }};
 }
 
