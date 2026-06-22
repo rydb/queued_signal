@@ -257,7 +257,7 @@ pub fn sync_assets_to_mirrors<A: DioxusAssetSync>(
     mirrors: Res<AssetMirrorMap<A>>,
 ) {
     for id in &changed.0 {
-        let Some(asset) = assets.get_mut(*id) else {
+        let Some(mut asset) = assets.get_mut(*id) else {
             continue;
         };
         let Some(handle) = mirrors.assets.get(id) else {
@@ -318,6 +318,8 @@ pub struct RequestBevyAssetMirror<A: DioxusAssetSync> {
 }
 
 impl<A: DioxusAssetSync> Command for RequestBevyAssetMirror<A> {
+    type Out = ();
+
     fn apply(self, world: &mut World) {
         match world.get_resource::<AssetSyncInitialized<A>>() {
             Some(_) => {}
@@ -494,6 +496,8 @@ pub struct UpdateTrackingAssets<A: DioxusAssetSync> {
 }
 
 impl<A: DioxusAssetSync> Command for UpdateTrackingAssets<A> {
+    type Out = ();
+
     fn apply(self, world: &mut World) {
         let mut pending_delta = world.get_resource_or_init::<PendingAssetTrackingDeltas<A>>();
         pending_delta.pending.push((self.asset_id, self.delta));

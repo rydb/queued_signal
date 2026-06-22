@@ -40,6 +40,8 @@ pub struct ToggleTestMarker;
 pub struct AddTenNames;
 
 impl Command for AddTenNames {
+    type Out = ();
+
     fn apply(self, world: &mut World) {
         world
             .commands()
@@ -79,6 +81,8 @@ impl Command for AddTenNames {
 pub struct RemoveNames;
 
 impl Command for RemoveNames {
+    type Out = ();
+
     fn apply(self, world: &mut World) {
         let mut names = world.query::<(Entity, &Name, &Greets)>();
 

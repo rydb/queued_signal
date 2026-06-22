@@ -7,28 +7,30 @@ members = ["./crates/*", "examples", "queued_signal", "crates/queued_signal_trac
 dioxus_bevy_signals = {path = "crates/dioxus_bevy_signals", default-features = false}
 queued_signal_tracing = { path = "crates/queued_signal_tracing" }
 
-dioxus = {version = "0.7.4", default-features = false}
-dioxus-core = {version = "0.7.4"}
-dioxus-signals = {version = "0.7.4"}
-dioxus-document = {version = "0.7.4"}
-dioxus-hooks = {version = "0.7.4"}
-generational-box = {version = "0.7.4"}
-dioxus-html = {version = "0.7.4"}
+dioxus = {git = "https://github.com/DioxusLabs/dioxus", rev = "b00ff7525901984f3a07fa5cfa175b537b64630b", default-features = false}
+dioxus-core = {git = "https://github.com/DioxusLabs/dioxus", rev = "b00ff7525901984f3a07fa5cfa175b537b64630b"}
+dioxus-signals = {git = "https://github.com/DioxusLabs/dioxus", rev = "b00ff7525901984f3a07fa5cfa175b537b64630b"}
+dioxus-document = {git = "https://github.com/DioxusLabs/dioxus", rev = "b00ff7525901984f3a07fa5cfa175b537b64630b"}
+dioxus-hooks = {git = "https://github.com/DioxusLabs/dioxus", rev = "b00ff7525901984f3a07fa5cfa175b537b64630b"}
+dioxus-native = {git = "https://github.com/DioxusLabs/dioxus", rev = "b00ff7525901984f3a07fa5cfa175b537b64630b"}
+dioxus-history = {git = "https://github.com/DioxusLabs/dioxus", rev = "b00ff7525901984f3a07fa5cfa175b537b64630b"}
+generational-box = {git = "https://github.com/DioxusLabs/dioxus", rev = "b00ff7525901984f3a07fa5cfa175b537b64630b"}
+dioxus-html = {git = "https://github.com/DioxusLabs/dioxus", rev = "b00ff7525901984f3a07fa5cfa175b537b64630b"}
 flume = {version = "0.12"}
 anyhow = "1"
 tokio = "1.51"
 parking_lot = "0.12.5"
 # flashmap = "0.2"
-bevy_ecs = {version = "0.17"}
-bevy_app = {version = "0.17"}
-bevy_asset = {version = "0.17"}
-bevy_color = {version = "0.17"}
-bevy_pbr = {version = "0.17"}
-bevy_transform = {version = "0.17"}
-bevy_time = {version = "0.17"}
-bevy_log = {version = "0.17"}
+bevy_ecs = {version = "0.19"}
+bevy_app = {version = "0.19"}
+bevy_asset = {version = "0.19"}
+bevy_color = {version = "0.19"}
+bevy_pbr = {version = "0.19"}
+bevy_transform = {version = "0.19"}
+bevy_time = {version = "0.19"}
+bevy_log = {version = "0.19"}
 tracing = { version = "0.1", default-features = false, features = ["std"] }
-glam = {version = "0.30"}
+glam = {version = "0.32"}
 trait-set = {version = "0.3"}
 bytemuck = {version = "1.25", features = ["derive"]}
 variadics_please = "1.1.0"
@@ -36,10 +38,12 @@ queued_signal = {path = "./queued_signal"}
 left-right = "0.11.7"
 cfg-if = "1.0"
 macro-v = "0.1.4"
-dioxus-native = "0.7"
-blitz-shell = "0.2"
-winit = "0.30"
-parley = { version = "0.6", features = ["std"] }
+
+blitz-shell = { version = "=0.3.0-alpha.4", default-features = false }
+blitz-traits = { version = "0.3.0-alpha.4", default-features = false }
+
+winit = "0.31.0-beta.2"
+parley = { version = "0.9", features = ["std"] }
 tracing-subscriber = "0.3"
 tracing-chrome = "0.7"
 

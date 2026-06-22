@@ -13,7 +13,11 @@ queued_signal = {workspace = true}
 [dev-dependencies]
 dioxus-native = {workspace = true, features = ["system-fonts"]}
 dioxus = {workspace = true, features = ["asset", "desktop", "launch", "devtools", "document", "html"]}
+dioxus-history = {workspace = true}
+dioxus-document = {workspace = true}
+queued_signal_tracing = {workspace = true}
 blitz-shell = {workspace = true}
+blitz-traits = {workspace = true}
 winit = {workspace = true}
 parley = {workspace = true}
 tracing-chrome = {workspace = true}
@@ -47,3 +51,4 @@ path = "minimal_dioxus.rs"
 resource_example = ["bevy_signal_tests/resource_tests"]
 query_example = ["bevy_signal_tests/query_tests"]
 asset_example = ["bevy_signal_tests/asset_tests"]
+

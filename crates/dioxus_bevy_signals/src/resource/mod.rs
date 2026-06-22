@@ -4,11 +4,12 @@
 //! of bevy resources, with automatic bidirectional synchronization.
 
 use crate::schedules::{DioxusSyncPostUpdate, DioxusSyncPreUpdate, DioxusSyncUpdate};
+use bevy_ecs::component::Mutable;
 use bevy_ecs::prelude::*;
 use bevy_ecs::world::CommandQueue;
-use dioxus::prelude::*;
-use dioxus_hooks::{use_context, use_signal};
-use dioxus_signals::{ReadableExt, Signal};
+// use dioxus::prelude::*;
+use dioxus_hooks::{use_context, use_future, use_signal};
+use dioxus_signals::{ReadableExt, Signal, WritableExt};
 use parking_lot::Mutex;
 use queued_signal::state::{HealthStatus, QueuedSignal, SignalReadGuard, WriterDriver};
 use std::any::{TypeId, type_name};
@@ -28,7 +29,7 @@ pub type Result<T, E> = std::result::Result<T, E>;
 
 trait_set! {
     /// Resource that can be synced with dioxus.
-    pub trait ResourceDioxusSync = bevy_ecs::resource::Resource + Clone + Send + Sync + 'static;
+    pub trait ResourceDioxusSync = bevy_ecs::resource::Resource + Component<Mutability = Mutable> + Clone + Send + Sync + 'static;
 }
 
 /// Error state for a resource signal that hasn't been initialized yet.
@@ -47,14 +48,6 @@ impl Display for ResourceNoneState {
     }
 }
 
-// impl From<ResourceNoneState> for String {
-//     fn from(value: ResourceNoneState) -> Self {
-//         match value {
-//             ResourceNoneState::NotInitialized => "Not Initialized".into(),
-//         }
-//     }
-// }
-
 /// Write driver for ticking resource signal updates.
 #[derive(Resource)]
 pub struct ResourceWriteDriver<T: ResourceDioxusSync>(pub Arc<Mutex<WriterDriver<T>>>);
@@ -72,6 +65,8 @@ pub struct ResourceQueuedSignalMirror<T: ResourceDioxusSync>(pub QueuedSignal<T>
 pub struct RegisteredResourceSyncs(HashSet<TypeId>);
 
 impl<T: ResourceDioxusSync> Command for RequestBevyResource<T> {
+    type Out = ();
+
     fn apply(self, world: &mut World) {
         let signal_to_send = match world.get_resource::<ResourceQueuedSignalMirror<T>>() {
             Some(signal) => signal.0.clone(),

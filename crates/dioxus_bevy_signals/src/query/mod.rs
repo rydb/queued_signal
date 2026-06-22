@@ -24,7 +24,7 @@ use crate::schedules::{DioxusSyncLast, DioxusSyncPostUpdate};
 use bevy_ecs::{
     component::Mutable,
     prelude::*,
-    query::{QueryData, QueryFilter},
+    query::{IterQueryData, QueryData, QueryFilter},
     world::CommandQueue,
 };
 use dioxus_core::use_drop;
@@ -287,6 +287,8 @@ pub struct UpdateTrackingQueries<Q: DioxusQuerySync, F: QueryFilter> {
 impl<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static> Command
     for UpdateTrackingQueries<Q, F>
 {
+    type Out = ();
+
     fn apply(self, world: &mut World) {
         let mut pending_delta = world.get_resource_or_init::<PendingQueryTrackingDeltas<Q, F>>();
         pending_delta.pending += self.delta;
@@ -461,6 +463,8 @@ impl<T: DioxusComponentSync> Default for RequestComponentsMirror<T> {
 }
 
 impl<T: DioxusComponentSync> Command for RequestComponentsMirror<T> {
+    type Out = ();
+
     fn apply(self, world: &mut World) {
         let mut mirrored_components =
             world.get_resource_or_insert_with(MirroredComponents::default);
@@ -489,6 +493,8 @@ pub struct RequestQueryMirror<T: DioxusQuerySync, F: QueryFilter + 'static> {
 }
 
 impl<T: DioxusQuerySync + 'static, F: QueryFilter> Command for RequestQueryMirror<T, F> {
+    type Out = ();
+
     fn apply(self, world: &mut World) {
         let signal_to_send: QueuedSignal<MirrorQuery<T, F>> =
             match world.get_resource::<MirrorQuerySignal<T, F>>() {
@@ -565,7 +571,7 @@ impl<T: DioxusQuerySync + 'static, F: QueryFilter> Command for RequestQueryMirro
 /// ```text
 /// let signal = MirrorQuery<(Entity, &mut A, &mut B)> -> Query<(Entity, &mut DioxusMirror<A>, &mut DioxusMirror<B>)> -> HashMap<Entity, (Entity, DioxusMirror<A>, DioxusMirror<B>)> -> QueuedQuerySignal
 /// ```
-pub trait MirrorQueryData: QueryData {
+pub trait MirrorQueryData: QueryData + IterQueryData {
     /// Mirrored query item type.
     ///
     /// E.G;
@@ -596,7 +602,7 @@ pub trait MirrorQueryData: QueryData {
     /// ```text
     /// Query<(Entity, &mut DioxusMirror<A>, &mut DioxusMirror<B>)>
     /// ```
-    type MirrorSignalsQueryDataImMut: QueryData;
+    type MirrorSignalsQueryDataImMut: QueryData + IterQueryData;
 
     /// Filter for components that are missing their mirrors.
     type MirrorSignalsWithoutFilter: QueryFilter;
@@ -616,7 +622,7 @@ pub trait MirrorQueryData: QueryData {
     /// ```text
     /// Query<(Entity, &mut DioxusTrackingQueries<A>, &mut DioxusTrackingQueries<B>)>
     /// ```
-    type TrackingQueriesQuerydataMut: QueryData;
+    type TrackingQueriesQuerydataMut: QueryData + IterQueryData;
 
     /// Register the sync systems for this mirror query.
     fn register_mirror_sync_systems<F: QueryFilter>(world: &mut World);
