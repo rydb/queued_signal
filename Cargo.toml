@@ -7,15 +7,27 @@ members = ["./crates/*", "examples", "queued_signal", "crates/queued_signal_trac
 dioxus_bevy_signals = {path = "crates/dioxus_bevy_signals", default-features = false}
 queued_signal_tracing = { path = "crates/queued_signal_tracing" }
 
-dioxus = {git = "https://github.com/DioxusLabs/dioxus", rev = "b00ff7525901984f3a07fa5cfa175b537b64630b", default-features = false}
-dioxus-core = {git = "https://github.com/DioxusLabs/dioxus", rev = "b00ff7525901984f3a07fa5cfa175b537b64630b"}
-dioxus-signals = {git = "https://github.com/DioxusLabs/dioxus", rev = "b00ff7525901984f3a07fa5cfa175b537b64630b"}
-dioxus-document = {git = "https://github.com/DioxusLabs/dioxus", rev = "b00ff7525901984f3a07fa5cfa175b537b64630b"}
-dioxus-hooks = {git = "https://github.com/DioxusLabs/dioxus", rev = "b00ff7525901984f3a07fa5cfa175b537b64630b"}
-dioxus-native = {git = "https://github.com/DioxusLabs/dioxus", rev = "b00ff7525901984f3a07fa5cfa175b537b64630b"}
-dioxus-history = {git = "https://github.com/DioxusLabs/dioxus", rev = "b00ff7525901984f3a07fa5cfa175b537b64630b"}
-generational-box = {git = "https://github.com/DioxusLabs/dioxus", rev = "b00ff7525901984f3a07fa5cfa175b537b64630b"}
-dioxus-html = {git = "https://github.com/DioxusLabs/dioxus", rev = "b00ff7525901984f3a07fa5cfa175b537b64630b"}
+# dioxus = {git = "https://github.com/DioxusLabs/dioxus", rev = "b00ff7525901984f3a07fa5cfa175b537b64630b", default-features = false}
+# dioxus-core = {git = "https://github.com/DioxusLabs/dioxus", rev = "b00ff7525901984f3a07fa5cfa175b537b64630b"}
+# dioxus-signals = {git = "https://github.com/DioxusLabs/dioxus", rev = "b00ff7525901984f3a07fa5cfa175b537b64630b"}
+# dioxus-document = {git = "https://github.com/DioxusLabs/dioxus", rev = "b00ff7525901984f3a07fa5cfa175b537b64630b"}
+# dioxus-hooks = {git = "https://github.com/DioxusLabs/dioxus", rev = "b00ff7525901984f3a07fa5cfa175b537b64630b"}
+# dioxus-native = {git = "https://github.com/DioxusLabs/dioxus", rev = "b00ff7525901984f3a07fa5cfa175b537b64630b"}
+# dioxus-history = {git = "https://github.com/DioxusLabs/dioxus", rev = "b00ff7525901984f3a07fa5cfa175b537b64630b"}
+# generational-box = {git = "https://github.com/DioxusLabs/dioxus", rev = "b00ff7525901984f3a07fa5cfa175b537b64630b"}
+# dioxus-html = {git = "https://github.com/DioxusLabs/dioxus", rev = "b00ff7525901984f3a07fa5cfa175b537b64630b"}
+
+
+dioxus = {path = "../dioxus/packages/dioxus", default-features = false}
+dioxus-core = {path = "../dioxus/packages/core"}
+dioxus-signals = {path = "../dioxus/packages/signals"}
+dioxus-document = {path = "../dioxus/packages/document"}
+dioxus-hooks = {path = "../dioxus/packages/hooks"}
+dioxus-native = {path = "../dioxus/packages/native", default-features = false}
+dioxus-history = {path = "../dioxus/packages/history"}
+generational-box = {path = "../dioxus/packages/generational-box"}
+dioxus-html = {path = "../dioxus/packages/html"}
+
 flume = {version = "0.12"}
 anyhow = "1"
 tokio = "1.51"
