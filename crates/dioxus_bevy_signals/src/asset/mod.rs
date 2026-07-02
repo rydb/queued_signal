@@ -196,7 +196,7 @@ pub fn init_requested_asset_mirrors<A: DioxusAssetSync>(
             },
             // get_load_state returns None for procedurally-generated assets
             // (those added via Assets::add() rather than loaded through the
-            // AssetServer). The asset may still exist in Assets<A> — check
+            // AssetServer). The asset may still exist in Assets<A> check
             // that directly before concluding it's invalid.
             None => match assets.get(id) {
                 Some(asset) => {
@@ -577,7 +577,7 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
 ) -> AssetMaybeMirrorSignal<A> {
     let ctx = use_context::<CommandQueueSender>();
 
-    // Value/health signals start in Fetching state — same as before.
+    // Value/health signals start in Fetching state, same as before.
     let mut asset_value_signal = use_signal(|| Arc::new(Err(AssetNoneState::Fetching)));
     let health_signal = use_signal(|| HealthStatus::Healthy);
     let mut extra_info_signal: Signal<Result<Arc<AssetUpdateExtraInfo<A>>, AssetNoneState>> =
@@ -658,7 +658,7 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
                 .forward_to(extra_info_signal, health_signal, Ok);
 
             // Mount: send tracking increment only for subsequent
-            // readers — the initial reader is pre-counted.
+            // readers the initial reader is pre-counted.
             if !resp.first_reader {
                 let asset_id = resp.extra_info.read().asset_id;
                 trace!("asset signal mounted, sending +1 for {:?}", asset_id);
