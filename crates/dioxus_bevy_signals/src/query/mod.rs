@@ -55,7 +55,6 @@ pub enum QueryNoneState {
 fn drive_component_signals<T: DioxusComponentSync>(mut components: Query<&mut DioxusMirror<T>>) {
     for mut component in &mut components {
         let old_version = component.version.load(std::sync::atomic::Ordering::Relaxed);
-        // Drop guard before set_changed to avoid borrow conflict
         {
             let mut guard = component.driver.lock();
             guard.tick(Duration::ZERO);
@@ -250,8 +249,9 @@ fn delete_unused_mirrors<T: DioxusComponentSync>(
 }
 
 /// Sync bevy components to their changed mirrors.
+#[allow(clippy::type_complexity)]
 fn sync_mirror_to_component<T: DioxusComponentSync>(
-    mut components: Query<(&T, &DioxusMirror<T>), Changed<T>>,
+    mut components: Query<(&T, &DioxusMirror<T>), (With<DioxusTrackingQueries<T>>, Changed<T>)>,
 ) {
     for (value, mirror) in &mut components {
         mirror.value.set_value(value.clone());

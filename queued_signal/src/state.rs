@@ -806,7 +806,7 @@ mod tests {
         // Initially healthy
         assert_eq!(driver.queued_state.health(), HealthStatus::Healthy);
 
-        // Register one reader and let it go stale — should be Degraded
+        // Register one reader and let it go stale, should be Degraded
         let _id = driver.registry.register();
         // Set a very short watchdog timeout
         driver.watchdog_timeout = Duration::from_millis(1);
@@ -818,7 +818,7 @@ mod tests {
             HealthStatus::Degraded { pinned_buffers: 1 }
         );
 
-        // Register two more stale readers — should be Stalled
+        // Register two more stale readers, should be Stalled
         let _id2 = driver.registry.register();
         let _id3 = driver.registry.register();
         std::thread::sleep(Duration::from_millis(10));

@@ -585,31 +585,30 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
     let mut writer_signal: Signal<Option<QueuedSignal<Result<A, AssetNoneState>>>> =
         use_signal(|| None);
 
-    // Tracks which asset ID we have sent a mirror request for,
-    // and whether the +1 tracking command has been dispatched.
-    let mut sent_id = use_signal(|| None::<AssetId<A>>);
+    // Check for if a mirror request is in flight to bevy. Prevents
+    // spawning duplicate tasks when the effect re-runs before
+    // the previous response arrives.
+    let mut in_flight = use_signal(|| false);
     let mut tracking_active = use_signal(|| false);
 
     // Wait for a real AssetId before creating the mirror.
     let ctx2 = ctx.clone();
     use_effect(move || {
         let Ok(asset_id) = id.read().clone() else {
-            trace!("use_bevy_asset effect: id not ready yet");
-            return; // ID not yet available — stay in Fetching
+            trace!("id not ready yet");
+            return;
         };
 
-        // Avoid re-requesting if we're already working on this ID
-        // or have already set up the mirror.
-        if *sent_id.read() == Some(asset_id) || writer_signal.read().is_some() {
-            trace!(
-                "use_bevy_asset effect: already sent for {:?}, skipping",
-                asset_id
-            );
+        let writer_signal_setup = writer_signal.read().is_some();
+        let in_flight_status = *in_flight.read();
+        // Skip if the mirror is already set up or a request is in flight. 
+        if writer_signal_setup || in_flight_status {
+            trace!("asset mirror setup skipped: signal is some: {}, in flight: {}", writer_signal_setup, in_flight_status);
             return;
         }
-        sent_id.set(Some(asset_id));
+        in_flight.set(true);
         trace!(
-            "use_bevy_asset effect: spawning mirror request for {:?}",
+            "spawning mirror request for {:?}",
             asset_id
         );
 
@@ -629,9 +628,10 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
                 Ok(r) => r,
                 Err(_) => {
                     trace!(
-                        "use_bevy_asset spawn: send_command_async failed for {:?}",
+                        "send_command_async failed for {:?}",
                         asset_id
                     );
+                    in_flight.set(false);
                     return;
                 }
             };
@@ -645,7 +645,7 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
             asset_value_signal.set(asset_arc);
 
             trace!(
-                "use_bevy_asset spawn: response received, asset_value={:?}",
+                "response received, asset_value={:?}",
                 *asset_value_signal.read()
             );
 
@@ -673,7 +673,8 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
 
             tracking_active.set(true);
             writer_signal.set(Some(resp.asset_state.clone()));
-            trace!("use_bevy_asset spawn: setup complete for {:?}", asset_id);
+            in_flight.set(false);
+            trace!("setup complete for {:?}", asset_id);
         });
     });
 
@@ -683,7 +684,9 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
         if !*tracking_active.read() {
             return;
         }
-        if let Some(asset_id) = *sent_id.read() {
+        let extra_info = extra_info_signal.read();
+        if let Ok(ref extra) = *extra_info {
+            let asset_id = extra.asset_id;
             trace!("asset signal dropped, sending -1 for {:?}", asset_id);
             let mut q = CommandQueue::default();
             q.push(UpdateTrackingAssets::<A> {
