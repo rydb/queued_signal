@@ -232,19 +232,21 @@ pub fn sync_mirrors_to_assets<A: DioxusAssetSync>(
     changed: Res<ChangedAssetMirrors<A>>,
 ) {
     for event in events.read() {
-        trace!("received event trace for {:#?}", event);
         let id = match event {
             AssetEvent::Modified { id } | AssetEvent::LoadedWithDependencies { id } => id,
             _ => continue,
         };
         // don't sync mirror asset to asset on the same frame it was set in order to stop an infinite change loop
         if changed.0.contains(id) {
-            trace!("chhanged includes {}, skipping", id);
+            trace!("changed includes {}, skipping", id);
             continue;
         }
+
         if let Some(entry) = mirrors.assets.get(id)
             && let Some(a) = assets.get(*id)
         {
+            trace!("setting new asset value for {} on event: {:#?}", id, event);
+
             entry.state.set_value(Ok(a.clone()));
         }
     }
