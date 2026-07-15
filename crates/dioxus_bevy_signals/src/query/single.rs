@@ -3,7 +3,7 @@
 use std::marker::PhantomData;
 
 use bevy_ecs::{prelude::*, query::QueryFilter};
-use dioxus_hooks::{use_memo, use_signal};
+use dioxus_hooks::{use_future, use_memo, use_signal};
 use dioxus_signals::{ReadableExt, Signal, WritableExt};
 use queued_signal::state::{HealthStatus, QueuedSignal};
 
@@ -82,20 +82,8 @@ pub fn use_bevy_single<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>()
     let mut item: Signal<Result<Q::MirrorItemHandles, SingleQueryError>> =
         use_signal(|| Err(SingleQueryError::NotInitialized));
 
-    let mut last_version: Signal<u64> = use_signal(|| 0);
-
     use_memo(move || {
-        // Always read to register the reactive dependency,
-        // so that subsequent updates from bevy trigger this memo.
         let dep = query_handle.read();
-
-        // Check if the query signal has published a new version
-        let writer = query_handle.writer.read();
-        let current_version = writer.as_ref().map(|s| s.peek_version()).unwrap_or(0);
-        if current_version == *last_version.read() {
-            return;
-        }
-        last_version.set(current_version);
 
         let new_val = match &*dep {
             Err(_) => Err(SingleQueryError::NotInitialized),

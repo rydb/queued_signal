@@ -236,11 +236,19 @@ impl<T: Clone + Send + Sync + 'static> QueuedState<T> {
             loop {
                 tokio::select! {
                     Ok(()) = nr.changed() => {
-                        let Some(g) = state.read_handle.enter() else { break };
-                        let reader_id = state.registry.register();
-                        state.registry.heartbeat(reader_id);
-                        value_signal.set(map(g.0.clone()));
-                        state.registry.unregister(reader_id);
+                        // Retry enter() when a concurrent publish is in
+                        // progress, instead of breaking out of the loop
+                        // permanently.
+                        loop {
+                            if let Some(g) = state.read_handle.enter() {
+                                let reader_id = state.registry.register();
+                                state.registry.heartbeat(reader_id);
+                                value_signal.set(map(g.0.clone()));
+                                state.registry.unregister(reader_id);
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        }
                     }
                     Ok(()) = hr.changed() => {
                         health_signal.set(*hr.borrow());

@@ -579,6 +579,24 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
 ) -> AssetMaybeMirrorSignal<A> {
     let ctx = use_context::<CommandQueueSender>();
 
+    // Evaluate id eagerly during render to avoid the Memo dirty-flag
+    // race between spawn_isomorphic and try_read_unchecked. Store
+    // the result in a Signal so use_effect dependency tracking works
+    // via Signal subscriber notifications.
+    let current_id = id.read().clone().clone();
+    let mut id_signal: Signal<Result<AssetId<A>, AssetNoneState>> = use_signal(|| current_id);
+    // Sync id_signal with the memo on each render. 
+    {
+        let latest = id.read().clone().clone();
+        let needs_set = {
+            let old = id_signal.peek();
+            latest != *old
+        };
+        if needs_set {
+            id_signal.set(latest);
+        }
+    }
+
     // Value/health signals start in Fetching state, same as before.
     let mut asset_value_signal = use_signal(|| Arc::new(Err(AssetNoneState::Fetching)));
     let health_signal = use_signal(|| HealthStatus::Healthy);
@@ -596,14 +614,16 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
     // Wait for a real AssetId before creating the mirror.
     let ctx2 = ctx.clone();
     use_effect(move || {
-        let Ok(asset_id) = id.read().clone() else {
+        trace!("use_bevy_asset effect running: id={:?}", id_signal.read());
+        let Ok(asset_id) = id_signal.read().clone() else {
             trace!("id not ready yet");
             return;
         };
 
         let writer_signal_setup = writer_signal.read().is_some();
         let in_flight_status = *in_flight.read();
-        // Skip if the mirror is already set up or a request is in flight. 
+        trace!("use_bevy_asset effect guards: writer_setup={writer_signal_setup}, inflight={in_flight_status}");
+        // Skip if the mirror is already set up or a request is in flight.
         if writer_signal_setup || in_flight_status {
             trace!("asset mirror setup skipped: signal is some: {}, in flight: {}", writer_signal_setup, in_flight_status);
             return;

@@ -908,7 +908,7 @@ pub fn use_bevy_query<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>()
         let _ = r.tx.send(queue);
     });
 
-    let value_signal = use_signal(|| Err(QueryNoneState::NotInitialized));
+    let mut value_signal = use_signal(|| Err(QueryNoneState::NotInitialized));
     let health_signal = use_signal(|| HealthStatus::Healthy);
     let mut writer: Signal<Option<QueuedSignal<MirrorQuery<Q, F>>>> = use_signal(|| None);
 
@@ -925,6 +925,12 @@ pub fn use_bevy_query<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>()
                 .await
             {
                 Ok(signal) => {
+                    // Eagerly read the current value so it is available
+                    // immediately, even if forward_to misses the initial
+                    // publish (e.g. when bevy publishes before the
+                    // dioxus async task subscribes).
+                    let current = signal.read().clone();
+                    value_signal.set(Ok(current));
                     signal.state.forward_to(value_signal, health_signal, Ok);
                     writer.set(Some(signal));
                 }
