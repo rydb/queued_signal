@@ -263,7 +263,7 @@ pub fn create_queued_signal_hub() -> QueuedSignalSender {
 
 /// Hook to obtain a [`QueuedSignalHandle`] for type `T`.
 ///
-/// Returns either the signal or a [`QueuedNoneState] until it exists
+/// Returns either the signal or a [`QueuedNoneState`] until it exists
 ///
 /// # Panics
 ///

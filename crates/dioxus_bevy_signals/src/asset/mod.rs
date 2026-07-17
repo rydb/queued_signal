@@ -4,12 +4,11 @@
 //! of bevy assets, with automatic bidirectional synchronization and
 //! cleanup of unused mirrors.
 
-pub use std::{
-    any::{TypeId, type_name},
+use std::{
+    any::type_name,
     collections::{HashMap, HashSet},
     marker::PhantomData,
     sync::Arc,
-    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -643,7 +642,7 @@ pub fn use_bevy_asset<A: DioxusAssetSync>(
                     },
                 };
 
-                println!("valid asset id value recieved: {}", id.clone());
+                debug!("valid asset id value recieved: {}", id.clone());
                 // request asset signal from asset id
                 let resp = match value
                     .send_command_async(|tx| {
