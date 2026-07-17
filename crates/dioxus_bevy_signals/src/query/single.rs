@@ -3,7 +3,7 @@
 use std::marker::PhantomData;
 
 use bevy_ecs::{prelude::*, query::QueryFilter};
-use dioxus_hooks::{use_future, use_memo, use_signal};
+use dioxus_hooks::{use_memo, use_signal};
 use dioxus_signals::{ReadableExt, Signal, WritableExt};
 use queued_signal::state::{HealthStatus, QueuedSignal};
 
