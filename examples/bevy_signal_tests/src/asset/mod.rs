@@ -99,7 +99,7 @@ pub fn ToggleableAsset() -> Element {
             .iter()
             .next()
             .map(|n| n.1.read().0.clone().id())
-            .ok_or(AssetNoneState::NonAsset)
+            .ok_or(AssetNoneState::Fetching)
     });
 
     let color = use_bevy_asset(handle);
@@ -175,7 +175,7 @@ pub fn AssetColorPicker() -> Element {
             .read()
             .as_ref()
             .map(|h| h.id())
-            .ok_or(AssetNoneState::NonAsset)
+            .ok_or(AssetNoneState::Fetching)
     });
     let asset_state = use_bevy_asset(asset_id);
 

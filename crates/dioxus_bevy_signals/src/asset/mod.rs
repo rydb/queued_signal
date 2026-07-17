@@ -20,7 +20,7 @@ use crate::schedules::{
 use bevy_asset::{Asset, AssetEvent, AssetId, AssetServer, Assets, LoadState};
 use bevy_ecs::{prelude::*, world::CommandQueue};
 use dioxus_core::{spawn, use_drop};
-use dioxus_hooks::{use_context, use_effect, use_signal};
+use dioxus_hooks::{use_context, use_effect, use_future, use_memo, use_signal};
 use dioxus_signals::{Memo, ReadableExt, Signal, WritableExt};
 use flume::{Receiver, Sender};
 use parking_lot::Mutex;
@@ -534,13 +534,21 @@ impl<A: DioxusAssetSync> AssetMaybeMirrorSignal<A> {
             return;
         };
         signal.mutate(move |state| {
-            if let Ok(asset) = state {
-                f(asset)
+            match state {
+                Ok(asset) => f(asset),
+                Err(_err) => {
+                    error!("attempted to mutate asset but failed due to: {}", _err);
+                },
             }
         });
         drop(signal_guard);
-        let Ok(extra_info) = &*self.extra_info.read() else {
-            return;
+        let r = self.extra_info.read();
+        let extra_info = match &*r {
+            Ok(extra_info) => extra_info,
+            Err(_err) => {
+                error!("could not notify bevy that asset was mutated: {}", _err);
+                return;
+            },
         };
         // notify bevy that the inner value was changed
         let _ = extra_info
@@ -570,78 +578,78 @@ impl<A: DioxusAssetSync> AssetMaybeMirrorSignal<A> {
 
 use std::fmt::{Debug, Display};
 
-/// Returns immediately with a `Fetching` state.
-/// The real mirror is fetched asynchronously once the
-/// asset ID becomes available and installed when bevy
-/// processes the request.
-pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
+/// Returns a synchronization mirror of a given result asset id.
+pub fn use_bevy_asset<A: DioxusAssetSync>(
     id: Memo<Result<AssetId<A>, AssetNoneState>>,
-) -> AssetMaybeMirrorSignal<A> {
+) -> AssetMaybeMirrorSignal<A>{
     let ctx = use_context::<CommandQueueSender>();
 
-    // Evaluate id eagerly during render to avoid the Memo dirty-flag
-    // race between spawn_isomorphic and try_read_unchecked. Store
-    // the result in a Signal so use_effect dependency tracking works
-    // via Signal subscriber notifications.
-    let current_id = id.read().clone().clone();
-    let mut id_signal: Signal<Result<AssetId<A>, AssetNoneState>> = use_signal(|| current_id);
-    // Sync id_signal with the memo on each render. 
-    {
-        let latest = id.read().clone().clone();
-        let needs_set = {
-            let old = id_signal.peek();
-            latest != *old
-        };
-        if needs_set {
-            id_signal.set(latest);
-        }
-    }
-
-    // Value/health signals start in Fetching state, same as before.
     let mut asset_value_signal = use_signal(|| Arc::new(Err(AssetNoneState::Fetching)));
     let health_signal = use_signal(|| HealthStatus::Healthy);
-    let mut extra_info_signal: Signal<Result<Arc<AssetUpdateExtraInfo<A>>, AssetNoneState>> =
-        use_signal(|| Err(AssetNoneState::Fetching));
-    let mut writer_signal: Signal<Option<QueuedSignal<Result<A, AssetNoneState>>>> =
-        use_signal(|| None);
+    let mut extra_info_signal = use_signal(|| Err(AssetNoneState::Fetching));
+    let mut writer_signal= use_signal(|| None);
 
-    // Check for if a mirror request is in flight to bevy. Prevents
-    // spawning duplicate tasks when the effect re-runs before
-    // the previous response arrives.
-    let mut in_flight = use_signal(|| false);
     let mut tracking_active = use_signal(|| false);
 
-    // Wait for a real AssetId before creating the mirror.
-    let ctx2 = ctx.clone();
-    use_effect(move || {
-        trace!("use_bevy_asset effect running: id={:?}", id_signal.read());
-        let Ok(asset_id) = id_signal.read().clone() else {
-            trace!("id not ready yet");
-            return;
-        };
+    let (id_tx, id_rx) = tokio::sync::mpsc::channel::<_>(100);
+    
+    // save tx channel in a signal so it doesn't get dropped when this signal is re-spun up.
+    let id_tx = use_signal(|| Some(id_tx));
 
-        let writer_signal_setup = writer_signal.read().is_some();
-        let in_flight_status = *in_flight.read();
-        trace!("use_bevy_asset effect guards: writer_setup={writer_signal_setup}, inflight={in_flight_status}");
-        // Skip if the mirror is already set up or a request is in flight.
-        if writer_signal_setup || in_flight_status {
-            trace!("asset mirror setup skipped: signal is some: {}, in flight: {}", writer_signal_setup, in_flight_status);
-            return;
+    // Memo sends through the signal-stored sender
+    use_memo(move || {
+        let id = id.read();
+        debug!("asset id is now: {:#?}", &*id);
+        if let Some(tx) = id_tx.read().as_ref() {
+            let _ = tx.try_send(id.cloned())
+                .inspect_err(|err| error!("...{}", err));
         }
-        in_flight.set(true);
-        trace!(
-            "spawning mirror request for {:?}",
-            asset_id
-        );
+    });
 
-        let ctx = ctx2.clone();
-        spawn(async move {
-            let resp = match ctx
+    // asset id fetch thread
+    let ctx_r = ctx.clone();
+    let mut id_rx = Some(id_rx);
+    use_future( move || {
+    let value = ctx_r.clone();
+    let mut id_rx = id_rx.take().unwrap();
+    async move {
+        // retrieve asset value if it exists.
+        loop {
+            // poll for asset id until it exists
+            let Some(id) = id_rx.recv().await else {
+                error!("channel closed for asset id update");
+                break;
+            };
+
+            let id = match id {
+                Ok(id) => {
+                    debug!("asset id recieved {}", id);
+                    id
+                },
+                Err(err) => match err {
+                    AssetNoneState::Loading | AssetNoneState::NotLoaded | AssetNoneState::Fetching => {
+                        warn!("attempt to fetch asset thats still loading, re-polling");
+                        continue
+                    },
+                    AssetNoneState::NonAsset => {
+                        error!("attempted to fetch NonAsset");
+                        break;
+                    }
+                    AssetNoneState::Error(_err) => {
+                        error!("error fetching asset: {}", _err);
+                        break;
+                    },
+                },
+            };
+
+            println!("valid asset id value recieved: {}", id.clone());
+            // request asset signal from asset id
+            let resp = match value
                 .send_command_async(|tx| {
                     let mut q = CommandQueue::default();
                     q.push(RequestBevyAssetMirror::<A> {
                         response_tx: tx,
-                        asset_id,
+                        asset_id: id,
                     });
                     q
                 })
@@ -649,38 +657,11 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
             {
                 Ok(r) => r,
                 Err(_) => {
-                    trace!(
-                        "send_command_async failed for {:?}",
-                        asset_id
-                    );
-                    in_flight.set(false);
+                    trace!("send_command_async failed for {:?}", id);
                     return;
                 }
             };
 
-            // Eagerly set signals from current values so they
-            // are immediately available, then subscribe to
-            // future changes.
-            let extra_info_arc = resp.extra_info.read().clone();
-            extra_info_signal.set(Ok(extra_info_arc));
-            let asset_arc = resp.asset_state.read().clone();
-            asset_value_signal.set(asset_arc);
-
-            trace!(
-                "response received, asset_value={:?}",
-                *asset_value_signal.read()
-            );
-
-            // Forward future changes into the hook signals.
-            resp.asset_state
-                .state
-                .forward_to(asset_value_signal, health_signal, |arc| arc);
-            resp.extra_info
-                .state
-                .forward_to(extra_info_signal, health_signal, Ok);
-
-            // Mount: send tracking increment only for subsequent
-            // readers the initial reader is pre-counted.
             if !resp.first_reader {
                 let asset_id = resp.extra_info.read().asset_id;
                 trace!("asset signal mounted, sending +1 for {:?}", asset_id);
@@ -690,18 +671,26 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
                     asset_id,
                     _phantom: PhantomData,
                 });
-                let _ = ctx.tx.send(q);
+                let _ = value.tx.send(q);
             }
-
+            debug!("retrieved asset from asset id {}", id);
             tracking_active.set(true);
+            resp.asset_state.forward_to(asset_value_signal, health_signal, |arc| arc);
+            resp.extra_info.forward_to(extra_info_signal, health_signal, Ok);
+
+            // set values on signals
+            let extra_info_arc = resp.extra_info.read().clone();
+            extra_info_signal.set(Ok(extra_info_arc));
+            let asset_arc = resp.asset_state.read().clone();
+            asset_value_signal.set(asset_arc);
+
             writer_signal.set(Some(resp.asset_state.clone()));
-            in_flight.set(false);
-            trace!("setup complete for {:?}", asset_id);
-        });
+            break;
+        }
+    }
     });
 
-    // Unmount: send tracking decrement.
-    let r = ctx.clone();
+    let ctx_r = ctx.clone();
     use_drop(move || {
         if !*tracking_active.read() {
             return;
@@ -716,9 +705,10 @@ pub fn use_bevy_asset<A: DioxusAssetSync + Debug>(
                 asset_id,
                 _phantom: PhantomData,
             });
-            let _ = r.tx.send(q);
+            let _ = ctx_r.tx.send(q);
         }
     });
+
 
     AssetMaybeMirrorSignal {
         value: asset_value_signal,
