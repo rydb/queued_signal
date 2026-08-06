@@ -324,33 +324,13 @@ impl Plugin for SingleQuerySetup {
 /// Test for the use_bevy_single mirror.
 #[component]
 pub fn SingleQuery() -> Element {
-    let counter = use_bevy_single::<(Entity, &mut SingleCounter), ()>();
-
-    let counter_str = use_memo(move || {
-        counter
-            .read_ok(|(_, val, ..)| val.read().0.to_string())
-            .unwrap_or_else(|n| n.into())
-    });
-
+    let (_, counter) = use_bevy_single::<(Entity, &mut SingleCounter), ()>();
     let increment_counter = move |_evt| {
-        counter
-            .read_ok(|value| value.1.mutate(|counter| counter.0 += 10))
-            .unwrap_or_else(|err| println!("tried to increment counter but: {:#?}", err));
+        counter.mutate(|n| n.0 += 10);
     };
 
-    let no_match = use_bevy_single::<(Entity, &mut MoreThenOneMatch), With<NoMatch>>();
-    let no_match_str = use_memo(move || {
-        no_match
-            .read_ok(|(e, _)| e.to_string())
-            .unwrap_or_else(|n| n.into())
-    });
-
-    let more_then_one_match = use_bevy_single::<(Entity, &mut MoreThenOneMatch), ()>();
-    let more_then_one_match_str = use_memo(move || {
-        more_then_one_match
-            .read_ok(|(e, _)| e.to_string())
-            .unwrap_or_else(|n| n.into())
-    });
+    let (_, no_match) = use_bevy_single::<(Entity, &mut MoreThenOneMatch), With<NoMatch>>();
+    let (_, more_then_one_match) = use_bevy_single::<(Entity, &mut MoreThenOneMatch), ()>();
 
     rsx! {
         div {
@@ -360,7 +340,7 @@ pub fn SingleQuery() -> Element {
             }
             div {
                 h2 {
-                    {format!("single match: {}", counter_str)}
+                    {format!("single match: {}", counter.use_display(|n| n.0.to_string()))}
                 }
                 button {
                     onclick: increment_counter,
@@ -369,10 +349,10 @@ pub fn SingleQuery() -> Element {
             }
 
             h2 {
-                {format!("no match: {}", no_match_str)}
+                {format!("no match: {}", no_match.use_display(|_n| "ERROR: there is a match".into()))}
             }
             h2 {
-                {format!("more then one match: {}", more_then_one_match_str)}
+                {format!("more then one match: {}", more_then_one_match.use_display(|_n| "ERROR: There is more then one match".into()))}
             }
         }
     }

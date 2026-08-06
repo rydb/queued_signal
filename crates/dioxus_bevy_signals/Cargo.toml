@@ -26,6 +26,7 @@ queued_signal = {workspace = true}
 trait-set = {workspace = true}
 queued_signal_tracing = { workspace = true}
 variadics_please = {workspace = true}
+pastey = {workspace = true}
 
 [features]
 asset = []

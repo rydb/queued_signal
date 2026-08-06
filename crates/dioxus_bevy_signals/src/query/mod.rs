@@ -4,15 +4,10 @@
 //! signal mirrors of bevy queries, with automatic bidirectional synchronization.
 
 use std::{
-    any::TypeId,
-    collections::{HashMap, HashSet},
-    fmt::Debug,
-    marker::PhantomData,
-    sync::{
+    any::TypeId, collections::{HashMap, HashSet}, fmt::Debug, marker::PhantomData, ops::Deref, sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
+    }, time::Duration,
 };
 
 mod macros;
@@ -28,7 +23,7 @@ use bevy_ecs::{
     world::CommandQueue,
 };
 use dioxus_core::use_drop;
-use dioxus_hooks::{use_context, use_effect, use_future, use_signal};
+use dioxus_hooks::{use_context, use_effect, use_future, use_memo, use_signal};
 use dioxus_signals::{ReadableExt, Signal, WritableExt};
 use parking_lot::Mutex;
 use queued_signal::state::{HealthStatus, QueuedSignal, SignalReadGuard, WriterDriver};
@@ -758,6 +753,54 @@ impl<A: DioxusComponentSync, B: DioxusComponentSync> MirrorQueryData for (Entity
         let vb = b.version.load(std::sync::atomic::Ordering::Relaxed);
         // XOR + rotate to combine two u64 values into one unique identifier
         va ^ vb.rotate_left(32)
+    }
+}
+
+impl<A: DioxusComponentSync, B: DioxusComponentSync> crate::query::single::SingleQueryParts
+    for (Entity, &mut A, &mut B)
+{
+    type Output = (
+        crate::query::single::SingleEntityHandle,
+        crate::query::single::SingleComponentHandle<A>,
+        crate::query::single::SingleComponentHandle<B>,
+    );
+
+    fn create_parts<F: QueryFilter + 'static>(
+        resolved: Signal<Result<Self::MirrorItemHandles, crate::query::single::SingleQueryError>>,
+    ) -> Self::Output {
+        let mut entity_signal: Signal<
+            Result<Entity, crate::query::single::SingleQueryError>,
+        > = use_signal(|| Err(crate::query::single::SingleQueryError::NotInitialized));
+        let mut a_signal: Signal<
+            Result<DioxusMirrorHandle<A>, crate::query::single::SingleQueryError>,
+        > = use_signal(|| Err(crate::query::single::SingleQueryError::NotInitialized));
+        let mut b_signal: Signal<
+            Result<DioxusMirrorHandle<B>, crate::query::single::SingleQueryError>,
+        > = use_signal(|| Err(crate::query::single::SingleQueryError::NotInitialized));
+
+        use_memo(move || {
+            match resolved.read().as_ref() {
+                Ok(handles) => {
+                    let handles = handles.clone();
+                    #[allow(non_snake_case)]
+                    let (entity, A, B) = handles;
+                    entity_signal.set(Ok(entity));
+                    a_signal.set(Ok(A));
+                    b_signal.set(Ok(B));
+                }
+                Err(e) => {
+                    entity_signal.set(Err(e.clone()));
+                    a_signal.set(Err(e.clone()));
+                    b_signal.set(Err(e.clone()));
+                }
+            }
+        });
+
+        (
+            crate::query::single::SingleEntityHandle { signal: entity_signal },
+            crate::query::single::SingleComponentHandle { signal: a_signal },
+            crate::query::single::SingleComponentHandle { signal: b_signal },
+        )
     }
 }
 

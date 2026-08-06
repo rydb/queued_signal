@@ -1,5 +1,4 @@
-//! Implements [`MirrorQueryData`](super::MirrorQueryData) for tuples of
-//! `(Entity, &mut T1, &mut T2, ..., &mut TN)`.
+//! Macro impls for library macros.
 
 macro_rules! impl_mirror_query_data {
     ($T0:ident, $T1:ident) => {};
@@ -265,7 +264,124 @@ macro_rules! impl_mirror_query_data {
     };
 }
 
+macro_rules! impl_single_query_parts {
+    // 2-component case is a no-op (handled manually in query/mod.rs).
+    ($T0:ident, $T1:ident) => {};
+
+    // Single-element arm (1 component)
+    ($T:ident) => {
+        impl<$T: DioxusComponentSync> SingleQueryParts for (Entity, &mut $T) {
+            type Output = (SingleEntityHandle, SingleComponentHandle<$T>);
+
+            fn create_parts<F: QueryFilter + 'static>(
+                resolved: Signal<Result<Self::MirrorItemHandles, SingleQueryError>>,
+            ) -> Self::Output {
+                let mut entity_signal: Signal<Result<Entity, SingleQueryError>> =
+                    use_signal(|| Err(SingleQueryError::NotInitialized));
+                let mut t_signal: Signal<Result<DioxusMirrorHandle<$T>, SingleQueryError>> =
+                    use_signal(|| Err(SingleQueryError::NotInitialized));
+
+                use_memo(move || {
+                    match resolved.read().as_ref() {
+                        Ok(handles) => {
+                            let handles = handles.clone();
+                            #[allow(non_snake_case)]
+                            let (entity, $T) = handles;
+                            entity_signal.set(Ok(entity));
+                            t_signal.set(Ok($T));
+                        }
+                        Err(e) => {
+                            entity_signal.set(Err(e.clone()));
+                            t_signal.set(Err(e.clone()));
+                        }
+                    }
+                });
+
+                (
+                    SingleEntityHandle { signal: entity_signal },
+                    SingleComponentHandle { signal: t_signal },
+                )
+            }
+        }
+    };
+
+    // Multi-element arm (3+ components)
+    ($first:ident, $second:ident, $third:ident $(, $rest:ident)*) => {
+        pastey::paste! {
+            impl<
+                $first: DioxusComponentSync,
+                $second: DioxusComponentSync,
+                $third: DioxusComponentSync,
+                $($rest: DioxusComponentSync),*
+            > SingleQueryParts
+                for (Entity, &mut $first, &mut $second, &mut $third $(, &mut $rest)*)
+            {
+                type Output = (
+                    SingleEntityHandle,
+                    SingleComponentHandle<$first>,
+                    SingleComponentHandle<$second>,
+                    SingleComponentHandle<$third>
+                    $(, SingleComponentHandle<$rest>)*
+                );
+
+                fn create_parts<F: QueryFilter + 'static>(
+                    resolved: Signal<Result<Self::MirrorItemHandles, SingleQueryError>>,
+                ) -> Self::Output {
+                    let mut entity_signal: Signal<Result<Entity, SingleQueryError>> =
+                        use_signal(|| Err(SingleQueryError::NotInitialized));
+                    let mut [< $first:snake _signal >]: Signal<Result<DioxusMirrorHandle<$first>, SingleQueryError>> =
+                        use_signal(|| Err(SingleQueryError::NotInitialized));
+                    let mut [< $second:snake _signal >]: Signal<Result<DioxusMirrorHandle<$second>, SingleQueryError>> =
+                        use_signal(|| Err(SingleQueryError::NotInitialized));
+                    let mut [< $third:snake _signal >]: Signal<Result<DioxusMirrorHandle<$third>, SingleQueryError>> =
+                        use_signal(|| Err(SingleQueryError::NotInitialized));
+                    $(
+                        let mut [< $rest:snake _signal >]: Signal<Result<DioxusMirrorHandle<$rest>, SingleQueryError>> =
+                            use_signal(|| Err(SingleQueryError::NotInitialized));
+                    )*
+
+                    use_memo(move || {
+                        match resolved.read().as_ref() {
+                            Ok(handles) => {
+                                let handles = handles.clone();
+                                #[allow(non_snake_case)]
+                                let (entity, $first, $second, $third $(, $rest)*) = handles;
+                                entity_signal.set(Ok(entity));
+                                [< $first:snake _signal >].set(Ok($first));
+                                [< $second:snake _signal >].set(Ok($second));
+                                [< $third:snake _signal >].set(Ok($third));
+                                $(
+                                    [< $rest:snake _signal >].set(Ok($rest));
+                                )*
+                            }
+                            Err(e) => {
+                                entity_signal.set(Err(e.clone()));
+                                [< $first:snake _signal >].set(Err(e.clone()));
+                                [< $second:snake _signal >].set(Err(e.clone()));
+                                [< $third:snake _signal >].set(Err(e.clone()));
+                                $(
+                                    [< $rest:snake _signal >].set(Err(e.clone()));
+                                )*
+                            }
+                        }
+                    });
+
+                    (
+                        SingleEntityHandle { signal: entity_signal },
+                        SingleComponentHandle { signal: [< $first:snake _signal >] },
+                        SingleComponentHandle { signal: [< $second:snake _signal >] },
+                        SingleComponentHandle { signal: [< $third:snake _signal >] }
+                        $(, SingleComponentHandle { signal: [< $rest:snake _signal >] })*
+                    )
+                }
+            }
+        }
+    };
+}
+
 use super::*;
+use super::single::*;
 use variadics_please::all_tuples;
 
 all_tuples!(impl_mirror_query_data, 1, 13, T);
+all_tuples!(impl_single_query_parts, 1, 13, T);
