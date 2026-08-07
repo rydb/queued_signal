@@ -4,10 +4,16 @@
 //! signal mirrors of bevy queries, with automatic bidirectional synchronization.
 
 use std::{
-    any::TypeId, collections::{HashMap, HashSet}, fmt::Debug, marker::PhantomData, ops::Deref, sync::{
+    any::TypeId,
+    collections::{HashMap, HashSet},
+    fmt::Debug,
+    marker::PhantomData,
+    ops::Deref,
+    sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
-    }, time::Duration,
+    },
+    time::Duration,
 };
 
 mod macros;
@@ -768,9 +774,8 @@ impl<A: DioxusComponentSync, B: DioxusComponentSync> crate::query::single::Singl
     fn create_parts<F: QueryFilter + 'static>(
         resolved: Signal<Result<Self::MirrorItemHandles, crate::query::single::SingleQueryError>>,
     ) -> Self::Output {
-        let mut entity_signal: Signal<
-            Result<Entity, crate::query::single::SingleQueryError>,
-        > = use_signal(|| Err(crate::query::single::SingleQueryError::NotInitialized));
+        let mut entity_signal: Signal<Result<Entity, crate::query::single::SingleQueryError>> =
+            use_signal(|| Err(crate::query::single::SingleQueryError::NotInitialized));
         let mut a_signal: Signal<
             Result<DioxusMirrorHandle<A>, crate::query::single::SingleQueryError>,
         > = use_signal(|| Err(crate::query::single::SingleQueryError::NotInitialized));
@@ -778,26 +783,26 @@ impl<A: DioxusComponentSync, B: DioxusComponentSync> crate::query::single::Singl
             Result<DioxusMirrorHandle<B>, crate::query::single::SingleQueryError>,
         > = use_signal(|| Err(crate::query::single::SingleQueryError::NotInitialized));
 
-        use_memo(move || {
-            match resolved.read().as_ref() {
-                Ok(handles) => {
-                    let handles = handles.clone();
-                    #[allow(non_snake_case)]
-                    let (entity, A, B) = handles;
-                    entity_signal.set(Ok(entity));
-                    a_signal.set(Ok(A));
-                    b_signal.set(Ok(B));
-                }
-                Err(e) => {
-                    entity_signal.set(Err(e.clone()));
-                    a_signal.set(Err(e.clone()));
-                    b_signal.set(Err(e.clone()));
-                }
+        use_memo(move || match resolved.read().as_ref() {
+            Ok(handles) => {
+                let handles = handles.clone();
+                #[allow(non_snake_case)]
+                let (entity, A, B) = handles;
+                entity_signal.set(Ok(entity));
+                a_signal.set(Ok(A));
+                b_signal.set(Ok(B));
+            }
+            Err(e) => {
+                entity_signal.set(Err(e.clone()));
+                a_signal.set(Err(e.clone()));
+                b_signal.set(Err(e.clone()));
             }
         });
 
         (
-            crate::query::single::SingleEntityHandle { signal: entity_signal },
+            crate::query::single::SingleEntityHandle {
+                signal: entity_signal,
+            },
             crate::query::single::SingleComponentHandle { signal: a_signal },
             crate::query::single::SingleComponentHandle { signal: b_signal },
         )

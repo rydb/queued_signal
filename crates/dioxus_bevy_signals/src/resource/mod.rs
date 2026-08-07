@@ -7,9 +7,9 @@ use crate::schedules::{DioxusSyncPostUpdate, DioxusSyncPreUpdate, DioxusSyncUpda
 use bevy_ecs::component::Mutable;
 use bevy_ecs::prelude::*;
 use bevy_ecs::world::CommandQueue;
-// use dioxus::prelude::*;
-use dioxus_hooks::{use_context, use_future, use_signal};
-use dioxus_signals::{ReadableExt, Signal, WritableExt};
+use dioxus_core::IntoDynNode;
+use dioxus_hooks::{use_context, use_future, use_memo, use_signal};
+use dioxus_signals::{Memo, ReadableExt, Signal, WritableExt};
 use parking_lot::Mutex;
 use queued_signal::state::{HealthStatus, QueuedSignal, SignalReadGuard, WriterDriver};
 use std::any::{TypeId, type_name};
@@ -158,29 +158,53 @@ fn drive_signal<T: ResourceDioxusSync>(driver: Res<ResourceWriteDriver<T>>) {
 }
 
 /// Dioxus signal for managing bevy resource synchronization.
-#[derive(Clone)]
-pub struct ResourceMirrorSignal<R: Clone + Send + Sync + 'static> {
+pub struct ResourceMirrorSignal<R, U, E>
+where
+    R: Clone + Send + Sync + 'static,
+{
     signal: Signal<Result<Arc<R>, ResourceNoneState>>,
     health: Signal<HealthStatus>,
     /// None until the bevy round-trip completes.
     /// Writes are silently ignored while pending.
     writer: Signal<Option<QueuedSignal<R>>>,
+    /// Memoized mapped value for reactive display in RSX.
+    display: Memo<Result<U, E>>,
 }
 
-impl<R: Clone + Send + Sync + 'static> Copy for ResourceMirrorSignal<R> {}
-
-impl<R: Clone + Send + Sync + 'static + Display> Display for ResourceMirrorSignal<R> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            self.read_ok(|n| format!("{}", n))
-                .unwrap_or_else(|n| n.to_string())
-        )
+impl<R: Clone + Send + Sync + 'static, U, E> Clone for ResourceMirrorSignal<R, U, E> {
+    fn clone(&self) -> Self {
+        *self
     }
 }
 
-impl<R: Clone + Send + Sync + 'static> ResourceMirrorSignal<R> {
+impl<R: Clone + Send + Sync + 'static, U, E> Copy for ResourceMirrorSignal<R, U, E> {}
+
+impl<R, U, E> Display for ResourceMirrorSignal<R, U, E>
+where
+    R: Clone + Send + Sync + 'static,
+    U: Display + PartialEq + 'static,
+    E: Display + PartialEq + 'static,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.display.read().as_ref() {
+            Ok(u) => write!(f, "{u}"),
+            Err(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl<R, U, E> IntoDynNode for ResourceMirrorSignal<R, U, E>
+where
+    R: Clone + Send + Sync + 'static,
+    U: Display + PartialEq + Clone + 'static,
+    E: Display + PartialEq + Clone + 'static,
+{
+    fn into_dyn_node(self) -> dioxus_core::DynamicNode {
+        self.to_string().into_dyn_node()
+    }
+}
+
+impl<R: Clone + Send + Sync + 'static, U, E> ResourceMirrorSignal<R, U, E> {
     /// Enqueue a relative mutation.
     pub fn mutate<F>(&self, f: F)
     where
@@ -230,8 +254,8 @@ impl<R: Clone + Send + Sync + 'static> ResourceMirrorSignal<R> {
         SignalReadGuard::new(self.signal.read())
     }
 
-    /// Read and map the `Ok` variant of the resource, or pass through the error.
-    pub fn read_ok<U>(&self, f: impl FnOnce(&R) -> U) -> Result<U, ResourceNoneState> {
+    /// .read() + .map()
+    pub fn read_ok<O>(&self, f: impl FnOnce(&R) -> O) -> Result<O, ResourceNoneState> {
         let guard = self.signal.read();
         match &*guard {
             Ok(arc_r) => Ok(f(arc_r.as_ref())),
@@ -241,15 +265,34 @@ impl<R: Clone + Send + Sync + 'static> ResourceMirrorSignal<R> {
 }
 
 /// Create or fetch a signal mirror for a bevy resource.
-pub fn use_bevy_resource<T>() -> ResourceMirrorSignal<T>
+pub fn use_bevy_resource<T, U, E>(
+    map_fn: impl Fn(&T) -> U + Clone + 'static,
+    err_fn: impl Fn(ResourceNoneState) -> E + Clone + 'static,
+) -> ResourceMirrorSignal<T, U, E>
 where
     T: ResourceDioxusSync,
+    U: PartialEq + 'static,
+    E: PartialEq + 'static,
 {
     let ctx = use_context::<CommandQueueSender>();
 
-    let mut value_signal = use_signal(|| Err(ResourceNoneState::NotInitialized));
+    let mut value_signal: Signal<Result<Arc<T>, ResourceNoneState>> =
+        use_signal(|| Err(ResourceNoneState::NotInitialized));
     let health_signal = use_signal(|| HealthStatus::Healthy);
     let mut writer: Signal<Option<QueuedSignal<T>>> = use_signal(|| None);
+
+    let display = {
+        let value_signal = value_signal;
+        let map_fn = map_fn.clone();
+        let err_fn = err_fn.clone();
+        use_memo(move || {
+            let guard = value_signal.read();
+            match &*guard {
+                Ok(arc_r) => Ok(map_fn(arc_r.as_ref())),
+                Err(e) => Err(err_fn(e.clone())),
+            }
+        })
+    };
 
     let ctx_clone = ctx.clone();
     use_future(move || {
@@ -280,5 +323,6 @@ where
         signal: value_signal,
         health: health_signal,
         writer,
+        display,
     }
 }

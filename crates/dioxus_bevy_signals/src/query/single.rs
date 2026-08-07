@@ -12,7 +12,10 @@ use queued_signal::state::{HealthStatus, QueuedSignal};
 #[cfg(feature = "asset")]
 use crate::asset::{AssetMaybeMirrorSignal, AssetNoneState, DioxusAssetSync, use_bevy_asset};
 
-use super::{DioxusComponentSync, DioxusQuerySync, MirrorQuery, MirrorQueryData, MirrorQuerySignalHandle, SignalReadGuard, use_bevy_query};
+use super::{
+    DioxusComponentSync, DioxusQuerySync, MirrorQuery, MirrorQueryData, MirrorQuerySignalHandle,
+    SignalReadGuard, use_bevy_query,
+};
 
 /// Error when a single-entity query does not resolve to exactly one match.
 #[derive(Clone, Debug, PartialEq)]
@@ -88,7 +91,7 @@ impl<Q: MirrorQueryData, F: QueryFilter> Clone for MirrorQuerySingleHandle<Q, F>
 
 impl<Q: MirrorQueryData, F: QueryFilter> Copy for MirrorQuerySingleHandle<Q, F> {}
 
-impl<Q: MirrorQueryData + 'static, F: QueryFilter + 'static> MirrorQuerySingleHandle<Q, F> {    
+impl<Q: MirrorQueryData + 'static, F: QueryFilter + 'static> MirrorQuerySingleHandle<Q, F> {
     /// Aquires a read guard on the inner read value of the signal
     pub fn read(&self) -> SignalReadGuard<'_, Result<Q::MirrorItemHandles, SingleQueryError>> {
         SignalReadGuard::new(self.item.read())
@@ -137,10 +140,11 @@ pub struct SingleComponentHandle<T: DioxusComponentSync> {
 
 impl<T: DioxusComponentSync> Copy for SingleComponentHandle<T> {}
 
-
 impl<T: DioxusComponentSync> SingleComponentHandle<T> {
     /// Read the current component handle or error state.
-    pub fn read(&self) -> SignalReadGuard<'_, Result<super::DioxusMirrorHandle<T>, SingleQueryError>> {
+    pub fn read(
+        &self,
+    ) -> SignalReadGuard<'_, Result<super::DioxusMirrorHandle<T>, SingleQueryError>> {
         SignalReadGuard::new(self.signal.read())
     }
 
@@ -209,8 +213,10 @@ pub trait SingleQueryParts: MirrorQueryData {
 }
 
 /// Query for a single mirrored bevy entity, returning per-field handles.
-pub fn use_bevy_single<Q: DioxusQuerySync + SingleQueryParts + 'static, F: QueryFilter + 'static>()
--> Q::Output {
+pub fn use_bevy_single<
+    Q: DioxusQuerySync + SingleQueryParts + 'static,
+    F: QueryFilter + 'static,
+>() -> Q::Output {
     let query_handle = use_bevy_query::<Q, F>();
     let resolved = resolve_single::<Q, F>(query_handle);
     Q::create_parts::<F>(resolved)

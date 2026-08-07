@@ -4,7 +4,7 @@ use flume::{Receiver, Sender};
 use left_right::{Absorb, ReadHandle, WriteHandle};
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,6 +28,16 @@ pub enum HealthStatus {
         /// Number of stalled (pinned) read buffers.
         pinned_buffers: usize,
     },
+}
+
+impl Display for HealthStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HealthStatus::Healthy => write!(f, "Healthy"),
+            HealthStatus::Degraded { pinned_buffers } => write!(f, "Degraded: pinned_buffers {}", pinned_buffers),
+            HealthStatus::Stalled { pinned_buffers } => write!(f, "Stalled: pinned_buffers {}", pinned_buffers),
+        }
+    }
 }
 
 /// Registry tracking active readers for stall detection.

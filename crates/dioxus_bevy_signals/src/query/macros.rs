@@ -379,8 +379,8 @@ macro_rules! impl_single_query_parts {
     };
 }
 
-use super::*;
 use super::single::*;
+use super::*;
 use variadics_please::all_tuples;
 
 all_tuples!(impl_mirror_query_data, 1, 13, T);
