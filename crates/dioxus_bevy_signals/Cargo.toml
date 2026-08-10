@@ -14,14 +14,11 @@ bevy_app = {workspace = true}
 bevy_asset = {workspace = true}
 bevy_time = {workspace = true}
 dioxus-core = {workspace = true}
-dioxus = {workspace = true}
 dioxus-hooks = {workspace = true}
 dioxus-signals = {workspace = true}
-bytemuck = {workspace = true}
-generational-box = {workspace = true}
 parking_lot = {workspace = true}
 flume = {workspace = true}
-tokio = {workspace = true}
+tokio = {workspace = true, features = ["sync"]}
 queued_signal = {workspace = true}
 trait-set = {workspace = true}
 queued_signal_tracing = { workspace = true}

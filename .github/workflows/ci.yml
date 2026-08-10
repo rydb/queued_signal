@@ -30,3 +30,67 @@ jobs:
       - run: nix develop -c cargo test --workspace
       - run: nix develop -c cargo clippy --workspace -- -D warnings
       - run: nix develop -c cargo fmt --check --all
+
+  features:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - ""
+          - "asset"
+          - "query"
+          - "resource"
+          - "asset,query"
+          - "asset,resource"
+          - "query,resource"
+          - "asset,query,resource"
+          - "asset,query,resource,trace"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: NixOS/nix-installer-action@main
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+
+      - name: Cache Cargo deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-features-${{ matrix.features }}-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-features-
+
+      - name: Check feature combination
+        run: nix develop -c cargo check -p dioxus_bevy_signals --no-default-features --features "${{ matrix.features }}"
+      - name: Clippy feature combination
+        run: nix develop -c cargo clippy -p dioxus_bevy_signals --no-default-features --features "${{ matrix.features }}" -- -D warnings
+
+  docs:
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: NixOS/nix-installer-action@main
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+
+      - name: Cache Cargo deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-docs-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-docs-
+
+      - run: nix develop -c cargo doc --no-deps --workspace

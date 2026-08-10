@@ -7,7 +7,7 @@ use crate::schedules::{DioxusSyncPostUpdate, DioxusSyncPreUpdate, DioxusSyncUpda
 use bevy_ecs::component::Mutable;
 use bevy_ecs::prelude::*;
 use bevy_ecs::world::CommandQueue;
-use dioxus_core::IntoDynNode;
+use dioxus_core::{IntoAttributeValue, IntoDynNode};
 use dioxus_hooks::{use_context, use_future, use_memo, use_signal};
 use dioxus_signals::{Memo, ReadableExt, Signal, WritableExt};
 use parking_lot::Mutex;
@@ -161,6 +161,8 @@ fn drive_signal<T: ResourceDioxusSync>(driver: Res<ResourceWriteDriver<T>>) {
 pub struct ResourceMirrorSignal<R, U, E>
 where
     R: Clone + Send + Sync + 'static,
+    U: 'static,
+    E: 'static,
 {
     signal: Signal<Result<Arc<R>, ResourceNoneState>>,
     health: Signal<HealthStatus>,
@@ -201,6 +203,17 @@ where
 {
     fn into_dyn_node(self) -> dioxus_core::DynamicNode {
         self.to_string().into_dyn_node()
+    }
+}
+
+impl<R, U, E> IntoAttributeValue for ResourceMirrorSignal<R, U, E>
+where
+    R: Clone + Send + Sync + 'static,
+    U: Display + PartialEq + Clone + 'static,
+    E: Display + PartialEq + Clone + 'static,
+{
+    fn into_value(self) -> dioxus_core::AttributeValue {
+        self.to_string().into_value()
     }
 }
 
@@ -266,13 +279,13 @@ impl<R: Clone + Send + Sync + 'static, U, E> ResourceMirrorSignal<R, U, E> {
 
 /// Create or fetch a signal mirror for a bevy resource.
 pub fn use_bevy_resource<T, U, E>(
-    map_fn: impl Fn(&T) -> U + Clone + 'static,
+    map_fn: impl Fn(Arc<T>) -> U + Clone + 'static,
     err_fn: impl Fn(ResourceNoneState) -> E + Clone + 'static,
 ) -> ResourceMirrorSignal<T, U, E>
 where
     T: ResourceDioxusSync,
-    U: PartialEq + 'static,
-    E: PartialEq + 'static,
+    U: PartialEq,
+    E: PartialEq,
 {
     let ctx = use_context::<CommandQueueSender>();
 
@@ -288,7 +301,7 @@ where
         use_memo(move || {
             let guard = value_signal.read();
             match &*guard {
-                Ok(arc_r) => Ok(map_fn(arc_r.as_ref())),
+                Ok(arc_r) => Ok(map_fn(arc_r.clone())),
                 Err(e) => Err(err_fn(e.clone())),
             }
         })

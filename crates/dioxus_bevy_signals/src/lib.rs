@@ -10,7 +10,7 @@ use bevy_ecs::{
     system::ScheduleSystem,
     world::{CommandQueue, World},
 };
-use dioxus_hooks::use_context;
+use dioxus_hooks::{use_context, use_signal};
 use dioxus_signals::Signal;
 use flume::{Receiver, Sender, unbounded};
 use tokio::sync::oneshot;
@@ -215,6 +215,6 @@ pub fn use_bevy_command_queue() -> BevyCommandsSignal {
     let command_queue = use_context::<CommandQueueSender>();
 
     BevyCommandsSignal {
-        command_queue_sender: Signal::new(command_queue),
+        command_queue_sender: use_signal(|| command_queue),
     }
 }

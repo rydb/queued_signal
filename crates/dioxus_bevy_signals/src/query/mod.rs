@@ -8,7 +8,6 @@ use std::{
     collections::{HashMap, HashSet},
     fmt::Debug,
     marker::PhantomData,
-    ops::Deref,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -326,14 +325,13 @@ pub struct QueryMirrorInitialized<Q: QueryData, F: QueryFilter> {
 /// Synchronize a bevy query's results into the dioxus signal mirror.
 pub fn sync_query_mirror_to_signal<T: DioxusQuerySync + 'static, F: QueryFilter + 'static>(
     components_without_signals: Query<T, (F, T::MirrorSignalsWithoutFilter)>,
+    changed_mirrors: Query<T::MirrorSignalsQueryDataImMut, (F, T::MirrorSignalsChangedFilter)>,
     mirror_components: Query<T::MirrorSignalsQueryDataImMut, F>,
     mirror_signal: ResMut<MirrorQuerySignal<T, F>>,
     mut commands: Commands,
     mut init_status: ResMut<QueryMirrorInitialized<T, F>>,
-    // Track last-seen entity count to skip removal detection when stable
-    mut last_entity_count: Local<usize>,
-    // Track per-entity combined version for cheap change detection (single u64, no alloc)
-    mut last_versions: Local<HashMap<Entity, u64>>,
+    // Track known entities to detect insertions and removals.
+    mut known_entities: Local<HashSet<Entity>>,
 ) {
     // Pre-init: spawn mirrors and wait for all entities to be ready.
     if !init_status.initialized {
@@ -350,15 +348,13 @@ pub fn sync_query_mirror_to_signal<T: DioxusQuerySync + 'static, F: QueryFilter 
             });
             init_status.initialized = true;
 
-            // Seed version tracker with initial values
-            *last_entity_count = mirror_components.iter().count();
-            for item in mirror_components.iter() {
-                let entity = T::get_mirror_entity(&item);
-                last_versions.insert(entity, T::extract_version(&item));
-            }
+            *known_entities = mirror_components
+                .iter()
+                .map(|item| T::get_mirror_entity(&item))
+                .collect();
             trace!(
                 "finished initializing component mirror to: {}",
-                mirror_components.iter().count()
+                known_entities.len()
             );
         } else {
             // Pre-init: spawn mirrors for entities that need them
@@ -380,59 +376,41 @@ pub fn sync_query_mirror_to_signal<T: DioxusQuerySync + 'static, F: QueryFilter 
         commands.entity(entity).insert_if_new(bundle);
     }
 
-    // Single pass over mirror components to count entities
-    // while detecting changes via atomic version loads.
-    let mut current_count: usize = 0;
-    let mut has_changes = false;
-    let mut changed_entities: Vec<(Entity, T::MirrorItemHandles)> = Vec::new();
-
-    for item in mirror_components.iter() {
-        current_count += 1;
-        let entity = T::get_mirror_entity(&item);
-        let current_ver = T::extract_version(&item);
-
-        let changed = match last_versions.get(&entity) {
-            Some(last) => current_ver != *last,
-            None => true, // new entity, always needs update
-        };
-
-        if changed {
-            has_changes = true;
-            let handles = T::clone_dioxus_signals(&item);
-            changed_entities.push((entity, handles));
-            last_versions.insert(entity, current_ver);
+    // Remove entities that left the mirror set since the last tick.
+    let mut removed_entities: Vec<Entity> = Vec::new();
+    known_entities.retain(|e| {
+        if mirror_components.contains(*e) {
+            true
+        } else {
+            removed_entities.push(*e);
+            false
         }
+    });
+
+    // Collect entities whose mirrors published changes this tick.
+    // Changed also matches newly added mirrors, covering insertions.
+    let mut changed_entities: Vec<(Entity, T::MirrorItemHandles)> = Vec::new();
+    for item in changed_mirrors.iter() {
+        let entity = T::get_mirror_entity(&item);
+        known_entities.insert(entity);
+        changed_entities.push((entity, T::clone_dioxus_signals(&item)));
     }
 
-    let count_changed = current_count != *last_entity_count;
-    *last_entity_count = current_count;
-
-    // Detect removals and seed new entity versions on count change.
-    if count_changed {
-        // Seed versions for any new entities that weren't in the scan above
+    // Reconcile when the entity count disagrees with the tracked set.
+    // This catches entities that started matching the filter without
+    // publishing any change.
+    if mirror_components.count() != known_entities.len() {
         for item in mirror_components.iter() {
             let entity = T::get_mirror_entity(&item);
-            last_versions
-                .entry(entity)
-                .or_insert_with(|| T::extract_version(&item));
-        }
-    }
-
-    // Entity removal detection when count changed.
-    let mut removed_entities: Vec<Entity> = Vec::new();
-    if count_changed {
-        for (&entity, _) in last_versions.iter() {
-            if !mirror_components.contains(entity) {
-                removed_entities.push(entity);
+            if known_entities.insert(entity) && !changed_entities.iter().any(|(e, _)| *e == entity)
+            {
+                changed_entities.push((entity, T::clone_dioxus_signals(&item)));
             }
-        }
-        for entity in &removed_entities {
-            last_versions.remove(entity);
         }
     }
 
     // Apply insertions and removals directly into the signal map.
-    if has_changes || !removed_entities.is_empty() {
+    if !changed_entities.is_empty() || !removed_entities.is_empty() {
         mirror_signal.0.mutate_set(move |n| {
             let map = &mut n.value;
 
@@ -662,14 +640,6 @@ pub trait MirrorQueryData: QueryData + IterQueryData {
             's,
         >,
     ) -> Self::MirrorItemHandles;
-
-    /// Extract a combined version identifier from mirrored components.
-    fn extract_version<'w, 's>(
-        item: &<<Self::MirrorSignalsQueryDataImMut as QueryData>::ReadOnly as QueryData>::Item<
-            'w,
-            's,
-        >,
-    ) -> u64;
 }
 
 impl<A: DioxusComponentSync, B: DioxusComponentSync> MirrorQueryData for (Entity, &mut A, &mut B) {
@@ -746,19 +716,6 @@ impl<A: DioxusComponentSync, B: DioxusComponentSync> MirrorQueryData for (Entity
         if *current_delta <= 0 {
             item.2.tracking_counts.remove(&id);
         }
-    }
-
-    fn extract_version<'w, 's>(
-        item: &<<Self::MirrorSignalsQueryDataImMut as QueryData>::ReadOnly as QueryData>::Item<
-            'w,
-            's,
-        >,
-    ) -> u64 {
-        let (_, a, b) = item;
-        let va = a.version.load(std::sync::atomic::Ordering::Relaxed);
-        let vb = b.version.load(std::sync::atomic::Ordering::Relaxed);
-        // XOR + rotate to combine two u64 values into one unique identifier
-        va ^ vb.rotate_left(32)
     }
 }
 

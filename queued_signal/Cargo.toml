@@ -11,17 +11,13 @@ license = "Apache-2.0"
 
 [dependencies]
 dioxus = {workspace = true, features = ["macro", "hooks", "signals"]}
-dioxus-signals = {workspace = true}
 dioxus-core = {workspace = true}
-dioxus-hooks = {workspace = true}
+dioxus-signals = {workspace = true}
 
 flume = {workspace = true}
 tokio = {workspace = true, features = ["rt", "time", "sync", "macros"]}
-variadics_please = {workspace = true}
 left-right = {workspace = true}
 parking_lot = {workspace = true}
-anyhow = {workspace = true}
-macro-v = {workspace = true}
 queued_signal_tracing = { workspace = true }
 
 [features]

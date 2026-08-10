@@ -26,8 +26,6 @@ pub enum SingleQueryError {
     NoMatchingEntity,
     /// The query matched more than one entity. Contains all matching [`Entity`] IDs.
     MoreThanOneEntity(Vec<Entity>),
-    /// No upper bound found on the size hint for the query.
-    NoUpperBound,
 }
 
 impl From<SingleQueryError> for String {
@@ -38,7 +36,6 @@ impl From<SingleQueryError> for String {
             SingleQueryError::MoreThanOneEntity(entities) => {
                 format!("more than one matching entity: {:#?}", entities)
             }
-            SingleQueryError::NoUpperBound => "No upper bound for query size found".into(),
         }
     }
 }

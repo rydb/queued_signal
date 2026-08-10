@@ -1,8 +1,11 @@
 use dioxus::prelude::*;
 use dioxus::signals::Signal;
+use dioxus_core::Task;
 use flume::{Receiver, Sender};
 use left_right::{Absorb, ReadHandle, WriteHandle};
 use parking_lot::Mutex;
+use queued_signal_tracing::error;
+use std::any::type_name;
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::ops::{Deref, DerefMut};
@@ -34,8 +37,12 @@ impl Display for HealthStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             HealthStatus::Healthy => write!(f, "Healthy"),
-            HealthStatus::Degraded { pinned_buffers } => write!(f, "Degraded: pinned_buffers {}", pinned_buffers),
-            HealthStatus::Stalled { pinned_buffers } => write!(f, "Stalled: pinned_buffers {}", pinned_buffers),
+            HealthStatus::Degraded { pinned_buffers } => {
+                write!(f, "Degraded: pinned_buffers {}", pinned_buffers)
+            }
+            HealthStatus::Stalled { pinned_buffers } => {
+                write!(f, "Stalled: pinned_buffers {}", pinned_buffers)
+            }
         }
     }
 }
@@ -230,12 +237,15 @@ impl<T: Clone + Send + Sync> QueuedState<T> {
 
 impl<T: Clone + Send + Sync + 'static> QueuedState<T> {
     /// Spawn a background task forwarding values into existing dioxus signals.
+    ///
+    /// Returns the spawned task so callers can cancel forwarding when
+    /// rebinding the target signals to a different source.
     pub fn forward_to<V: 'static>(
         &self,
         value_signal: Signal<V>,
         health_signal: Signal<HealthStatus>,
         map: impl Fn(Arc<T>) -> V + 'static,
-    ) {
+    ) -> Task {
         let state = self.clone();
         // Use dioxus local spawn since Signal is not Send.
         spawn(async move {
@@ -246,18 +256,27 @@ impl<T: Clone + Send + Sync + 'static> QueuedState<T> {
             loop {
                 tokio::select! {
                     Ok(()) = nr.changed() => {
-                        // Retry enter() when a concurrent publish is in
-                        // progress, instead of breaking out of the loop
-                        // permanently.
+                        // Retry enter() while a concurrent publish is in
+                        // progress, skipping this notification after a
+                        // bounded wait.
+                        let deadline = Instant::now() + Duration::from_millis(100);
+                        let mut entered = false;
                         loop {
                             if let Some(g) = state.read_handle.enter() {
                                 let reader_id = state.registry.register();
                                 state.registry.heartbeat(reader_id);
                                 value_signal.set(map(g.0.clone()));
                                 state.registry.unregister(reader_id);
+                                entered = true;
                                 break;
                             }
-                            tokio::task::yield_now().await;
+                            if Instant::now() >= deadline {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                        if !entered {
+                            error!("read handle stayed pinned for {}, skipping update", type_name::<T>());
                         }
                     }
                     Ok(()) = hr.changed() => {
@@ -267,7 +286,7 @@ impl<T: Clone + Send + Sync + 'static> QueuedState<T> {
                 }
                 tokio::task::yield_now().await;
             }
-        });
+        })
     }
 }
 
@@ -323,7 +342,7 @@ pub struct WriterDriver<T: Clone + Send + Sync> {
     health_tx: watch::Sender<HealthStatus>,
     last_health: HealthStatus,
     registry: Arc<ReaderRegistry>,
-    watchdog_timeout: Duration,
+    pub watchdog_timeout: Duration,
     last_publish: Instant,
     /// Sender for authoritative full-value replacements.
     /// Sent values overwrite the entire signal state.
@@ -630,11 +649,27 @@ fn use_queued_state_inner<T: Clone + Send + Sync + 'static, V: 'static>(
             loop {
                 tokio::select! {
                     Ok(()) = notify_rx.changed() => {
-                        let Some(guard) = read_handle.enter() else { break };
-                        let reader_id = registry.register();
-                        registry.heartbeat(reader_id);
-                        value_signal.set(map(guard.0.clone()));
-                        registry.unregister(reader_id);
+                        // Retry enter() while a concurrent publish is in
+                        // progress.
+                        let deadline = Instant::now() + Duration::from_millis(100);
+                        let mut entered = false;
+                        loop {
+                            if let Some(guard) = read_handle.enter() {
+                                let reader_id = registry.register();
+                                registry.heartbeat(reader_id);
+                                value_signal.set(map(guard.0.clone()));
+                                registry.unregister(reader_id);
+                                entered = true;
+                                break;
+                            }
+                            if Instant::now() >= deadline {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                        if !entered {
+                            warn!("use_queued_state: read handle stayed pinned, skipping update");
+                        }
                     }
                     Ok(()) = health_rx.changed() => {
                         health_signal.set(*health_rx.borrow());

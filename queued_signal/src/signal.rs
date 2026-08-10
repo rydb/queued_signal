@@ -6,7 +6,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use dioxus::prelude::*;
@@ -15,7 +15,12 @@ use flume::{Receiver, Sender};
 use parking_lot::Mutex;
 use tokio::sync::oneshot;
 
+use crate::macros::warn;
 use crate::state::{HealthStatus, QueuedSignal, SignalReadGuard, WriterDriver};
+
+/// How long a parked signal request waits for registration before being
+/// evicted.
+const PARKED_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Error state for a queued signal that has not yet resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +76,10 @@ impl<T: Clone + Send + Sync + 'static> QueuedSignalHandle<T> {
     {
         if let Some(w) = self.writer.read().as_ref() {
             w.mutate(f);
+        } else {
+            warn!(
+                "QueuedSignalHandle::mutate dropped: writer not yet available (hub round-trip pending)"
+            );
         }
     }
 
@@ -81,6 +90,10 @@ impl<T: Clone + Send + Sync + 'static> QueuedSignalHandle<T> {
     {
         if let Some(w) = self.writer.read().as_ref() {
             w.mutate_set(f);
+        } else {
+            warn!(
+                "QueuedSignalHandle::mutate_set dropped: writer not yet available (hub round-trip pending)"
+            );
         }
     }
 
@@ -88,6 +101,10 @@ impl<T: Clone + Send + Sync + 'static> QueuedSignalHandle<T> {
     pub fn set_value(&self, value: T) {
         if let Some(w) = self.writer.read().as_ref() {
             w.set_value(value);
+        } else {
+            warn!(
+                "QueuedSignalHandle::set_value dropped: writer not yet available (hub round-trip pending)"
+            );
         }
     }
 
@@ -156,8 +173,8 @@ impl<T: Clone + Send + Sync + 'static> HubCommand for RegisterCommand<T> {
         // Replay any requests that were parked while waiting for
         // this registration. They will now find the signal.
         if let Some(pending) = hub.pending.remove(&type_id) {
-            for cmd in pending {
-                cmd.execute(hub);
+            for parked in pending {
+                parked.cmd.execute(hub);
             }
         }
     }
@@ -183,7 +200,10 @@ impl<T: Clone + Send + Sync + 'static> HubCommand for GetSignalCommand<T> {
             None => {
                 // Signal not registered yet. Park this request so it
                 // resolves when a RegisterCommand arrives for this type.
-                hub.pending.entry(type_id).or_default().push(self);
+                hub.pending.entry(type_id).or_default().push(ParkedCommand {
+                    cmd: self,
+                    parked_at: Instant::now(),
+                });
             }
         }
     }
@@ -213,14 +233,21 @@ impl QueuedSignalSender {
     }
 }
 
+/// A hub command parked until a matching registration arrives.
+struct ParkedCommand {
+    cmd: Box<dyn HubCommand>,
+    parked_at: Instant,
+}
+
 /// Internal hub owning all registered signals and driver tickers.
 struct InnerHub {
     signals: HashMap<TypeId, Box<dyn Any + Send>>,
     drivers: Vec<Box<dyn FnMut() + Send>>,
     requests: Receiver<Box<dyn HubCommand>>,
     shutdown: Arc<AtomicBool>,
-    /// Requests parked until a matching registration arrives.
-    pending: HashMap<TypeId, Vec<Box<dyn HubCommand>>>,
+    /// Requests parked until a matching registration arrives or the
+    /// park timeout elapses.
+    pending: HashMap<TypeId, Vec<ParkedCommand>>,
 }
 
 /// Create a new queued signal hub running in a background thread.
@@ -245,6 +272,13 @@ pub fn create_queued_signal_hub() -> QueuedSignalSender {
                 cmd.execute(&mut hub);
             }
 
+            // Evict requests that have waited too long for registration.
+            // Dropping a parked command resolves its waiter with an error.
+            hub.pending.retain(|_, parked| {
+                parked.retain(|p| p.parked_at.elapsed() < PARKED_REQUEST_TIMEOUT);
+                !parked.is_empty()
+            });
+
             for ticker in &mut hub.drivers {
                 ticker();
             }
@@ -262,8 +296,6 @@ pub fn create_queued_signal_hub() -> QueuedSignalSender {
 }
 
 /// Hook to obtain a [`QueuedSignalHandle`] for type `T`.
-///
-/// Returns either the signal or a [`QueuedNoneState`] until it exists
 ///
 /// # Panics
 ///
@@ -288,7 +320,7 @@ pub fn use_queued_signal<T: Clone + Send + Sync + 'static>() -> QueuedSignalHand
                     let current = signal.read().clone();
                     value.set(Ok(current));
 
-                    signal.state.forward_to(value, health, Ok);
+                    let _ = signal.state.forward_to(value, health, Ok);
                     writer.set(Some(signal));
                 }
                 Err(_) => {

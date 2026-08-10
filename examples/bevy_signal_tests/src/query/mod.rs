@@ -194,8 +194,6 @@ pub fn TenNamesQuery() -> Element {
 
     let names_list_str = use_memo(move || {
         let mut value = "".to_string();
-
-        println!("changed names list str");
         let mut new_str_list = Vec::new();
 
         for (_e, name, greets) in names.iter() {
@@ -211,10 +209,7 @@ pub fn TenNamesQuery() -> Element {
     });
 
     let greet_button_onclick = move |_evt| {
-        println!("sending greet");
-
         for (_e, _n, greet) in names.iter() {
-            println!("greeting");
             greet.value.mutate(|n| n.value += 1);
         }
     };
