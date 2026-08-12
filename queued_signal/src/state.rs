@@ -342,6 +342,7 @@ pub struct WriterDriver<T: Clone + Send + Sync> {
     health_tx: watch::Sender<HealthStatus>,
     last_health: HealthStatus,
     registry: Arc<ReaderRegistry>,
+    /// Timeout for how long signal health updates will be waited for until marking a signal as stalled.
     pub watchdog_timeout: Duration,
     last_publish: Instant,
     /// Sender for authoritative full-value replacements.

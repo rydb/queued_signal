@@ -939,7 +939,7 @@ pub fn use_bevy_query<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>()
                     signal.state.forward_to(value_signal, health_signal, Ok);
                     writer.set(Some(signal));
                 }
-                Err(err) => warn!("use_bevy_query: {}", err),
+                Err(_err) => warn!("use_bevy_query: {}", _err),
             }
         }
     });

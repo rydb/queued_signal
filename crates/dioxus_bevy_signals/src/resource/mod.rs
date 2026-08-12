@@ -327,7 +327,7 @@ where
                     signal.state.forward_to(value_signal, health_signal, Ok);
                     writer.set(Some(signal));
                 }
-                Err(err) => warn!("use_bevy_resource: {}", err),
+                Err(_err) => warn!("use_bevy_resource: {}", _err),
             }
         }
     });

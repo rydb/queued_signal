@@ -557,7 +557,7 @@ impl<A: DioxusAssetSync> AssetMaybeMirrorSignal<A> {
         let _ = extra_info
             .changed_sender
             .send(extra_info.asset_id)
-            .inspect_err(|err| warn!("{err}"));
+            .inspect_err(|_err| warn!("{_err}"));
     }
 
     /// Read asset state
@@ -606,7 +606,7 @@ pub fn use_bevy_asset<A: DioxusAssetSync>(
         if let Some(tx) = id_tx.read().as_ref() {
             let _ = tx
                 .try_send(id)
-                .inspect_err(|err| warn!("asset id channel rejected update: {}", err));
+                .inspect_err(|_err| warn!("asset id channel rejected update: {}", _err));
         }
     });
 
@@ -676,8 +676,8 @@ pub fn use_bevy_asset<A: DioxusAssetSync>(
                     .await
                 {
                     Ok(resp) => resp,
-                    Err(err) => {
-                        warn!("send_command_async failed for {:?}: {}", id, err);
+                    Err(_err) => {
+                        warn!("send_command_async failed for {:?}: {}", id, _err);
                         continue;
                     }
                 };
