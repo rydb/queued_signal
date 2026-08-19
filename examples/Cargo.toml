@@ -8,6 +8,7 @@ license = "MIT"
 
 [dependencies]
 bevy_signal_tests = {path = "./bevy_signal_tests", default-features = false, optional = true}
+bevy_reflection_tests = {path = "./bevy_reflection_tests", default-features = false, optional = true}
 queued_signal = {workspace = true}
 
 [dev-dependencies]
@@ -51,4 +52,5 @@ path = "minimal_dioxus.rs"
 resource_example = ["bevy_signal_tests/resource_tests"]
 query_example = ["bevy_signal_tests/query_tests"]
 asset_example = ["bevy_signal_tests/asset_tests"]
+reflect_example = ["bevy_reflection_tests/reflect_tests"]
 

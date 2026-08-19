@@ -126,9 +126,14 @@ impl<T: Debug + Clone + Send + Sync> Debug for SignalOp<T> {
 }
 
 /// Newtype wrapper over `Arc<T>` that implements [`left_right::Absorb`]
-/// for [`SignalOp<T>`].
-#[derive(Clone)]
+/// for [`SignalOp<T>`]. Its Clone is deep so each buffer owns a distinct Arc.
 pub struct Absorbable<T: Clone>(pub Arc<T>);
+
+impl<T: Clone> Clone for Absorbable<T> {
+    fn clone(&self) -> Self {
+        Absorbable(Arc::new((*self.0).clone()))
+    }
+}
 
 impl<T: Clone + Debug> Debug for Absorbable<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -152,11 +157,14 @@ impl<T: Clone + Send + Sync> Absorb<SignalOp<T>> for Absorbable<T> {
     fn absorb_first(&mut self, operation: &mut SignalOp<T>, _other: &Self) {
         match operation {
             SignalOp::Fn(op) => {
-                let inner = Arc::make_mut(&mut self.0);
-                op(inner);
+                if let Some(inner) = Arc::get_mut(&mut self.0) {
+                    op(inner);
+                } else {
+                    warn!("{} still holds {} strong references. Deferring publish", type_name::<T>(), Arc::strong_count(&self.0));
+                }
             }
             SignalOp::Set(op) => {
-                self.0 = op.0.clone();
+                self.0 = Arc::new((*op.0).clone());
             }
         }
     }
@@ -164,8 +172,11 @@ impl<T: Clone + Send + Sync> Absorb<SignalOp<T>> for Absorbable<T> {
     fn absorb_second(&mut self, operation: SignalOp<T>, _other: &Self) {
         match operation {
             SignalOp::Fn(op) => {
-                let inner = Arc::make_mut(&mut self.0);
-                op(inner);
+                if let Some(inner) = Arc::get_mut(&mut self.0) {
+                    op(inner);
+                } else {
+                    warn!("{} still holds {} strong references. Deferring publish", type_name::<T>(), Arc::strong_count(&self.0));
+                }
             }
             SignalOp::Set(op) => {
                 self.0 = op.0;
@@ -174,8 +185,6 @@ impl<T: Clone + Send + Sync> Absorb<SignalOp<T>> for Absorbable<T> {
     }
 
     fn sync_with(&mut self, first: &Self) {
-        // Clone T into a fresh Arc so that subsequent absorb_first/absorb_second
-        // calls see strong_count == 1, making Arc::make_mut a no-op.
         self.0 = Arc::new((*first.0).clone());
     }
 }
@@ -488,17 +497,28 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
             }
         }
 
-        if did_work && self.last_publish.elapsed() >= publish_interval {
-            self.write_handle.publish();
-            self.last_publish = Instant::now();
-            self.version += 1;
-            let _ = self.notify_tx.send(self.version);
-            if let Some(ref counter) = self.publish_counter {
-                counter.fetch_add(1, Ordering::Relaxed);
+        if (did_work || self.write_handle.has_pending_operations())
+            && self.last_publish.elapsed() >= publish_interval
+        {
+            if self.write_buffer_exclusive() {
+                self.write_handle.publish();
+                self.last_publish = Instant::now();
+                self.version += 1;
+                let _ = self.notify_tx.send(self.version);
+                if let Some(ref counter) = self.publish_counter {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
 
         self.update_health();
+    }
+
+    fn write_buffer_exclusive(&mut self) -> bool {
+        // SAFETY: the write handle owns the write buffer for its lifetime, so
+        // the pointer stays valid while we hold exclusive access during tick.
+        let absorbable = unsafe { self.write_handle.raw_write_handle().as_ref() };
+        Arc::strong_count(&absorbable.0) == 1
     }
 
     fn update_health(&mut self) {
@@ -702,16 +722,12 @@ pub fn use_queued_state_direct<T: Clone + Send + Sync + 'static>(
     use_queued_state_inner(state, arc, |arc| arc)
 }
 
-// SAFETY: Absorbable<T> is a newtype over Arc<T>. Arc<T> is Send when
-// T: Send + Sync, and our bound enforces both. The left-right crate's
-// ReadHandle/WriteHandle internally use Arc<AtomicCell<…>> which are
-// also Send + Sync given T: Send.
+// SAFETY: Absorbable<T> is a transparent wrapper over T. Sending and
+// sharing it is safe when T is Send and Sync, which the bound enforces.
 unsafe impl<T: Clone + Send + Sync> Send for Absorbable<T> {}
 
-// SAFETY: Absorbable<T> is a newtype over Arc<T>. Arc<T> is Sync when
-// T: Send + Sync, and our bound enforces both. Shared references to
-// Absorbable<T> only permit cloning the inner Arc, which is safe to
-// share across threads.
+// SAFETY: Absorbable<T> is a transparent wrapper over T. Shared access
+// only exposes references to T, which is safe to share when T is Sync.
 unsafe impl<T: Clone + Send + Sync> Sync for Absorbable<T> {}
 
 // SAFETY: QueuedState<T> contains:
@@ -807,7 +823,7 @@ mod tests {
         let mut driver = WriterDriver::new(0i32);
 
         // All three op types in one tick.
-        // Priority order: set_value_rx → set_rx → add_rx
+        // Priority order: set_value_rx -> set_rx -> add_rx
         driver.set_value_tx.send(SetValueOp(Arc::new(42))).unwrap();
         driver
             .set_tx
@@ -817,7 +833,7 @@ mod tests {
 
         driver.tick(Duration::ZERO);
 
-        // set_value(42) → mutate_set(+10) → mutate(+1) = 53
+        // set_value(42) -> mutate_set(+10) -> mutate(+1) = 53
         let val = driver.queued_state.read().clone();
         assert_eq!(*val, 53i32);
     }
@@ -884,8 +900,8 @@ mod tests {
         );
     }
 
-    /// Absorbable absorb_first should clone the inner Arc for mutation
-    /// (via Arc::make_mut) and apply the operation.
+    /// Absorbable absorb_first applies the Fn operation to the inner
+    /// value in place without cloning.
     #[test]
     fn absorbable_absorb_first_fn() {
         let mut absorbable = Absorbable(Arc::new(vec![1, 2, 3]));
@@ -906,6 +922,8 @@ mod tests {
         absorbable.absorb_first(&mut op, &other);
 
         assert_eq!(*absorbable.0, vec![9, 9, 9]);
+        // The buffer must own a distinct Arc so the write side can mutate it.
+        assert_eq!(Arc::strong_count(&absorbable.0), 1);
     }
 
     #[test]
@@ -915,6 +933,26 @@ mod tests {
 
         second.sync_with(&first);
         assert_eq!(*second.0, 42i32);
+    }
+
+    /// Sentinel whose Clone panics, to prove the Fn path never clones T.
+    #[derive(Debug, PartialEq)]
+    struct ClonePanics(i32);
+
+    impl Clone for ClonePanics {
+        fn clone(&self) -> Self {
+            panic!("SignalOp::Fn must not clone the inner value");
+        }
+    }
+
+    #[test]
+    fn absorbable_fn_does_not_clone_inner() {
+        let mut absorbable = Absorbable(Arc::new(ClonePanics(1)));
+        let other = Absorbable(Arc::new(ClonePanics(0)));
+
+        let mut op = SignalOp::Fn(Arc::new(|v: &mut ClonePanics| v.0 += 1));
+        absorbable.absorb_first(&mut op, &other);
+        assert_eq!(absorbable.0.0, 2);
     }
 
     /// Compile-time Send/Sync verification for the unsafe impl blocks.

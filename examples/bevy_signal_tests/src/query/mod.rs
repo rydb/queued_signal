@@ -167,7 +167,7 @@ pub fn ToggleableQuery() -> Element {
         let Some((_e, name, _)) = second_query.iter().next() else {
             return value;
         };
-        value = format!("Name: {}", **name.read());
+        value = format!("Name: {}", *name.read());
         value
     });
 
@@ -199,10 +199,6 @@ pub fn TenNamesQuery() -> Element {
         for (_e, name, greets) in names.iter() {
             new_str_list.push((name.read().clone(), greets.read().clone()))
         }
-        let mut new_str_list = new_str_list
-            .iter()
-            .map(|n| (n.0.as_ref(), n.1.as_ref()))
-            .collect::<Vec<_>>();
         new_str_list.sort();
         value += &format!("{:#?}", new_str_list);
         value

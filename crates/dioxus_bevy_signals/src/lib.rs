@@ -33,6 +33,10 @@ pub mod resource;
 #[cfg(feature = "asset")]
 pub mod asset;
 
+/// Bevy reflect-driven type-erased mirroring (feature = "reflect").
+#[cfg(feature = "reflect")]
+pub mod reflect;
+
 /// Sender for bevy command queues across thread boundaries.
 pub type CommandSender = Sender<CommandQueue>;
 /// Receiver for bevy command queues across thread boundaries.
@@ -181,6 +185,11 @@ impl Plugin for DioxusBevyMirrorPlugin {
         .insert_resource(CommandQueueSender {
             tx: self.bevy_command_txrx.tx.clone(),
         });
+
+        // Register reflect-driven type-erased mirroring when enabled.
+        #[cfg(feature = "reflect")]
+        crate::reflect::setup(app);
+
         // Process commands inside the dioxus sync main runner so that
         // dynamically registered systems from command processing are available
         // for the current frame.

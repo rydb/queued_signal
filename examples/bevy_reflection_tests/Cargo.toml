@@ -1,0 +1,25 @@
+[package]
+name = "bevy_reflection_tests"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy_app = {workspace = true}
+bevy_ecs = {workspace = true}
+bevy_time = {workspace = true}
+bevy_log = {workspace = true}
+bevy_reflect = {workspace = true}
+dioxus-core = {workspace = true}
+dioxus-hooks = {workspace = true}
+dioxus-document = {workspace = true}
+dioxus-signals = {workspace = true}
+dioxus = {workspace = true, features = ["lib", "desktop", "document", "devtools", "launch"]}
+flume = {workspace = true}
+queued_signal = {workspace = true}
+dioxus_bevy_signals = {workspace = true, features = ["query", "reflect"]}
+parking_lot = {workspace = true}
+tokio = {workspace = true}
+
+[features]
+reflect_tests = ["dioxus_bevy_signals/reflect"]
+default = ["reflect_tests"]

@@ -13,6 +13,7 @@ bevy_ecs = {workspace = true}
 bevy_app = {workspace = true}
 bevy_asset = {workspace = true}
 bevy_time = {workspace = true}
+bevy_reflect = {workspace = true, optional = true}
 dioxus-core = {workspace = true}
 dioxus-hooks = {workspace = true}
 dioxus-signals = {workspace = true}
@@ -29,5 +30,6 @@ pastey = {workspace = true}
 asset = []
 query = []
 resource = []
+reflect = ["dep:bevy_reflect", "resource", "query"]
 trace = ["queued_signal_tracing/trace"]
 default = ["asset", "query", "resource"]

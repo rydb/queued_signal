@@ -41,6 +41,7 @@ bevy_pbr = {version = "0.19"}
 bevy_transform = {version = "0.19"}
 bevy_time = {version = "0.19"}
 bevy_log = {version = "0.19"}
+bevy_reflect = {version = "0.19"}
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 glam = {version = "0.32"}
 trait-set = {version = "0.3"}

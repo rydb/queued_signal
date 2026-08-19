@@ -116,6 +116,11 @@ impl<T: ResourceDioxusSync> Command for RequestBevyResource<T> {
                 let mut map = world.get_resource_or_init::<RegisteredResourceSyncs>();
                 map.0.insert(TypeId::of::<T>());
                 world.insert_resource(ResourceQueuedSignalMirror(signal.clone()));
+
+                // Elevate any erased reflect mirror for this type.
+                #[cfg(feature = "reflect")]
+                crate::reflect::resource::notify_typed_resource_mirror::<T>(world);
+
                 signal
             }
         };
