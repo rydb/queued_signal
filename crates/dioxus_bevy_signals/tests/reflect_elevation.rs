@@ -43,11 +43,9 @@ fn untyped_query_elevates_to_typed() {
 
     {
         let world = app.world_mut();
-        let signal = register_or_get_query_dyn(
-            world,
-            &["Name".to_string(), "Transform".to_string()],
-        )
-        .expect("reflect query should register");
+        let signal =
+            register_or_get_query_dyn(world, &["Name".to_string(), "Transform".to_string()])
+                .expect("reflect query should register");
         drop(signal);
 
         assert!(
@@ -91,8 +89,8 @@ fn untyped_resource_elevates_to_typed() {
 
     {
         let world = app.world_mut();
-        let signal =
-            register_or_get_resource_dyn(world, "Counter").expect("reflect resource should register");
+        let signal = register_or_get_resource_dyn(world, "Counter")
+            .expect("reflect resource should register");
         drop(signal);
 
         assert!(
@@ -109,13 +107,8 @@ fn untyped_resource_elevates_to_typed() {
         let add_tx = driver.add_tx.clone();
         let queued_state = driver.queued_state.clone();
         let driver_arc = Arc::new(Mutex::new(driver));
-        let signal = QueuedSignal::from_parts(
-            queued_state,
-            Some(driver_arc),
-            add_tx,
-            set_tx,
-            set_value_tx,
-        );
+        let signal =
+            QueuedSignal::from_parts(queued_state, Some(driver_arc), add_tx, set_tx, set_value_tx);
         world.insert_resource(ResourceQueuedSignalMirror(signal));
         notify_typed_resource_mirror::<Counter>(world);
     }
@@ -123,7 +116,10 @@ fn untyped_resource_elevates_to_typed() {
     {
         let world = app.world_mut();
         let mirror = &world.resource::<ReflectResourceRegistry>().map[&TypeId::of::<Counter>()];
-        assert!(mirror.elevated, "mirror should be elevated after typed request");
+        assert!(
+            mirror.elevated,
+            "mirror should be elevated after typed request"
+        );
         assert_eq!(mirror.active_count, 0, "reflect sync should be disabled");
     }
 }

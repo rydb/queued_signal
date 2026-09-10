@@ -7,9 +7,10 @@ use bevy_ecs::prelude::*;
 use bevy_ecs::ptr::{Ptr, PtrMut};
 use bevy_ecs::reflect::AppTypeRegistry;
 use bevy_ecs::system::{
-    FilteredResourcesMutParamBuilder, FilteredResourcesParamBuilder, ParamBuilder, SystemParamBuilder,
+    FilteredResourcesMutParamBuilder, FilteredResourcesParamBuilder, ParamBuilder,
+    SystemParamBuilder,
 };
-use bevy_ecs::world::{FilteredResources, FilteredResourcesMut, CommandQueue};
+use bevy_ecs::world::{CommandQueue, FilteredResources, FilteredResourcesMut};
 use bevy_reflect::{Reflect, ReflectFromPtr};
 use dioxus_core::Task;
 use dioxus_hooks::{use_context, use_future, use_signal};
@@ -23,7 +24,7 @@ use crate::resource::{ResourceDioxusSync, ResourceQueuedSignalMirror};
 use crate::schedules::{DioxusSyncPostUpdate, DioxusSyncUpdate};
 use crate::{CommandQueueSender, add_systems_through_world};
 
-use super::{ErasedValue, clone_into_arc, enumerate_reflect_types, resolve_name};
+use super::{ErasedMutation, ErasedValue, clone_into_arc, enumerate_reflect_types, resolve_name};
 
 /// Error state for a reflect resource signal that has not initialized yet.
 #[derive(Clone, Debug, PartialEq)]
@@ -35,9 +36,6 @@ pub enum ReflectResourceNoneState {
     /// The reflected value could not be cloned for the dioxus side.
     CloneError(String),
 }
-
-/// Type-erased mutation operating on a reflected value.
-pub type ErasedMutation = Arc<dyn Fn(&mut dyn Reflect) + Send + Sync>;
 
 /// Type-erased handle to the currently active resource signal.
 #[derive(Clone)]
@@ -136,24 +134,28 @@ pub fn drive_reflect_resource_signals(mut registry: ResMut<ReflectResourceRegist
 fn reflect_signal_handle(signal: QueuedSignal<ErasedValue>) -> ResourceSignalHandle {
     let s = signal.clone();
     let mutate = Arc::new(move |f: ErasedMutation| {
-        s.mutate(move |erased: &mut ErasedValue| match erased.0.reflect_clone() {
-            Ok(mut cloned) => {
-                f(&mut *cloned);
-                erased.0 = Arc::from(cloned);
-            }
-            Err(err) => error!("reflect clone failed: {}", err),
-        });
+        s.mutate(
+            move |erased: &mut ErasedValue| match erased.0.reflect_clone() {
+                Ok(mut cloned) => {
+                    f(&mut *cloned);
+                    erased.0 = Arc::from(cloned);
+                }
+                Err(err) => error!("reflect clone failed: {}", err),
+            },
+        );
     });
 
     let s = signal.clone();
     let mutate_set = Arc::new(move |f: ErasedMutation| {
-        s.mutate_set(move |erased: &mut ErasedValue| match erased.0.reflect_clone() {
-            Ok(mut cloned) => {
-                f(&mut *cloned);
-                erased.0 = Arc::from(cloned);
-            }
-            Err(err) => error!("reflect clone failed: {}", err),
-        });
+        s.mutate_set(
+            move |erased: &mut ErasedValue| match erased.0.reflect_clone() {
+                Ok(mut cloned) => {
+                    f(&mut *cloned);
+                    erased.0 = Arc::from(cloned);
+                }
+                Err(err) => error!("reflect clone failed: {}", err),
+            },
+        );
     });
 
     let s = signal.clone();
@@ -171,9 +173,11 @@ fn reflect_signal_handle(signal: QueuedSignal<ErasedValue>) -> ResourceSignalHan
 
     let state = signal.state.clone();
     let forward_to = Arc::new(move |value, health| {
-        state.forward_to(value, health, |arc: Arc<ErasedValue>| match arc.0.reflect_clone() {
-            Ok(boxed) => Ok(Arc::from(boxed)),
-            Err(err) => Err(ReflectResourceNoneState::CloneError(err.to_string())),
+        state.forward_to(value, health, |arc: Arc<ErasedValue>| {
+            match arc.0.reflect_clone() {
+                Ok(boxed) => Ok(Arc::from(boxed)),
+                Err(err) => Err(ReflectResourceNoneState::CloneError(err.to_string())),
+            }
         })
     });
 
@@ -403,7 +407,8 @@ pub fn register_or_get_resource_dyn(
     )
         .build_state(world)
         .build_system(
-            move |mut resources: FilteredResourcesMut, mut registry: ResMut<ReflectResourceRegistry>| {
+            move |mut resources: FilteredResourcesMut,
+                  mut registry: ResMut<ReflectResourceRegistry>| {
                 let Some(mirror) = registry.map.get_mut(&type_id) else {
                     return;
                 };

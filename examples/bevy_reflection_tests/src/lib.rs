@@ -1,12 +1,19 @@
 //! Reflect-driven bevy mirroring tests.
 
+use std::io;
 use std::thread;
 
 use bevy_app::{App, ScheduleRunnerPlugin};
-use dioxus::prelude::*;
 use dioxus::LaunchBuilder;
+use dioxus::prelude::*;
 use dioxus_bevy_signals::{BevyCommandChannels, CommandQueueSender, DioxusBevyMirrorPlugin};
 use dioxus_hooks::{use_context, use_context_provider};
+use tracing_chrome::ChromeLayerBuilder;
+use tracing_subscriber::filter::filter_fn;
+use tracing_subscriber::fmt;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::registry;
+use tracing_subscriber::util::SubscriberInitExt;
 
 pub mod query;
 pub mod resource;
@@ -39,6 +46,33 @@ impl bevy_app::Plugin for ReflectionTestsPlugin {
 
 /// Run the reflect tests in a headless bevy app plus a dioxus UI.
 pub fn run_reflection_tests() {
+    // Filter OUT noisy crate tracing
+    // metadata.target() is the module path, e.g. "dioxus_core::scope_arena"
+    let filter = filter_fn(|metadata| {
+        !metadata.target().starts_with("dioxus_core")
+            && !metadata.target().starts_with("dioxus_signals")
+            && !metadata.target().starts_with("tungstenite")
+            && !metadata.target().starts_with("bevy_ecs")
+            && !metadata.target().starts_with("bevy_app")
+            && !metadata.target().starts_with("warnings")
+        // true
+    });
+
+    let stdout_layer = fmt::layer().with_writer(io::stdout);
+
+    let (chrome_layer, _chrome_guard) = ChromeLayerBuilder::new()
+        .file("./target/bevy_signal_tests_trace.json")
+        .include_args(true)
+        .build();
+
+    let subscriber = registry()
+        .with(filter)
+        .with(stdout_layer)
+        .with(chrome_layer);
+
+    subscriber.init();
+
+
     let plugin = ReflectionTestsPlugin::default();
 
     let bevy_plugin = plugin.clone();
@@ -67,8 +101,8 @@ pub fn reflection_app() -> Element {
 
     rsx! {
         div {
-            // query::QueryDynDemo {}
-            resource::ReflectElevationTest {}
+            query::QueryElevationTest {}
+            // resource::ReflectElevationTest {}
         }
     }
 }

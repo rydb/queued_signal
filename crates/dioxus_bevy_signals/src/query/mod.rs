@@ -212,11 +212,28 @@ impl<T: DioxusComponentSync> DioxusMirror<T> {
     }
 }
 
+/// Entities whose component was just written from a dioxus mirror.
+#[derive(Resource)]
+struct RecentlySyncedToComponent<T: DioxusComponentSync> {
+    entities: HashSet<Entity>,
+    _marker: PhantomData<T>,
+}
+
+impl<T: DioxusComponentSync> Default for RecentlySyncedToComponent<T> {
+    fn default() -> Self {
+        Self {
+            entities: HashSet::new(),
+            _marker: PhantomData,
+        }
+    }
+}
+
 /// Copies a dioxus-side signal value back into the bevy component.
 #[allow(clippy::type_complexity)]
 fn sync_component_to_mirror<T: DioxusComponentSync>(
     components: Query<(Entity, &mut DioxusMirror<T>, &mut T), Changed<DioxusMirror<T>>>,
     mut last_versions: Local<HashMap<Entity, u64>>,
+    mut recently_written: ResMut<RecentlySyncedToComponent<T>>,
 ) {
     for (entity, mut mirror, mut value) in components {
         let current_version = mirror.version.load(Ordering::Acquire);
@@ -227,7 +244,8 @@ fn sync_component_to_mirror<T: DioxusComponentSync>(
             None => true,
         };
         if is_changed {
-            *value.bypass_change_detection() = mirror.value.read().as_ref().clone();
+            *value = mirror.value.read().as_ref().clone();
+            recently_written.entities.insert(entity);
             mirror.set_changed();
             last_versions.insert(entity, current_version);
         }
@@ -251,9 +269,16 @@ fn delete_unused_mirrors<T: DioxusComponentSync>(
 /// Sync bevy components to their changed mirrors.
 #[allow(clippy::type_complexity)]
 fn sync_mirror_to_component<T: DioxusComponentSync>(
-    mut components: Query<(&T, &DioxusMirror<T>), (With<DioxusTrackingQueries<T>>, Changed<T>)>,
+    mut components: Query<
+        (Entity, &T, &DioxusMirror<T>),
+        (With<DioxusTrackingQueries<T>>, Changed<T>),
+    >,
+    mut recently_written: ResMut<RecentlySyncedToComponent<T>>,
 ) {
-    for (value, mirror) in &mut components {
+    for (entity, value, mirror) in &mut components {
+        if recently_written.entities.remove(&entity) {
+            continue;
+        }
         mirror.value.set_value(value.clone());
     }
 }
@@ -451,6 +476,7 @@ impl<T: DioxusComponentSync> Command for RequestComponentsMirror<T> {
             // Mark T as mirrored before adding systems so subsequent
             // requests for the same component type are no-ops.
             mirrored_components.0.insert(TypeId::of::<T>());
+            world.init_resource::<RecentlySyncedToComponent<T>>();
 
             add_systems_through_world(
                 world,
@@ -819,6 +845,18 @@ impl<T: MirrorQueryData, F: QueryFilter> Default for MirrorQuery<T, F> {
 /// A mirrored bevy query holding signals for matching components.
 #[derive(Resource)]
 pub struct MirrorQuerySignal<Q: MirrorQueryData, F: QueryFilter>(QueuedSignal<MirrorQuery<Q, F>>);
+
+impl<Q: MirrorQueryData, F: QueryFilter> MirrorQuerySignal<Q, F> {
+    /// The underlying query signal.
+    pub fn signal(&self) -> &QueuedSignal<MirrorQuery<Q, F>> {
+        &self.0
+    }
+
+    /// A clone of the underlying query signal.
+    pub fn signal_cloned(&self) -> QueuedSignal<MirrorQuery<Q, F>> {
+        self.0.clone()
+    }
+}
 
 /// Write driver for ticking query signal updates.
 #[derive(Resource)]

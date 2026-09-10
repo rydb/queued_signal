@@ -160,7 +160,11 @@ impl<T: Clone + Send + Sync> Absorb<SignalOp<T>> for Absorbable<T> {
                 if let Some(inner) = Arc::get_mut(&mut self.0) {
                     op(inner);
                 } else {
-                    warn!("{} still holds {} strong references. Deferring publish", type_name::<T>(), Arc::strong_count(&self.0));
+                    warn!(
+                        "{} still holds {} strong references. Deferring publish",
+                        type_name::<T>(),
+                        Arc::strong_count(&self.0)
+                    );
                 }
             }
             SignalOp::Set(op) => {
@@ -175,7 +179,11 @@ impl<T: Clone + Send + Sync> Absorb<SignalOp<T>> for Absorbable<T> {
                 if let Some(inner) = Arc::get_mut(&mut self.0) {
                     op(inner);
                 } else {
-                    warn!("{} still holds {} strong references. Deferring publish", type_name::<T>(), Arc::strong_count(&self.0));
+                    warn!(
+                        "{} still holds {} strong references. Deferring publish",
+                        type_name::<T>(),
+                        Arc::strong_count(&self.0)
+                    );
                 }
             }
             SignalOp::Set(op) => {

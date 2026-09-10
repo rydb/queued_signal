@@ -1,5 +1,6 @@
 //! Field path navigation and leaf primitive helpers for reflected values.
 
+use bevy_ecs::name::Name;
 use bevy_reflect::{Reflect, ReflectMut, ReflectRef};
 
 /// One step in a path into a reflected value.
@@ -7,13 +8,16 @@ use bevy_reflect::{Reflect, ReflectMut, ReflectRef};
 pub enum ReflectPathSegment {
     /// A named struct field.
     Field(String),
+    /// A tuple struct field index.
+    Index(usize),
 }
 
 impl ReflectPathSegment {
-    /// The field name for this segment, when it targets a field.
-    pub fn as_str(&self) -> &str {
+    /// A display label for this segment.
+    pub fn label(&self) -> String {
         match self {
-            ReflectPathSegment::Field(name) => name,
+            ReflectPathSegment::Field(name) => name.clone(),
+            ReflectPathSegment::Index(idx) => idx.to_string(),
         }
     }
 }
@@ -35,59 +39,139 @@ impl ReflectPath {
         path
     }
 
+    /// Append a tuple field index segment to this path.
+    pub fn index(&self, idx: usize) -> Self {
+        let mut path = self.clone();
+        path.0.push(ReflectPathSegment::Index(idx));
+        path
+    }
+
     /// The segments in this path.
     pub fn segments(&self) -> &[ReflectPathSegment] {
         &self.0
     }
+
+    /// A dotted label describing this path.
+    pub fn label(&self) -> String {
+        self.0
+            .iter()
+            .map(ReflectPathSegment::label)
+            .collect::<Vec<_>>()
+            .join(".")
+    }
 }
 
-/// Navigate to a reflected value along a path of named struct fields.
+/// Navigate to a reflected value along a path of named and tuple fields.
 pub fn read_at_path<'a>(mut value: &'a dyn Reflect, path: &ReflectPath) -> Option<&'a dyn Reflect> {
     for segment in path.segments() {
-        let ReflectRef::Struct(s) = value.reflect_ref() else {
-            return None;
+        value = match segment {
+            ReflectPathSegment::Field(name) => {
+                let ReflectRef::Struct(s) = value.reflect_ref() else {
+                    return None;
+                };
+                s.field(name)?.try_as_reflect()?
+            }
+            ReflectPathSegment::Index(idx) => {
+                let ReflectRef::TupleStruct(ts) = value.reflect_ref() else {
+                    return None;
+                };
+                ts.field(*idx)?.try_as_reflect()?
+            }
         };
-        let field = s.field(segment.as_str())?;
-        value = field.try_as_reflect()?;
     }
     Some(value)
 }
 
-/// Write a primitive leaf value along a path of named struct fields.
+/// Descend one path segment mutably.
+fn descend_mut<'a>(
+    current: &'a mut dyn Reflect,
+    segment: &ReflectPathSegment,
+) -> Option<&'a mut dyn Reflect> {
+    match segment {
+        ReflectPathSegment::Field(name) => {
+            let ReflectMut::Struct(s) = current.reflect_mut() else {
+                return None;
+            };
+            let field = s.field_mut(name)?;
+            field.try_as_reflect_mut()
+        }
+        ReflectPathSegment::Index(idx) => {
+            let ReflectMut::TupleStruct(ts) = current.reflect_mut() else {
+                return None;
+            };
+            let field = ts.field_mut(*idx)?;
+            field.try_as_reflect_mut()
+        }
+    }
+}
+
+/// Write a primitive leaf value along a path of named and tuple fields.
 pub fn write_at_path(
     root: &mut dyn Reflect,
     path: &ReflectPath,
     replacement: &PrimitiveValue,
 ) -> bool {
-    let segments = path.segments();
-    let Some((last, parents)) = segments.split_last() else {
-        return false;
-    };
-
     let mut current: &mut dyn Reflect = root;
-    for segment in parents {
-        let ReflectMut::Struct(s) = current.reflect_mut() else {
+    for segment in path.segments() {
+        let Some(next) = descend_mut(current, segment) else {
             return false;
         };
-        let Some(field) = s.field_mut(segment.as_str()) else {
-            return false;
-        };
-        let Some(field) = field.try_as_reflect_mut() else {
-            return false;
-        };
-        current = field;
+        current = next;
     }
+    write_primitive(current, replacement)
+}
 
-    let ReflectMut::Struct(s) = current.reflect_mut() else {
-        return false;
-    };
-    let Some(leaf) = s.field_mut(last.as_str()) else {
-        return false;
-    };
-    let Some(leaf) = leaf.try_as_reflect_mut() else {
-        return false;
-    };
-    write_primitive(leaf, replacement)
+/// Iteratively collect every primitive leaf in a reflected value with its path.
+///
+/// Struct and tuple struct fields are walked down to their primitive leaves.
+/// Leaves that cannot be reduced to a primitive are reported as errors.
+pub fn collect_primitive_leaves(
+    value: &dyn Reflect,
+) -> Vec<(ReflectPath, Result<PrimitiveValue, String>)> {
+    let mut out = Vec::new();
+    let mut stack: Vec<(ReflectPath, &dyn Reflect)> = vec![(ReflectPath::root(), value)];
+    while let Some((path, current)) = stack.pop() {
+        if let Some(primitive) = reflect_to_primitive(current) {
+            out.push((path, Ok(primitive)));
+            continue;
+        }
+
+        let children: Vec<(ReflectPath, &dyn Reflect)> = match current.reflect_ref() {
+            ReflectRef::Struct(s) => s
+                .iter_fields()
+                .enumerate()
+                .filter_map(|(_idx, (name, field))| {
+                    let field = field.try_as_reflect()?;
+                    Some((path.field(name), field))
+                })
+                .collect(),
+            ReflectRef::TupleStruct(ts) => ts
+                .iter_fields()
+                .enumerate()
+                .filter_map(|(idx, field)| {
+                    let field = field.try_as_reflect()?;
+                    Some((path.index(idx), field))
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        if children.is_empty() {
+            out.push((
+                path,
+                Err(format!(
+                    "{} is not a primitive value",
+                    current.reflect_short_type_path()
+                )),
+            ));
+        } else {
+            // Push in reverse so the final output keeps field order.
+            for child in children.into_iter().rev() {
+                stack.push(child);
+            }
+        }
+    }
+    out
 }
 
 /// The type of a leaf primitive.
@@ -188,10 +272,7 @@ impl PrimitiveValue {
     /// Parse a string into a primitive of the given kind.
     pub fn parse(text: &str, kind: PrimitiveKind) -> Option<PrimitiveValue> {
         match kind {
-            PrimitiveKind::Bool => text
-                .parse::<bool>()
-                .ok()
-                .map(PrimitiveValue::Bool),
+            PrimitiveKind::Bool => text.parse::<bool>().ok().map(PrimitiveValue::Bool),
             PrimitiveKind::I8 => text.parse::<i8>().ok().map(PrimitiveValue::I8),
             PrimitiveKind::I16 => text.parse::<i16>().ok().map(PrimitiveValue::I16),
             PrimitiveKind::I32 => text.parse::<i32>().ok().map(PrimitiveValue::I32),
@@ -244,6 +325,9 @@ pub fn reflect_to_primitive(value: &dyn Reflect) -> Option<PrimitiveValue> {
     }
     if let Some(v) = value.downcast_ref::<String>() {
         return Some(PrimitiveValue::String(v.clone()));
+    }
+    if let Some(v) = value.downcast_ref::<Name>() {
+        return Some(PrimitiveValue::String(v.as_str().to_owned()));
     }
     None
 }
@@ -313,10 +397,17 @@ pub fn write_primitive(target: &mut dyn Reflect, value: &PrimitiveValue) -> bool
             *x = *v;
             true
         }),
-        PrimitiveValue::String(v) => target.downcast_mut::<String>().is_some_and(|x| {
-            *x = v.clone();
-            true
-        }),
+        PrimitiveValue::String(v) => {
+            if let Some(x) = target.downcast_mut::<String>() {
+                *x = v.clone();
+                return true;
+            }
+            if let Some(name) = target.downcast_mut::<Name>() {
+                name.set(v.clone());
+                return true;
+            }
+            false
+        }
     }
 }
 

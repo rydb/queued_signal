@@ -9,18 +9,15 @@ pub mod path;
 pub mod query;
 pub mod resource;
 
-use std::{
-    any::TypeId,
-    collections::HashSet,
-    ops::Deref,
-    sync::Arc,
-};
+use std::{any::TypeId, collections::HashSet, ops::Deref, sync::Arc};
 
 use bevy_app::prelude::*;
 use bevy_ecs::reflect::{AppTypeRegistry, ReflectComponent, ReflectResource};
 use bevy_reflect::{Reflect, ReflectCloneError};
 
-use crate::macros::*;
+
+/// Type-erased mutation operating on a reflected value.
+pub type ErasedMutation = Arc<dyn Fn(&mut dyn Reflect) + Send + Sync>;
 
 /// Kinds of reflectable bevy state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,8 +107,7 @@ pub fn resolve_name(
         return Ok(info.type_id);
     }
 
-    let matches: Vec<&ReflectTypeInfo> =
-        infos.iter().filter(|i| i.short_path == name).collect();
+    let matches: Vec<&ReflectTypeInfo> = infos.iter().filter(|i| i.short_path == name).collect();
 
     match matches.len() {
         1 => Ok(matches[0].type_id),
@@ -127,9 +123,7 @@ pub fn resolve_name(
 pub fn clone_into_arc(value: &dyn Reflect) -> Result<Arc<dyn Reflect>, ReflectCloneError> {
     match value.reflect_clone() {
         Ok(boxed) => Ok(Arc::from(boxed)),
-        Err(err) => {
-            Err(err)
-        }
+        Err(err) => Err(err),
     }
 }
 
@@ -176,5 +170,9 @@ pub fn setup(app: &mut App) {
     app.add_systems(
         crate::schedules::DioxusSyncUpdate,
         resource::drive_reflect_resource_signals,
+    );
+    app.add_systems(
+        crate::schedules::DioxusSyncUpdate,
+        query::drive_reflect_query_signals,
     );
 }

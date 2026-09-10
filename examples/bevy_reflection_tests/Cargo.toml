@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 bevy_app = {workspace = true}
-bevy_ecs = {workspace = true}
+bevy_ecs = {workspace = true, features = ["trace", "debug"]}
 bevy_time = {workspace = true}
 bevy_log = {workspace = true}
 bevy_reflect = {workspace = true}
@@ -17,6 +17,9 @@ dioxus = {workspace = true, features = ["lib", "desktop", "document", "devtools"
 flume = {workspace = true}
 queued_signal = {workspace = true}
 dioxus_bevy_signals = {workspace = true, features = ["query", "reflect"]}
+queued_signal_tracing = {workspace = true, features = ["trace"]}
+tracing-subscriber = {workspace = true}
+tracing-chrome = {workspace = true}
 parking_lot = {workspace = true}
 tokio = {workspace = true}
 

@@ -5,7 +5,7 @@ use bevy_ecs::prelude::*;
 use bevy_reflect::{Reflect, ReflectRef};
 use dioxus::prelude::*;
 use dioxus_bevy_signals::reflect::path::{
-    PrimitiveValue, ReflectPath, reflect_to_primitive, write_at_path,
+    PrimitiveValue, ReflectPath, ReflectPathSegment, reflect_to_primitive, write_at_path,
 };
 use dioxus_bevy_signals::reflect::resource::{ReflectResourceSignal, use_bevy_resource_dyn};
 use dioxus_bevy_signals::resource::use_bevy_resource;
@@ -70,14 +70,16 @@ pub fn ReflectCounter() -> Element {
 /// Demo demonstrating elevating a reflect resource into a typed resource pointer
 #[component]
 pub fn ReflectElevationTest() -> Element {
-    let mut typed_counter = use_signal(|| rsx! {
-        h1 {
-            "...waiting for countdown"
+    let mut typed_counter = use_signal(|| {
+        rsx! {
+            h1 {
+                "...waiting for countdown"
+            }
         }
     });
 
     use_future(move || async move {
-        for i in 0..1 {
+        for _i in 0..1 {
             let _ = tokio::time::sleep(Duration::from_secs(1)).await;
         }
         *typed_counter.write() = rsx! {
@@ -89,11 +91,14 @@ pub fn ReflectElevationTest() -> Element {
         ReflectCounter {  }
         {typed_counter.read().clone()}
     }
-
 }
 
 /// Render a reflected value as a flat list of editable primitive leaves.
-fn render_reflect(signal: ReflectResourceSignal, path: ReflectPath, value: &dyn Reflect) -> Element {
+fn render_reflect(
+    signal: ReflectResourceSignal,
+    path: ReflectPath,
+    value: &dyn Reflect,
+) -> Element {
     let leaves = collect_leaves(&path, value);
 
     rsx! {
@@ -122,7 +127,9 @@ fn collect_leaves(
         if let ReflectRef::Struct(s) = value.reflect_ref() {
             let mut children: Vec<(ReflectPath, &dyn Reflect)> = s
                 .iter_fields()
-                .filter_map(|(name, field)| field.try_as_reflect().map(|refl| (path.field(name), refl)))
+                .filter_map(|(name, field)| {
+                    field.try_as_reflect().map(|refl| (path.field(name), refl))
+                })
                 .collect();
             children.reverse();
             stack.extend(children);
@@ -133,13 +140,17 @@ fn collect_leaves(
 }
 
 /// Render a primitive leaf as a labeled, editable input.
-fn render_leaf(signal: ReflectResourceSignal, path: ReflectPath, current: PrimitiveValue) -> Element {
+fn render_leaf(
+    signal: ReflectResourceSignal,
+    path: ReflectPath,
+    current: PrimitiveValue,
+) -> Element {
     let kind = current.kind();
     let initial = current.to_string_repr();
     let label = path
         .segments()
         .last()
-        .map(|s| s.as_str().to_owned())
+        .map(ReflectPathSegment::label)
         .unwrap_or_default();
 
     rsx! {
