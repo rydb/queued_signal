@@ -15,7 +15,6 @@ use bevy_app::prelude::*;
 use bevy_ecs::reflect::{AppTypeRegistry, ReflectComponent, ReflectResource};
 use bevy_reflect::{Reflect, ReflectCloneError};
 
-
 /// Type-erased mutation operating on a reflected value.
 pub type ErasedMutation = Arc<dyn Fn(&mut dyn Reflect) + Send + Sync>;
 

@@ -8,5 +8,4 @@ pub mod signal;
 pub mod state;
 pub mod swap_cell;
 
-
 pub(crate) mod macros;

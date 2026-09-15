@@ -9,15 +9,10 @@ use bevy_reflect::Reflect;
 use bevy_time::{Real, Time};
 use dioxus::prelude::*;
 use dioxus_bevy_signals::query::use_bevy_query;
-use dioxus_bevy_signals::reflect::path::{
-    PrimitiveValue, collect_primitive_leaves, write_at_path,
-};
-use dioxus_bevy_signals::reflect::query::{
-    ReflectComponentHandle, use_bevy_query_dyn,
-};
-use queued_signal_tracing::*;
+use dioxus_bevy_signals::reflect::path::{PrimitiveValue, collect_primitive_leaves, write_at_path};
+use dioxus_bevy_signals::reflect::query::{ReflectComponentHandle, use_bevy_query_dyn};
 use dioxus_hooks::{use_memo, use_signal};
-
+use queued_signal_tracing::*;
 
 #[derive(Component, Clone, Default, PartialEq, PartialOrd, Eq, Ord, Debug, Reflect)]
 #[reflect(Component)]

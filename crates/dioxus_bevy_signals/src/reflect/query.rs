@@ -27,9 +27,7 @@ use queued_signal::state::{HealthStatus, QueuedSignal, SignalReadGuard, WriterDr
 use queued_signal_tracing::error;
 use tokio::sync::{oneshot, watch};
 
-use crate::query::{
-    DioxusComponentSync, MirrorQuery, MirrorQueryData, MirrorQuerySignal,
-};
+use crate::query::{DioxusComponentSync, MirrorQuery, MirrorQueryData, MirrorQuerySignal};
 use crate::reflect::NameResolutionError;
 use crate::schedules::{DioxusSyncPostUpdate, DioxusSyncUpdate};
 use crate::{CommandQueueSender, add_systems_through_world};
@@ -578,7 +576,13 @@ fn type_short_path(world: &World, type_id: TypeId) -> String {
     let registry = registry.read();
     registry
         .get(type_id)
-        .map(|registration| registration.type_info().type_path_table().short_path().to_owned())
+        .map(|registration| {
+            registration
+                .type_info()
+                .type_path_table()
+                .short_path()
+                .to_owned()
+        })
         .unwrap_or_else(|| format!("{type_id:?}"))
 }
 
@@ -659,12 +663,8 @@ pub fn register_or_get_query_dyn(
     let mut reflect_from_ptrs = Vec::with_capacity(type_ids.len());
     for type_id in &type_ids {
         let registration = registry.get(*type_id).unwrap();
-        let reflect_from_ptr = registration
-            .data::<ReflectFromPtr>().unwrap().clone();
-        let component_id = world
-            .components()
-            .get_id(*type_id)
-            .unwrap();
+        let reflect_from_ptr = registration.data::<ReflectFromPtr>().unwrap().clone();
+        let component_id = world.components().get_id(*type_id).unwrap();
         component_ids.push(component_id);
         reflect_from_ptrs.push(reflect_from_ptr);
     }
@@ -823,8 +823,9 @@ pub fn register_or_get_query_dyn(
                                 continue;
                             };
                             // SAFETY: untyped holds the type mirrored by reflect_from_ptr.
-                            let mut reflect = untyped
-                                .map_unchanged(|ptr| unsafe { reflect_from_ptr.as_reflect_mut(ptr) });
+                            let mut reflect = untyped.map_unchanged(|ptr| unsafe {
+                                reflect_from_ptr.as_reflect_mut(ptr)
+                            });
                             // Marking the component changed lets the typed query
                             // observe this write. The read system skips these
                             // entities to avoid echoing the write back.

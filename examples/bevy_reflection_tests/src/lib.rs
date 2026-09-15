@@ -72,7 +72,6 @@ pub fn run_reflection_tests() {
 
     subscriber.init();
 
-
     let plugin = ReflectionTestsPlugin::default();
 
     let bevy_plugin = plugin.clone();

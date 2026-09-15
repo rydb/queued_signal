@@ -1,4 +1,11 @@
-use std::{ops::Deref, ptr::NonNull, sync::{Arc, atomic::{AtomicUsize, Ordering}}};
+use std::{
+    ops::Deref,
+    ptr::NonNull,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 /// Single-buffer cell shared between one writer and many readers.
 pub struct SwapCellSync<T: Send + Sync> {

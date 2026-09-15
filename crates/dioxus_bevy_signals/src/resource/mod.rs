@@ -11,7 +11,9 @@ use dioxus_core::{IntoAttributeValue, IntoDynNode};
 use dioxus_hooks::{use_context, use_future, use_memo, use_signal};
 use dioxus_signals::{Memo, ReadableExt, Signal, WritableExt};
 use parking_lot::Mutex;
-use queued_signal::state::{HealthStatus, QueuedSignal, SetValueOp, TrackedReadGuard, WriterDriver};
+use queued_signal::state::{
+    HealthStatus, QueuedSignal, SetValueOp, TrackedReadGuard, WriterDriver,
+};
 use std::any::{TypeId, type_name};
 use std::collections::HashSet;
 use std::fmt::Display;
