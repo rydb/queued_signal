@@ -16,7 +16,7 @@ dioxus-signals = {workspace = true}
 
 flume = {workspace = true}
 tokio = {workspace = true, features = ["rt", "time", "sync", "macros"]}
-left-right = {workspace = true}
+arc-swap = "1.9"
 parking_lot = {workspace = true}
 queued_signal_tracing = { workspace = true }
 

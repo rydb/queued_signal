@@ -16,7 +16,7 @@ use parking_lot::Mutex;
 use tokio::sync::oneshot;
 
 use crate::macros::warn;
-use crate::state::{HealthStatus, QueuedSignal, SignalReadGuard, WriterDriver};
+use crate::state::{HealthStatus, QueuedSignal, TrackedReadGuard, WriterDriver};
 
 /// How long a parked signal request waits for registration before being
 /// evicted.
@@ -42,8 +42,8 @@ impl From<QueuedSignalNoneState> for String {
 
 /// Handle to a globally registered queued signal.
 pub struct QueuedSignalHandle<T: Clone + Send + Sync + 'static> {
-    /// Current value, or an error state if not yet resolved.
-    pub value: Signal<Result<Arc<T>, QueuedSignalNoneState>>,
+    /// Version signal that triggers re-renders on publish.
+    pub version: Signal<u64>,
     /// Health status of the underlying signal.
     pub health: Signal<HealthStatus>,
     writer: Signal<Option<QueuedSignal<T>>>,
@@ -113,17 +113,23 @@ impl<T: Clone + Send + Sync + 'static> QueuedSignalHandle<T> {
         *self.health.read()
     }
 
-    /// Read the current value through a [`SignalReadGuard`].
-    pub fn read(&self) -> SignalReadGuard<'_, Result<Arc<T>, QueuedSignalNoneState>> {
-        SignalReadGuard::new(self.value.read())
+    /// Read the current value, subscribing to version updates.
+    pub fn read(&self) -> Result<TrackedReadGuard<T>, QueuedSignalNoneState> {
+        let _ = self.version.read();
+        let writer = self.writer.read();
+        match writer.as_ref() {
+            Some(signal) => Ok(signal.read()),
+            None => Err(QueuedSignalNoneState::NotRegistered),
+        }
     }
 
-    /// Read the `Ok` variant, mapping the inner value through `f`.
+    /// Read the value, mapping it through `f`.
     pub fn read_ok<U>(&self, f: impl FnOnce(&T) -> U) -> Result<U, QueuedSignalNoneState> {
-        let guard = self.value.read();
-        match &*guard {
-            Ok(arc) => Ok(f(arc.as_ref())),
-            Err(e) => Err(*e),
+        let _ = self.version.read();
+        let writer = self.writer.read();
+        match writer.as_ref() {
+            Some(signal) => Ok(f(&signal.read())),
+            None => Err(QueuedSignalNoneState::NotRegistered),
         }
     }
 }
@@ -303,8 +309,7 @@ pub fn create_queued_signal_hub() -> QueuedSignalSender {
 pub fn use_queued_signal<T: Clone + Send + Sync + 'static>() -> QueuedSignalHandle<T> {
     let sender = use_context::<QueuedSignalSender>();
 
-    let mut value: Signal<Result<Arc<T>, QueuedSignalNoneState>> =
-        use_signal(|| Err(QueuedSignalNoneState::NotRegistered));
+    let mut version: Signal<u64> = use_signal(|| 0);
     let health: Signal<HealthStatus> = use_signal(|| HealthStatus::Healthy);
     let mut writer: Signal<Option<QueuedSignal<T>>> = use_signal(|| None);
 
@@ -312,26 +317,19 @@ pub fn use_queued_signal<T: Clone + Send + Sync + 'static>() -> QueuedSignalHand
     use_future(move || {
         let sender = sender.clone();
         async move {
-            value.set(Err(QueuedSignalNoneState::Fetching));
-
             let rx = sender.request::<T>();
             match rx.await {
                 Ok(signal) => {
-                    let current = signal.read().clone();
-                    value.set(Ok(current));
-
-                    let _ = signal.state.forward_to(value, health, Ok);
+                    let _ = signal.state.forward_to(version, health);
                     writer.set(Some(signal));
                 }
-                Err(_) => {
-                    value.set(Err(QueuedSignalNoneState::NotRegistered));
-                }
+                Err(_) => {}
             }
         }
     });
 
     QueuedSignalHandle {
-        value,
+        version,
         health,
         writer,
     }

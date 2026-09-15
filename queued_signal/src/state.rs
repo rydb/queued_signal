@@ -2,19 +2,18 @@ use dioxus::prelude::*;
 use dioxus::signals::Signal;
 use dioxus_core::Task;
 use flume::{Receiver, Sender};
-use left_right::{Absorb, ReadHandle, WriteHandle};
 use parking_lot::Mutex;
 use queued_signal_tracing::error;
-use std::any::type_name;
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
 use crate::macros::warn;
+use crate::swap_cell::{ReadGuard, ReadHandle, SwapCellSync};
 
 /// Health status of QueuedSignal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,104 +102,14 @@ impl ReaderRegistry {
 /// Closure mutation operation.
 pub type MutationOp<T> = Arc<dyn Fn(&mut T) + Send + Sync>;
 
-/// Full-value replacement operation.
-#[derive(Clone)]
-pub struct SetValueOp<T>(pub Arc<T>);
-
-/// Unified operation that always operates on `Arc<T>`.
-#[derive(Clone)]
-pub enum SignalOp<T: Clone + Send + Sync> {
-    /// Apply a closure mutation to the value.
-    Fn(MutationOp<T>),
-    /// Replace the entire value.
-    Set(SetValueOp<T>),
-}
-
-impl<T: Debug + Clone + Send + Sync> Debug for SignalOp<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Fn(_arg0) => f.debug_tuple("Fn").field(&"{anonymous function}").finish(),
-            Self::Set(_arg0) => f.debug_tuple("Set").field(&"{anonymous function}").finish(),
-        }
-    }
-}
-
-/// Newtype wrapper over `Arc<T>` that implements [`left_right::Absorb`]
-/// for [`SignalOp<T>`]. Its Clone is deep so each buffer owns a distinct Arc.
-pub struct Absorbable<T: Clone>(pub Arc<T>);
-
-impl<T: Clone> Clone for Absorbable<T> {
-    fn clone(&self) -> Self {
-        Absorbable(Arc::new((*self.0).clone()))
-    }
-}
-
-impl<T: Clone + Debug> Debug for Absorbable<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("Absorbable").field(&self.0).finish()
-    }
-}
-
-impl<T: Clone> Deref for Absorbable<T> {
-    type Target = Arc<T>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-impl<T: Clone> DerefMut for Absorbable<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl<T: Clone + Send + Sync> Absorb<SignalOp<T>> for Absorbable<T> {
-    fn absorb_first(&mut self, operation: &mut SignalOp<T>, _other: &Self) {
-        match operation {
-            SignalOp::Fn(op) => {
-                if let Some(inner) = Arc::get_mut(&mut self.0) {
-                    op(inner);
-                } else {
-                    warn!(
-                        "{} still holds {} strong references. Deferring publish",
-                        type_name::<T>(),
-                        Arc::strong_count(&self.0)
-                    );
-                }
-            }
-            SignalOp::Set(op) => {
-                self.0 = Arc::new((*op.0).clone());
-            }
-        }
-    }
-
-    fn absorb_second(&mut self, operation: SignalOp<T>, _other: &Self) {
-        match operation {
-            SignalOp::Fn(op) => {
-                if let Some(inner) = Arc::get_mut(&mut self.0) {
-                    op(inner);
-                } else {
-                    warn!(
-                        "{} still holds {} strong references. Deferring publish",
-                        type_name::<T>(),
-                        Arc::strong_count(&self.0)
-                    );
-                }
-            }
-            SignalOp::Set(op) => {
-                self.0 = op.0;
-            }
-        }
-    }
-
-    fn sync_with(&mut self, first: &Self) {
-        self.0 = Arc::new((*first.0).clone());
-    }
-}
+/// Full-value replacement operation carrying an owned value.
+#[derive(Debug)]
+pub struct SetValueOp<T>(pub T);
 
 /// Inner state of a QueuedSignal.
 pub struct QueuedState<T: Clone + Send + Sync> {
-    /// The left-right read handle for wait-free snapshot reads.
-    pub read_handle: ReadHandle<Absorbable<T>>,
+    /// Shared read handle over the read buffer.
+    pub cell: ReadHandle<T>,
     /// Version notification channel. Readers await changes here.
     pub notify_rx: watch::Receiver<u64>,
     /// Health status notification channel.
@@ -212,7 +121,6 @@ pub struct QueuedState<T: Clone + Send + Sync> {
 impl<T: Clone + Send + Sync> Debug for QueuedState<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QueuedState")
-            .field("read_handle", &self.read_handle)
             .field("notify_rx", &self.notify_rx)
             .field("health_rx", &self.health_rx)
             .field("registry", &self.registry)
@@ -223,7 +131,7 @@ impl<T: Clone + Send + Sync> Debug for QueuedState<T> {
 impl<T: Clone + Send + Sync> Clone for QueuedState<T> {
     fn clone(&self) -> Self {
         Self {
-            read_handle: self.read_handle.clone(),
+            cell: self.cell.clone(),
             notify_rx: self.notify_rx.clone(),
             health_rx: self.health_rx.clone(),
             registry: self.registry.clone(),
@@ -232,15 +140,17 @@ impl<T: Clone + Send + Sync> Clone for QueuedState<T> {
 }
 
 impl<T: Clone + Send + Sync> QueuedState<T> {
-    /// Returns a tracked read guard.
-    pub fn read(&self) -> TrackedReadGuard<'_, T> {
-        let guard = self.read_handle.enter().unwrap();
+    /// Returns a tracked read guard over the current read buffer.
+    pub fn read(&self) -> TrackedReadGuard<T> {
+        let guard = self.cell.read();
         TrackedReadGuard::new(guard, self.registry.clone())
     }
+
     /// Current health status of the underlying signal.
     pub fn health(&self) -> HealthStatus {
         *self.health_rx.borrow()
     }
+
     /// Clone of the version notification receiver.
     pub fn notify_rx(&self) -> watch::Receiver<u64> {
         self.notify_rx.clone()
@@ -253,48 +163,23 @@ impl<T: Clone + Send + Sync> QueuedState<T> {
 }
 
 impl<T: Clone + Send + Sync + 'static> QueuedState<T> {
-    /// Spawn a background task forwarding values into existing dioxus signals.
-    ///
-    /// Returns the spawned task so callers can cancel forwarding when
-    /// rebinding the target signals to a different source.
-    pub fn forward_to<V: 'static>(
+    /// Spawn a background task forwarding the version into a dioxus signal.
+    pub fn forward_to(
         &self,
-        value_signal: Signal<V>,
+        version_signal: Signal<u64>,
         health_signal: Signal<HealthStatus>,
-        map: impl Fn(Arc<T>) -> V + 'static,
     ) -> Task {
         let state = self.clone();
         // Use dioxus local spawn since Signal is not Send.
         spawn(async move {
-            let mut value_signal = value_signal;
+            let mut version_signal = version_signal;
             let mut health_signal = health_signal;
             let mut nr = state.notify_rx();
             let mut hr = state.health_rx.clone();
             loop {
                 tokio::select! {
                     Ok(()) = nr.changed() => {
-                        // Retry enter() while a concurrent publish is in
-                        // progress, skipping this notification after a
-                        // bounded wait.
-                        let deadline = Instant::now() + Duration::from_millis(100);
-                        let mut entered = false;
-                        loop {
-                            if let Some(g) = state.read_handle.enter() {
-                                let reader_id = state.registry.register();
-                                state.registry.heartbeat(reader_id);
-                                value_signal.set(map(g.0.clone()));
-                                state.registry.unregister(reader_id);
-                                entered = true;
-                                break;
-                            }
-                            if Instant::now() >= deadline {
-                                break;
-                            }
-                            tokio::time::sleep(Duration::from_millis(1)).await;
-                        }
-                        if !entered {
-                            error!("read handle stayed pinned for {}, skipping update", type_name::<T>());
-                        }
+                        version_signal.set(*nr.borrow());
                     }
                     Ok(()) = hr.changed() => {
                         health_signal.set(*hr.borrow());
@@ -308,52 +193,54 @@ impl<T: Clone + Send + Sync + 'static> QueuedState<T> {
 }
 
 /// Read guard for a QueuedSignal.
-pub struct TrackedReadGuard<'a, T: Clone + Send + Sync> {
-    guard: left_right::ReadGuard<'a, Absorbable<T>>,
+pub struct TrackedReadGuard<T: Clone + Send + Sync> {
+    guard: ReadGuard<T>,
     registry: Arc<ReaderRegistry>,
     reader_id: u64,
 }
 
-impl<'a, T: Clone + Send + Sync> TrackedReadGuard<'a, T> {
-    fn new(guard: left_right::ReadGuard<'a, Absorbable<T>>, registry: Arc<ReaderRegistry>) -> Self {
+impl<T: Clone + Send + Sync> TrackedReadGuard<T> {
+    fn new(guard: ReadGuard<T>, registry: Arc<ReaderRegistry>) -> Self {
         let reader_id = registry.register();
+        registry.heartbeat(reader_id);
         Self {
             guard,
             registry,
             reader_id,
         }
     }
+
     /// Record a heartbeat, resetting this reader's stall timer.
     pub fn heartbeat(&self) {
         self.registry.heartbeat(self.reader_id);
     }
 }
 
-impl<'a, T: Clone + Send + Sync> Drop for TrackedReadGuard<'a, T> {
+impl<T: Clone + Send + Sync> Drop for TrackedReadGuard<T> {
     fn drop(&mut self) {
         self.registry.unregister(self.reader_id);
     }
 }
 
-impl<'a, T: Clone + Send + Sync> Deref for TrackedReadGuard<'a, T> {
-    type Target = Arc<T>;
+impl<T: Clone + Send + Sync> Deref for TrackedReadGuard<T> {
+    type Target = T;
+
     fn deref(&self) -> &Self::Target {
-        &self.guard.0
+        &self.guard
     }
 }
 
 /// Driver for managing reads and writes for a QueuedSignal.
 ///
-/// Owns the left-right [`WriteHandle`] and channels for
-/// receiving mutations. Call [`tick`](Self::tick) regularly (e.g.
-/// every frame or in a background thread) to drain pending
-/// operations, publish to the read side, and update health.
+/// Owns the read buffer and the channels for receiving mutations. Call
+/// [`tick`](Self::tick) regularly to drain pending operations, publish
+/// to readers, and update health.
 pub struct WriterDriver<T: Clone + Send + Sync> {
-    write_handle: WriteHandle<Absorbable<T>, SignalOp<T>>,
+    cell: SwapCellSync<T>,
     set_value_rx: Receiver<SetValueOp<T>>,
     set_rx: Receiver<MutationOp<T>>,
     add_rx: Receiver<MutationOp<T>>,
-    abs_slot: Arc<Mutex<Option<Arc<T>>>>,
+    abs_slot: Arc<Mutex<Option<T>>>,
     notify_tx: watch::Sender<u64>,
     version: u64,
     health_tx: watch::Sender<HealthStatus>,
@@ -363,14 +250,10 @@ pub struct WriterDriver<T: Clone + Send + Sync> {
     pub watchdog_timeout: Duration,
     last_publish: Instant,
     /// Sender for authoritative full-value replacements.
-    /// Sent values overwrite the entire signal state.
     pub set_value_tx: Sender<SetValueOp<T>>,
     /// Sender for authoritative closure mutations.
-    /// These are applied before relative mutations and may be
-    /// overridden by a later [`set_value_tx`](Self::set_value_tx) send.
     pub set_tx: Sender<MutationOp<T>>,
     /// Sender for relative closure mutations.
-    /// These are applied after all authoritative operations.
     pub add_tx: Sender<MutationOp<T>>,
     /// The read-side state that consumers subscribe to.
     pub queued_state: QueuedState<T>,
@@ -380,34 +263,18 @@ pub struct WriterDriver<T: Clone + Send + Sync> {
 impl<T: Debug + Clone + Send + Sync> Debug for WriterDriver<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WriterDriver")
-            .field("write_handle", &self.write_handle)
-            .field("set_value_rx", &self.set_value_rx)
-            .field("set_rx", &self.set_rx)
-            .field("add_rx", &self.add_rx)
-            .field("abs_slot", &self.abs_slot)
-            .field("notify_tx", &self.notify_tx)
             .field("version", &self.version)
             .field("last_health", &self.last_health)
-            .field("health_tx", &self.health_tx)
             .field("registry", &self.registry)
             .field("watchdog_timeout", &self.watchdog_timeout)
             .field("last_publish", &self.last_publish)
-            .field("set_value_tx", &self.set_value_tx)
-            .field("set_tx", &self.set_tx)
-            .field("add_tx", &self.add_tx)
             .field("queued_state", &self.queued_state)
             .finish()
     }
 }
 
 impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
-    /// Create a new driver with the given initial value.
-    pub fn new(initial: T) -> Self {
-        let initial_health = HealthStatus::Healthy;
-        let initial_wrapped = Absorbable(Arc::new(initial));
-        let (write_handle, read_handle) =
-            left_right::new_from_empty::<Absorbable<T>, SignalOp<T>>(initial_wrapped);
-
+    fn build(cell: SwapCellSync<T>) -> Self {
         let (notify_tx, notify_rx) = watch::channel(0u64);
         let (health_tx, health_rx) = watch::channel(HealthStatus::Healthy);
 
@@ -418,14 +285,14 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
         let registry = Arc::new(ReaderRegistry::default());
 
         let state = QueuedState {
-            read_handle,
+            cell: cell.share(),
             notify_rx,
             health_rx,
             registry: registry.clone(),
         };
 
         Self {
-            write_handle,
+            cell,
             set_value_rx,
             set_rx,
             add_rx,
@@ -435,38 +302,65 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
             registry,
             watchdog_timeout: Duration::from_millis(500),
             last_publish: Instant::now(),
-            set_value_tx: set_value_tx.clone(),
-            set_tx: set_tx.clone(),
-            add_tx: add_tx.clone(),
-            queued_state: state,
             publish_counter: None,
             version: 0,
-            last_health: initial_health,
+            last_health: HealthStatus::Healthy,
+            set_value_tx,
+            set_tx,
+            add_tx,
+            queued_state: state,
         }
     }
-    /// Append an operation directly to the write handle (bypasses channels).
-    pub fn append(&mut self, op: SignalOp<T>) {
-        self.write_handle.append(op);
+
+    /// Create a new driver with an initial read buffer value.
+    pub fn new(initial: T) -> Self {
+        Self::build(SwapCellSync::new(initial))
     }
+
     /// Attach a counter that will be incremented on each publish.
     pub fn set_publish_counter(&mut self, counter: Arc<AtomicU64>) {
         self.publish_counter = Some(counter);
     }
 
+    /// Drains all channels and returns the pending operations.
+    pub fn drain_ops(&mut self) -> (Vec<T>, Vec<MutationOp<T>>, Vec<MutationOp<T>>) {
+        let set_values = self.set_value_rx.drain().map(|op| op.0).collect();
+        let sets = self.set_rx.drain().collect();
+        let adds = self.add_rx.drain().collect();
+        (set_values, sets, adds)
+    }
+
+    /// Borrows the read buffer value.
+    pub fn read(&self) -> ReadGuard<T> {
+        self.cell.read()
+    }
+
+    /// Returns mutable access to the read buffer when no readers exist.
+    pub fn get_mut(&mut self) -> Result<&mut T, usize> {
+        self.cell.get_mut()
+    }
+
+    /// Swaps the read buffer value with `with`, zero clone.
+    pub fn try_swap(&mut self, with: &mut T) -> Result<(), usize> {
+        self.cell.try_swap(with)
+    }
+
+    /// Publishes the current version to readers.
+    pub fn publish(&mut self) {
+        self.version += 1;
+        let _ = self.notify_tx.send(self.version);
+        if let Some(ref counter) = self.publish_counter {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Drains all buffers and replaces with the given value.
-    ///
-    /// All pending mutation channels are drained so that the absolute
-    /// write is not interleaved with in-flight relative or authoritative
-    /// operations.
     pub fn write_absolute(&self, value: T) {
-        let arc = Arc::new(value);
         let mut slot = self.abs_slot.lock();
         if slot.is_some() {
             warn!("Absolute value overwritten before being applied.");
         }
-        *slot = Some(arc);
-        // Drain pending mutation channels so that stale ops don't
-        // compete with the absolute write on the next tick.
+        *slot = Some(value);
         self.set_value_rx.drain();
         self.set_rx.drain();
         self.add_rx.drain();
@@ -475,61 +369,71 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
     /// Drain pending operations, publish if the interval has elapsed,
     /// and update the health status.
     pub fn tick(&mut self, publish_interval: Duration) {
-        let mut did_work = false;
+        let abs_taken = { self.abs_slot.lock().take() };
 
-        let mut abs_guard = self.abs_slot.lock();
-        if let Some(abs_val) = abs_guard.take() {
-            drop(abs_guard);
-            // Wrap as SetValueOp and append as Set.
-            self.write_handle.append(SignalOp::Set(SetValueOp(abs_val)));
-            self.set_value_rx.drain().for_each(|_| {});
-            self.set_rx.drain().for_each(|_| {});
-            self.add_rx.drain().for_each(|_| {});
-            did_work = true;
+        let did_work;
+
+        if let Some(abs_val) = abs_taken {
+            match self.cell.get_mut() {
+                Ok(slot) => {
+                    *slot = abs_val;
+                    self.set_value_rx.drain();
+                    self.set_rx.drain();
+                    self.add_rx.drain();
+                    did_work = true;
+                }
+                Err(_count) => {
+                    error!("readers active, deferring absolute write: {}", _count);
+                    *self.abs_slot.lock() = Some(abs_val);
+                    did_work = false;
+                }
+            }
         } else {
-            drop(abs_guard);
-            // Authoritative full replacements (SetValueOp)
-            for op in self.set_value_rx.drain() {
-                self.write_handle.append(SignalOp::Set(op));
-                did_work = true;
+            let (set_values, sets, adds) = self.drain_ops();
+            let has_ops = !set_values.is_empty() || !sets.is_empty() || !adds.is_empty();
+            if !has_ops {
+                self.update_health();
+                return;
             }
-            // Authoritative closure mutations (mutate_set)
-            for op in self.set_rx.drain() {
-                self.write_handle.append(SignalOp::Fn(op));
-                did_work = true;
-            }
-            // Relative closure mutations (mutate)
-            for op in self.add_rx.drain() {
-                self.write_handle.append(SignalOp::Fn(op));
-                did_work = true;
+            match self.cell.get_mut() {
+                Ok(slot) => {
+                    for value in set_values {
+                        *slot = value;
+                    }
+                    for f in sets {
+                        f(slot);
+                    }
+                    for f in adds {
+                        f(slot);
+                    }
+                    did_work = true;
+                }
+                Err(_count) => {
+                    error!("readers active, deferring mutations: {}", _count);
+                    for value in set_values {
+                        let _ = self.set_value_tx.send(SetValueOp(value));
+                    }
+                    for f in sets {
+                        let _ = self.set_tx.send(f);
+                    }
+                    for f in adds {
+                        let _ = self.add_tx.send(f);
+                    }
+                    did_work = false;
+                }
             }
         }
 
-        if (did_work || self.write_handle.has_pending_operations())
-            && self.last_publish.elapsed() >= publish_interval
-        {
-            if self.write_buffer_exclusive() {
-                self.write_handle.publish();
-                self.last_publish = Instant::now();
-                self.version += 1;
-                let _ = self.notify_tx.send(self.version);
-                if let Some(ref counter) = self.publish_counter {
-                    counter.fetch_add(1, Ordering::Relaxed);
-                }
-            }
+        if did_work && self.last_publish.elapsed() >= publish_interval {
+            self.publish();
+            self.last_publish = Instant::now();
         }
 
         self.update_health();
     }
 
-    fn write_buffer_exclusive(&mut self) -> bool {
-        // SAFETY: the write handle owns the write buffer for its lifetime, so
-        // the pointer stays valid while we hold exclusive access during tick.
-        let absorbable = unsafe { self.write_handle.raw_write_handle().as_ref() };
-        Arc::strong_count(&absorbable.0) == 1
-    }
-
-    fn update_health(&mut self) {
+    /// Recomputes and publishes the current health status.
+    pub fn update_health(&mut self) {
         let stalled = self.registry.check_stalled(self.watchdog_timeout);
         let pinned = stalled.len();
         let status = match pinned {
@@ -541,7 +445,6 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
                 pinned_buffers: pinned,
             },
         };
-        // Don't update health every frame when no changes are made.
         if status != self.last_health {
             self.last_health = status;
             let _ = self.health_tx.send(status);
@@ -549,8 +452,7 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
     }
 }
 
-/// A signal providing wait-free reads and queued writes via left-right
-/// double buffering.
+/// A signal providing borrow reads and queued writes.
 #[derive(Clone)]
 pub struct QueuedSignal<T: Clone + Send + Sync> {
     /// The read-side state that consumers subscribe to.
@@ -599,16 +501,12 @@ impl<T: Clone + Send + Sync + 'static> QueuedSignal<T> {
         }
     }
 
-    /// Acquire a tracked read guard for the current snapshot.
-    pub fn read(&self) -> TrackedReadGuard<'_, T> {
+    /// Acquire a tracked read guard for the current value.
+    pub fn read(&self) -> TrackedReadGuard<T> {
         self.state.read()
     }
 
-    /// Enqueue a relative mutation. Applied after all authoritative
-    /// operations within the same tick.
-    ///
-    /// Use for non-critical adjustments (e.g., incrementing a counter)
-    /// that should compose with authoritative changes.
+    /// Enqueue a relative mutation.
     pub fn mutate<F>(&self, f: F)
     where
         F: Fn(&mut T) + Send + Sync + 'static,
@@ -616,9 +514,7 @@ impl<T: Clone + Send + Sync + 'static> QueuedSignal<T> {
         let _ = self.add_tx.send(Arc::new(f));
     }
 
-    /// Enqueue an authoritative mutation (closure). Applied before
-    /// relative mutations but may be overridden by a later
-    /// [`set_value`](Self::set_value) in the same tick.
+    /// Enqueue an authoritative mutation.
     pub fn mutate_set<F>(&self, f: F)
     where
         F: Fn(&mut T) + Send + Sync + 'static,
@@ -626,14 +522,9 @@ impl<T: Clone + Send + Sync + 'static> QueuedSignal<T> {
         let _ = self.set_tx.send(Arc::new(f));
     }
 
-    /// Enqueue an authoritative full-value replacement. Within a
-    /// single tick, `set_value` ops are applied first, followed by
-    /// [`mutate_set`](Self::mutate_set), then [`mutate`](Self::mutate).
-    ///
-    /// To discard all pending mutations and force a pure overwrite,
-    /// use [`WriterDriver::write_absolute`] instead.
+    /// Enqueue an authoritative full-value replacement.
     pub fn set_value(&self, value: T) {
-        let _ = self.set_value_tx.send(SetValueOp(Arc::new(value)));
+        let _ = self.set_value_tx.send(SetValueOp(value));
     }
 
     /// Current health status.
@@ -641,27 +532,25 @@ impl<T: Clone + Send + Sync + 'static> QueuedSignal<T> {
         self.state.health()
     }
 
-    /// Subscribe dioxus signals to this queued signal's value and health,
-    /// wrapping each value in `Ok(Arc<T>)`.
+    /// Subscribe dioxus signals to this queued signal's value and health.
     pub fn use_hook<E: 'static>(
         &self,
         error_state: E,
-    ) -> (Signal<Result<Arc<T>, E>>, Signal<HealthStatus>) {
+    ) -> (Signal<Result<ReadGuard<T>, E>>, Signal<HealthStatus>) {
         use_queued_state(self.state.clone(), error_state)
     }
 
-    /// Like [`use_hook`], but passes `Arc<T>` directly without wrapping in `Ok()`.
-    pub fn use_hook_direct(&self, initial: T) -> (Signal<Arc<T>>, Signal<HealthStatus>) {
+    /// Like [`use_hook`], but passes the read guard directly.
+    pub fn use_hook_direct(&self, initial: T) -> (Signal<ReadGuard<T>>, Signal<HealthStatus>) {
         use_queued_state_direct(self.state.clone(), initial)
     }
 }
 
-/// Shared helper that subscribes a [`Signal`] to a [`QueuedState`],
-/// mapping each published value through `map`.
+/// Shared helper that subscribes a [`Signal`] to a [`QueuedState`].
 fn use_queued_state_inner<T: Clone + Send + Sync + 'static, V: 'static>(
     state: QueuedState<T>,
     initial: V,
-    map: impl Fn(Arc<T>) -> V + 'static,
+    map: impl Fn(ReadGuard<T>) -> V + 'static,
 ) -> (Signal<V>, Signal<HealthStatus>) {
     let mut value_signal = use_signal(|| initial);
     let mut health_signal = use_signal(|| HealthStatus::Healthy);
@@ -670,35 +559,14 @@ fn use_queued_state_inner<T: Clone + Send + Sync + 'static, V: 'static>(
     use_future(move || {
         let mut notify_rx = state.notify_rx();
         let mut health_rx = state.health_rx.clone();
-        let read_handle = state.read_handle.clone();
-        let registry = state.registry.clone();
+        let cell = state.cell.clone();
         let map = map.clone();
 
         async move {
             loop {
                 tokio::select! {
                     Ok(()) = notify_rx.changed() => {
-                        // Retry enter() while a concurrent publish is in
-                        // progress.
-                        let deadline = Instant::now() + Duration::from_millis(100);
-                        let mut entered = false;
-                        loop {
-                            if let Some(guard) = read_handle.enter() {
-                                let reader_id = registry.register();
-                                registry.heartbeat(reader_id);
-                                value_signal.set(map(guard.0.clone()));
-                                registry.unregister(reader_id);
-                                entered = true;
-                                break;
-                            }
-                            if Instant::now() >= deadline {
-                                break;
-                            }
-                            tokio::time::sleep(Duration::from_millis(1)).await;
-                        }
-                        if !entered {
-                            warn!("use_queued_state: read handle stayed pinned, skipping update");
-                        }
+                        value_signal.set(map(cell.read()));
                     }
                     Ok(()) = health_rx.changed() => {
                         health_signal.set(*health_rx.borrow());
@@ -713,45 +581,22 @@ fn use_queued_state_inner<T: Clone + Send + Sync + 'static, V: 'static>(
     (value_signal, health_signal)
 }
 
-/// Subscribe a [`Signal`] to a [`QueuedState`], wrapping each value in `Ok(Arc<T>)`.
+/// Subscribe a [`Signal`] to a [`QueuedState`], wrapping each read in `Ok`.
 pub fn use_queued_state<T: Clone + Send + Sync + 'static, E: 'static>(
     state: QueuedState<T>,
     error_state: E,
-) -> (Signal<Result<Arc<T>, E>>, Signal<HealthStatus>) {
-    use_queued_state_inner(state, Err(error_state), |arc| Ok(arc))
+) -> (Signal<Result<ReadGuard<T>, E>>, Signal<HealthStatus>) {
+    use_queued_state_inner(state, Err(error_state), |guard| Ok(guard))
 }
 
-/// Subscribe a [`Signal`] to a [`QueuedState`], passing `Arc<T>` directly.
+/// Subscribe a [`Signal`] to a [`QueuedState`], passing the guard directly.
 pub fn use_queued_state_direct<T: Clone + Send + Sync + 'static>(
     state: QueuedState<T>,
-    initial: T,
-) -> (Signal<Arc<T>>, Signal<HealthStatus>) {
-    let arc = Arc::new(initial);
-    use_queued_state_inner(state, arc, |arc| arc)
+    _initial: T,
+) -> (Signal<ReadGuard<T>>, Signal<HealthStatus>) {
+    let guard = state.cell.read();
+    use_queued_state_inner(state, guard, |guard| guard)
 }
-
-// SAFETY: Absorbable<T> is a transparent wrapper over T. Sending and
-// sharing it is safe when T is Send and Sync, which the bound enforces.
-unsafe impl<T: Clone + Send + Sync> Send for Absorbable<T> {}
-
-// SAFETY: Absorbable<T> is a transparent wrapper over T. Shared access
-// only exposes references to T, which is safe to share when T is Sync.
-unsafe impl<T: Clone + Send + Sync> Sync for Absorbable<T> {}
-
-// SAFETY: QueuedState<T> contains:
-//   - ReadHandle<Absorbable<T>>: internally Arc<AtomicCell<…>>, Send when T: Send
-//   - watch::Receiver<u64>: Send + Sync
-//   - watch::Receiver<HealthStatus>: Send + Sync
-//   - Arc<ReaderRegistry>: Send + Sync (all fields are atomics or Mutex<HashMap<…>>)
-// Our bound T: Send + Sync satisfies all transitive requirements.
-unsafe impl<T: Clone + Send + Sync> Send for QueuedState<T> {}
-
-// SAFETY: QueuedState<T>'s fields are all Sync-safe:
-//   - ReadHandle uses Arc internally, reads are lock-free via atomics
-//   - watch::Receiver::borrow() takes a shared reference
-//   - ReaderRegistry uses Mutex for interior mutability
-// Shared access to QueuedState<T> is therefore sound when T: Sync.
-unsafe impl<T: Clone + Send + Sync> Sync for QueuedState<T> {}
 
 /// Read guard for returning refs to inner signal values.
 pub struct SignalReadGuard<
@@ -795,21 +640,14 @@ mod tests {
                 .is_empty()
         );
 
-        // Simulate a stalled reader by registering but never heartbeating,
-        // then waiting past the timeout.
         let id2 = registry.register();
         std::thread::sleep(Duration::from_millis(50));
         let stalled = registry.check_stalled(Duration::from_millis(10));
         assert!(stalled.contains(&id2));
 
-        // id is still heartbeating, should not be stalled.
         registry.heartbeat(id);
-        assert!(
-            registry
-                .check_stalled(Duration::from_millis(100))
-                .is_empty()
-                || registry.check_stalled(Duration::from_millis(100)) == vec![id2]
-        );
+        let stalled = registry.check_stalled(Duration::from_millis(100));
+        assert!(stalled.is_empty() || stalled == vec![id2]);
     }
 
     #[test]
@@ -822,17 +660,11 @@ mod tests {
         assert!(registry.check_stalled(Duration::ZERO).is_empty());
     }
 
-    /// Verify that within a single tick, operations are applied in
-    /// priority order: set_value first, then mutate_set, then mutate.
-    /// Full-value replacements do not drain the mutation channels
-    /// unless the `write_absolute` path is used.
     #[test]
     fn writer_driver_tick_ordering() {
         let mut driver = WriterDriver::new(0i32);
 
-        // All three op types in one tick.
-        // Priority order: set_value_rx -> set_rx -> add_rx
-        driver.set_value_tx.send(SetValueOp(Arc::new(42))).unwrap();
+        driver.set_value_tx.send(SetValueOp(42)).unwrap();
         driver
             .set_tx
             .send(Arc::new(|v: &mut i32| *v += 10))
@@ -841,135 +673,114 @@ mod tests {
 
         driver.tick(Duration::ZERO);
 
-        // set_value(42) -> mutate_set(+10) -> mutate(+1) = 53
         let val = driver.queued_state.read().clone();
-        assert_eq!(*val, 53i32);
+        assert_eq!(val, 53i32);
     }
 
-    /// A lone set_value should set the value directly.
     #[test]
     fn writer_driver_tick_set_value_alone() {
         let mut driver = WriterDriver::new(0i32);
 
-        driver.set_value_tx.send(SetValueOp(Arc::new(99))).unwrap();
+        driver.set_value_tx.send(SetValueOp(99)).unwrap();
 
         driver.tick(Duration::ZERO);
 
         let val = driver.queued_state.read().clone();
-        assert_eq!(*val, 99i32);
+        assert_eq!(val, 99i32);
     }
 
-    /// Verify that mutate_set wins over mutate when no set_value is
-    /// present.
     #[test]
     fn writer_driver_tick_mutate_set_wins_over_mutate() {
         let mut driver = WriterDriver::new(0i32);
 
-        // Relative mutation (applied second)
         driver.add_tx.send(Arc::new(|v: &mut i32| *v += 1)).unwrap();
-        // Authoritative mutation (applied first, so result is 10 + 1 = 11)
         driver.set_tx.send(Arc::new(|v: &mut i32| *v = 10)).unwrap();
 
         driver.tick(Duration::ZERO);
 
         let val = driver.queued_state.read().clone();
-        assert_eq!(*val, 11i32);
+        assert_eq!(val, 11i32);
     }
 
-    /// Verify health transitions: Healthy → Degraded → Stalled.
     #[test]
     fn health_status_transitions() {
         let mut driver = WriterDriver::new(0i32);
 
-        // Initially healthy
         assert_eq!(driver.queued_state.health(), HealthStatus::Healthy);
 
-        // Register one reader and let it go stale, should be Degraded
         let _id = driver.registry.register();
-        // Set a very short watchdog timeout
         driver.watchdog_timeout = Duration::from_millis(1);
         std::thread::sleep(Duration::from_millis(10));
 
-        driver.tick(Duration::ZERO);
+        driver.update_health();
         assert_eq!(
             driver.queued_state.health(),
             HealthStatus::Degraded { pinned_buffers: 1 }
         );
 
-        // Register two more stale readers, should be Stalled
         let _id2 = driver.registry.register();
         let _id3 = driver.registry.register();
         std::thread::sleep(Duration::from_millis(10));
 
-        driver.tick(Duration::ZERO);
+        driver.update_health();
         assert_eq!(
             driver.queued_state.health(),
             HealthStatus::Stalled { pinned_buffers: 3 }
         );
     }
 
-    /// Absorbable absorb_first applies the Fn operation to the inner
-    /// value in place without cloning.
-    #[test]
-    fn absorbable_absorb_first_fn() {
-        let mut absorbable = Absorbable(Arc::new(vec![1, 2, 3]));
-        let other = Absorbable(Arc::new(vec![]));
-
-        let mut op = SignalOp::Fn(Arc::new(|v: &mut Vec<i32>| v.push(4)));
-        absorbable.absorb_first(&mut op, &other);
-
-        assert_eq!(*absorbable.0, vec![1, 2, 3, 4]);
+    /// Sentinel whose Clone counts invocations, to prove the write path
+    /// never clones the inner value.
+    #[derive(Debug)]
+    struct CountClones {
+        counter: Arc<AtomicU64>,
+        value: i32,
     }
 
-    #[test]
-    fn absorbable_absorb_first_set() {
-        let mut absorbable = Absorbable(Arc::new(vec![1, 2, 3]));
-        let other = Absorbable(Arc::new(vec![]));
-
-        let mut op = SignalOp::Set(SetValueOp(Arc::new(vec![9, 9, 9])));
-        absorbable.absorb_first(&mut op, &other);
-
-        assert_eq!(*absorbable.0, vec![9, 9, 9]);
-        // The buffer must own a distinct Arc so the write side can mutate it.
-        assert_eq!(Arc::strong_count(&absorbable.0), 1);
-    }
-
-    #[test]
-    fn absorbable_sync_with_clones_inner() {
-        let first = Absorbable(Arc::new(42i32));
-        let mut second = Absorbable(Arc::new(0i32));
-
-        second.sync_with(&first);
-        assert_eq!(*second.0, 42i32);
-    }
-
-    /// Sentinel whose Clone panics, to prove the Fn path never clones T.
-    #[derive(Debug, PartialEq)]
-    struct ClonePanics(i32);
-
-    impl Clone for ClonePanics {
+    impl Clone for CountClones {
         fn clone(&self) -> Self {
-            panic!("SignalOp::Fn must not clone the inner value");
+            self.counter.fetch_add(1, Ordering::Relaxed);
+            Self {
+                counter: self.counter.clone(),
+                value: self.value,
+            }
         }
     }
 
     #[test]
-    fn absorbable_fn_does_not_clone_inner() {
-        let mut absorbable = Absorbable(Arc::new(ClonePanics(1)));
-        let other = Absorbable(Arc::new(ClonePanics(0)));
+    fn writer_driver_write_path_does_not_clone() {
+        let counter = Arc::new(AtomicU64::new(0));
+        let initial = CountClones {
+            counter: counter.clone(),
+            value: 0,
+        };
+        let mut driver = WriterDriver::new(initial);
 
-        let mut op = SignalOp::Fn(Arc::new(|v: &mut ClonePanics| v.0 += 1));
-        absorbable.absorb_first(&mut op, &other);
-        assert_eq!(absorbable.0.0, 2);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+
+        driver
+            .set_value_tx
+            .send(SetValueOp(CountClones {
+                counter: counter.clone(),
+                value: 7,
+            }))
+            .unwrap();
+        driver
+            .add_tx
+            .send(Arc::new(|v: &mut CountClones| v.value += 1))
+            .unwrap();
+
+        driver.tick(Duration::ZERO);
+
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+        let val = driver.queued_state.read().clone();
+        assert_eq!(val.value, 8);
     }
 
-    /// Compile-time Send/Sync verification for the unsafe impl blocks.
     #[test]
-    fn absorbable_is_send_sync() {
+    fn queued_state_is_send_sync() {
         fn assert_send<T: Send>() {}
         fn assert_sync<T: Sync>() {}
-        assert_send::<Absorbable<i32>>();
-        assert_sync::<Absorbable<i32>>();
         assert_send::<QueuedState<i32>>();
         assert_sync::<QueuedState<i32>>();
     }

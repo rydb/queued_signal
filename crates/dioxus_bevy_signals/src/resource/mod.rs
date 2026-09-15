@@ -3,7 +3,7 @@
 //! Provides [`use_bevy_resource`] to create dioxus-side signal mirrors
 //! of bevy resources, with automatic bidirectional synchronization.
 
-use crate::schedules::{DioxusSyncPostUpdate, DioxusSyncPreUpdate, DioxusSyncUpdate};
+use crate::schedules::DioxusSyncPostUpdate;
 use bevy_ecs::component::Mutable;
 use bevy_ecs::prelude::*;
 use bevy_ecs::world::CommandQueue;
@@ -11,12 +11,11 @@ use dioxus_core::{IntoAttributeValue, IntoDynNode};
 use dioxus_hooks::{use_context, use_future, use_memo, use_signal};
 use dioxus_signals::{Memo, ReadableExt, Signal, WritableExt};
 use parking_lot::Mutex;
-use queued_signal::state::{HealthStatus, QueuedSignal, SignalReadGuard, WriterDriver};
+use queued_signal::state::{HealthStatus, QueuedSignal, SetValueOp, TrackedReadGuard, WriterDriver};
 use std::any::{TypeId, type_name};
 use std::collections::HashSet;
 use std::fmt::Display;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::oneshot;
 use trait_set::trait_set;
 
@@ -102,17 +101,7 @@ impl<T: ResourceDioxusSync> Command for RequestBevyResource<T> {
                 );
                 world.insert_resource(ResourceWriteDriver(driver_arc));
 
-                add_systems_through_world(world, DioxusSyncUpdate, drive_signal::<T>);
-                add_systems_through_world(
-                    world,
-                    DioxusSyncPreUpdate,
-                    sync_mirror_to_resource::<T>.run_if(resource_changed::<T>),
-                );
-                add_systems_through_world(
-                    world,
-                    DioxusSyncPostUpdate,
-                    sync_resource_to_mirror::<T>,
-                );
+                add_systems_through_world(world, DioxusSyncPostUpdate, sync_resource::<T>);
                 let mut map = world.get_resource_or_init::<RegisteredResourceSyncs>();
                 map.0.insert(TypeId::of::<T>());
                 world.insert_resource(ResourceQueuedSignalMirror(signal.clone()));
@@ -128,38 +117,70 @@ impl<T: ResourceDioxusSync> Command for RequestBevyResource<T> {
     }
 }
 
-/// Synchronizes the authoritative bevy resource into the signal mirror.
-/// Runs when the bevy resource has changed. When bevy and dioxus both
-/// modify the resource in the same frame, the bevy change takes precedence.
-fn sync_mirror_to_resource<T: ResourceDioxusSync>(
-    resource: Res<T>,
-    mut mirror: ResMut<ResourceQueuedSignalMirror<T>>,
-) {
-    let new_value = resource.clone();
-    // Send authoritative full replacement.
-    mirror.bypass_change_detection().0.set_value(new_value);
-}
-
-/// Synchronizes a dioxus-side signal mutation back into the bevy resource.
-/// Only writes when the dioxus signal version advanced, avoiding unnecessary
-/// writes every frame.
-fn sync_resource_to_mirror<T: ResourceDioxusSync>(
+/// Sync bevy <-> dioxus resource values
+fn sync_resource<T: ResourceDioxusSync>(
     mut resource: ResMut<T>,
-    mirror: Res<ResourceQueuedSignalMirror<T>>,
-    mut last_version: Local<u64>,
+    mut driver: ResMut<ResourceWriteDriver<T>>,
 ) {
-    let current = mirror.0.peek_version();
-    if current == *last_version {
-        return; // dioxus side hasn't published a new version
-    }
-    *last_version = current;
-    let new_value = mirror.0.read().as_ref().clone();
-    *resource.bypass_change_detection() = new_value;
-}
-
-fn drive_signal<T: ResourceDioxusSync>(driver: Res<ResourceWriteDriver<T>>) {
+    let bevy_changed = resource.is_changed();
     let mut guard = driver.0.lock();
-    guard.tick(Duration::ZERO);
+    let (set_values, sets, adds) = guard.drain_ops();
+    let has_dioxus_ops = !set_values.is_empty() || !sets.is_empty() || !adds.is_empty();
+
+    if !bevy_changed && !has_dioxus_ops {
+        guard.update_health();
+        return;
+    }
+
+    if bevy_changed {
+        // Bevy wins authoritative sets; relative adds compose on top.
+        for f in adds {
+            f(&mut *resource);
+        }
+        if let Ok(()) = guard.try_swap(&mut *resource) {
+            let value = (*guard.read()).clone();
+            *resource = value;
+            guard.publish();
+        }
+    } else {
+        // Dioxus wins; apply operations to the read buffer.
+        match guard.get_mut() {
+            Ok(slot) => {
+                for value in set_values {
+                    *slot = value;
+                }
+                for f in sets {
+                    f(slot);
+                }
+                for f in adds {
+                    f(slot);
+                }
+            }
+            Err(_count) => {
+                warn!("readers active, deferring mutations: {}", _count);
+                for value in set_values {
+                    let _ = guard.set_value_tx.send(SetValueOp(value));
+                }
+                for f in sets {
+                    let _ = guard.set_tx.send(f);
+                }
+                for f in adds {
+                    let _ = guard.add_tx.send(f);
+                }
+                guard.update_health();
+                return;
+            }
+        }
+        if let Ok(()) = guard.try_swap(&mut *resource) {
+            let value = resource.clone();
+            if let Ok(slot) = guard.get_mut() {
+                *slot = value;
+            }
+            guard.publish();
+        }
+    }
+
+    guard.update_health();
 }
 
 /// Dioxus signal for managing bevy resource synchronization.
@@ -169,7 +190,7 @@ where
     U: 'static,
     E: 'static,
 {
-    signal: Signal<Result<Arc<R>, ResourceNoneState>>,
+    version: Signal<u64>,
     health: Signal<HealthStatus>,
     /// None until the bevy round-trip completes.
     /// Writes are silently ignored while pending.
@@ -267,24 +288,30 @@ impl<R: Clone + Send + Sync + 'static, U, E> ResourceMirrorSignal<R, U, E> {
         *self.health.read()
     }
 
-    /// Read resource
-    pub fn read(&self) -> SignalReadGuard<'_, Result<Arc<R>, ResourceNoneState>> {
-        SignalReadGuard::new(self.signal.read())
+    /// Read resource, subscribing to version updates.
+    pub fn read(&self) -> Result<TrackedReadGuard<R>, ResourceNoneState> {
+        let _ = self.version.read();
+        let writer = self.writer.read();
+        match writer.as_ref() {
+            Some(signal) => Ok(signal.read()),
+            None => Err(ResourceNoneState::NotInitialized),
+        }
     }
 
     /// .read() + .map()
     pub fn read_ok<O>(&self, f: impl FnOnce(&R) -> O) -> Result<O, ResourceNoneState> {
-        let guard = self.signal.read();
-        match &*guard {
-            Ok(arc_r) => Ok(f(arc_r.as_ref())),
-            Err(e) => Err(e.clone()),
+        let _ = self.version.read();
+        let writer = self.writer.read();
+        match writer.as_ref() {
+            Some(signal) => Ok(f(&signal.read())),
+            None => Err(ResourceNoneState::NotInitialized),
         }
     }
 }
 
 /// Create or fetch a signal mirror for a bevy resource.
 pub fn use_bevy_resource<T, U, E>(
-    map_fn: impl Fn(Arc<T>) -> U + Clone + 'static,
+    map_fn: impl Fn(&T) -> U + Clone + 'static,
     err_fn: impl Fn(ResourceNoneState) -> E + Clone + 'static,
 ) -> ResourceMirrorSignal<T, U, E>
 where
@@ -294,20 +321,21 @@ where
 {
     let ctx = use_context::<CommandQueueSender>();
 
-    let mut value_signal: Signal<Result<Arc<T>, ResourceNoneState>> =
-        use_signal(|| Err(ResourceNoneState::NotInitialized));
+    let mut version: Signal<u64> = use_signal(|| 0);
     let health_signal = use_signal(|| HealthStatus::Healthy);
     let mut writer: Signal<Option<QueuedSignal<T>>> = use_signal(|| None);
 
     let display = {
-        let value_signal = value_signal;
+        let version = version;
+        let writer = writer;
         let map_fn = map_fn.clone();
         let err_fn = err_fn.clone();
         use_memo(move || {
-            let guard = value_signal.read();
-            match &*guard {
-                Ok(arc_r) => Ok(map_fn(arc_r.clone())),
-                Err(e) => Err(err_fn(e.clone())),
+            let _ = version.read();
+            let writer = writer.read();
+            match writer.as_ref() {
+                Some(signal) => Ok(map_fn(&signal.read())),
+                None => Err(err_fn(ResourceNoneState::NotInitialized)),
             }
         })
     };
@@ -325,11 +353,7 @@ where
                 .await
             {
                 Ok(signal) => {
-                    // Eagerly forward the current mirrored value so
-                    // static resources are available immediately.
-                    let current = signal.read().clone();
-                    value_signal.set(Ok(current));
-                    signal.state.forward_to(value_signal, health_signal, Ok);
+                    signal.state.forward_to(version, health_signal);
                     writer.set(Some(signal));
                 }
                 Err(_err) => warn!("use_bevy_resource: {}", _err),
@@ -338,7 +362,7 @@ where
     });
 
     ResourceMirrorSignal {
-        signal: value_signal,
+        version,
         health: health_signal,
         writer,
         display,
