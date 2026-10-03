@@ -101,7 +101,7 @@ pub fn reflection_app() -> Element {
     rsx! {
         div {
             query::QueryElevationTest {}
-            // resource::ReflectElevationTest {}
+            resource::ReflectElevationTest {}
         }
     }
 }

@@ -1,6 +1,7 @@
 //! Reflect-driven resource mirroring.
 
-use std::{any::TypeId, collections::HashMap, ptr::NonNull, sync::Arc, time::Duration};
+use std::{any::TypeId, collections::HashMap, ptr::NonNull, sync::Arc};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bevy_ecs::component::ComponentId;
 use bevy_ecs::prelude::*;
@@ -12,11 +13,11 @@ use bevy_ecs::system::{
 };
 use bevy_ecs::world::{CommandQueue, FilteredResources, FilteredResourcesMut};
 use bevy_reflect::{Reflect, ReflectFromPtr};
-use dioxus_core::Task;
+use dioxus_core::{spawn, Task};
 use dioxus_hooks::{use_context, use_future, use_signal};
 use dioxus_signals::{ReadableExt, Signal, WritableExt};
-use parking_lot::Mutex;
-use queued_signal::state::{HealthStatus, QueuedSignal, SignalReadGuard, WriterDriver};
+use queued_signal::atom_coerce_dyn::AtomCoerceDyn;
+use queued_signal::state::{HealthStatus, QueuedSignal, SignalReadGuard};
 use tokio::sync::{oneshot, watch};
 
 use crate::macros::*;
@@ -24,7 +25,7 @@ use crate::resource::{ResourceDioxusSync, ResourceQueuedSignalMirror};
 use crate::schedules::{DioxusSyncPostUpdate, DioxusSyncUpdate};
 use crate::{CommandQueueSender, add_systems_through_world};
 
-use super::{ErasedMutation, ErasedValue, clone_into_arc, enumerate_reflect_types, resolve_name};
+use super::{ErasedMutation, clone_into_arc, enumerate_reflect_types, resolve_name};
 
 /// Error state for a reflect resource signal that has not initialized yet.
 #[derive(Clone, Debug, PartialEq)]
@@ -96,16 +97,18 @@ pub struct ReflectResourceMirror {
     pub component_id: ComponentId,
     /// Type data for pointer conversion.
     pub reflect_from_ptr: ReflectFromPtr,
-    /// The erased signal mirror.
-    pub signal: QueuedSignal<ErasedValue>,
+    /// The single value source, owning a reflected value or bound to a typed T.
+    pub holder: AtomCoerceDyn<dyn Reflect>,
+    /// Monotonic version, bumped on every value change.
+    pub version: Arc<AtomicU64>,
+    /// Notification channel for value changes.
+    pub notify_tx: watch::Sender<u64>,
     /// Active selection count.
     pub active_count: i32,
     /// Whether a typed mirror has taken over.
     pub elevated: bool,
-    /// Last signal version written back to bevy.
+    /// Last version written back to bevy.
     pub last_written_version: u64,
-    /// Driver that publishes queued mutations into the signal read buffer.
-    pub driver: Arc<Mutex<WriterDriver<ErasedValue>>>,
     /// Handle to the currently active signal.
     pub handle: ResourceSignalHandle,
     /// Sender for replacing the active handle when elevation happens.
@@ -119,67 +122,100 @@ pub struct ReflectResourceRegistry {
     pub map: HashMap<TypeId, ReflectResourceMirror>,
 }
 
-/// Ticks every active reflect resource driver so queued mutations publish.
-pub fn drive_reflect_resource_signals(mut registry: ResMut<ReflectResourceRegistry>) {
-    for mirror in registry.map.values_mut() {
-        if mirror.elevated {
-            continue;
-        }
-        let mut guard = mirror.driver.lock();
-        guard.tick(Duration::ZERO);
-    }
+/// Drives reflect resource signals.
+pub fn drive_reflect_resource_signals(_registry: ResMut<ReflectResourceRegistry>) {}
+
+/// Reads the current owning value of a holder as a shared reflected arc.
+fn read_holder_arc(holder: &AtomCoerceDyn<dyn Reflect>) -> Option<Arc<dyn Reflect>> {
+    let view = holder.get();
+    view.as_dyn().downcast_ref::<Arc<dyn Reflect>>().cloned()
 }
 
-/// Builds a type-erased handle wrapping the reflect signal.
-fn reflect_signal_handle(signal: QueuedSignal<ErasedValue>) -> ResourceSignalHandle {
-    let s = signal.clone();
+/// Bumps the mirror version and notifies watchers.
+fn bump_version(version: &Arc<AtomicU64>, notify_tx: &watch::Sender<u64>) {
+    let next = version.fetch_add(1, Ordering::Relaxed) + 1;
+    let _ = notify_tx.send(next);
+}
+
+/// Builds a type-erased handle wrapping the reflect holder.
+fn reflect_signal_handle(
+    holder: AtomCoerceDyn<dyn Reflect>,
+    version: Arc<AtomicU64>,
+    notify_tx: watch::Sender<u64>,
+    notify_rx: watch::Receiver<u64>,
+) -> ResourceSignalHandle {
+    let h = holder.clone();
+    let v = version.clone();
+    let nt = notify_tx.clone();
     let mutate = Arc::new(move |f: ErasedMutation| {
-        s.mutate(
-            move |erased: &mut ErasedValue| match erased.0.reflect_clone() {
-                Ok(mut cloned) => {
-                    f(&mut *cloned);
-                    erased.0 = Arc::from(cloned);
-                }
-                Err(err) => error!("reflect clone failed: {}", err),
-            },
-        );
-    });
-
-    let s = signal.clone();
-    let mutate_set = Arc::new(move |f: ErasedMutation| {
-        s.mutate_set(
-            move |erased: &mut ErasedValue| match erased.0.reflect_clone() {
-                Ok(mut cloned) => {
-                    f(&mut *cloned);
-                    erased.0 = Arc::from(cloned);
-                }
-                Err(err) => error!("reflect clone failed: {}", err),
-            },
-        );
-    });
-
-    let s = signal.clone();
-    let set_value = Arc::new(move |value: Arc<dyn Reflect>| {
-        if let Ok(erased) = ErasedValue::new(value.as_ref()) {
-            s.set_value(erased);
+        let Some(current) = read_holder_arc(&h) else {
+            return;
+        };
+        let Ok(mut cloned) = current.reflect_clone() else {
+            error!("reflect clone failed");
+            return;
+        };
+        f(&mut *cloned);
+        if h.try_store_boxed(Box::new(Arc::<dyn Reflect>::from(cloned)))
+            .is_ok()
+        {
+            bump_version(&v, &nt);
         }
     });
 
-    let s = signal.clone();
-    let read_reflect = Arc::new(move || {
-        let guard = s.read();
-        clone_into_arc(guard.as_reflect()).ok()
+    let h = holder.clone();
+    let v = version.clone();
+    let nt = notify_tx.clone();
+    let mutate_set = Arc::new(move |f: ErasedMutation| {
+        let Some(current) = read_holder_arc(&h) else {
+            return;
+        };
+        let Ok(mut cloned) = current.reflect_clone() else {
+            error!("reflect clone failed");
+            return;
+        };
+        f(&mut *cloned);
+        if h.try_store_boxed(Box::new(Arc::<dyn Reflect>::from(cloned)))
+            .is_ok()
+        {
+            bump_version(&v, &nt);
+        }
     });
 
-    let state = signal.state.clone();
-    let forward_to = Arc::new(move |value, health| {
-        state.forward_to(value, health, |arc: Arc<ErasedValue>| {
-            match arc.0.reflect_clone() {
-                Ok(boxed) => Ok(Arc::from(boxed)),
-                Err(err) => Err(ReflectResourceNoneState::CloneError(err.to_string())),
-            }
-        })
+    let h = holder.clone();
+    let v = version.clone();
+    let nt = notify_tx.clone();
+    let set_value = Arc::new(move |value: Arc<dyn Reflect>| {
+        if h.try_store_boxed(Box::new(value)).is_ok() {
+            bump_version(&v, &nt);
+        }
     });
+
+    let h = holder.clone();
+    let read_reflect = Arc::new(move || read_holder_arc(&h));
+
+    let h = holder.clone();
+    let forward_to = Arc::new(
+        move |value: Signal<Result<Arc<dyn Reflect>, ReflectResourceNoneState>>,
+              health: Signal<HealthStatus>| {
+            let h = h.clone();
+            let mut notify_rx = notify_rx.clone();
+            spawn(async move {
+                let mut value = value;
+                let mut health = health;
+                health.set(HealthStatus::Healthy);
+                loop {
+                    if notify_rx.changed().await.is_err() {
+                        break;
+                    }
+                    if let Some(arc) = read_holder_arc(&h) {
+                        value.set(Ok(arc));
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+        },
+    );
 
     ResourceSignalHandle {
         mutate,
@@ -252,7 +288,7 @@ fn typed_signal_handle<T: ResourceDioxusSync>(
     let rfp = reflect_from_ptr.clone();
     let forward_to = Arc::new(move |value, health| {
         let rfp = rfp.clone();
-        state.forward_to(value, health, move |arc_t: Arc<T>| {
+        state.forward_value_to(value, health, move |arc_t: Arc<T>| {
             let raw = std::ptr::from_ref(arc_t.as_ref()).cast::<u8>() as *mut u8;
             // SAFETY: arc_t is live and rfp mirrors T.
             let ptr = unsafe { Ptr::new(NonNull::new_unchecked(raw)) };
@@ -337,38 +373,28 @@ pub fn register_or_get_resource_dyn(
             .ok_or("resource does not exist")?;
         // SAFETY: ptr holds the type mirrored by reflect_from_ptr.
         let value = unsafe { reflect_from_ptr.as_reflect(ptr) };
-        match ErasedValue::new(value) {
-            Ok(erased) => erased,
+        match clone_into_arc(value) {
+            Ok(arc) => arc,
             Err(err) => return Err(err.to_string()),
         }
     };
 
-    let driver = WriterDriver::new(initial);
-    let set_value_tx = driver.set_value_tx.clone();
-    let set_tx = driver.set_tx.clone();
-    let add_tx = driver.add_tx.clone();
-    let queued_state = driver.queued_state.clone();
-    let driver_arc = Arc::new(Mutex::new(driver));
+    let holder = AtomCoerceDyn::<dyn Reflect>::new(initial);
+    let version = Arc::new(AtomicU64::new(0));
+    let (notify_tx, notify_rx) = watch::channel(0u64);
 
-    let signal = QueuedSignal::from_parts(
-        queued_state,
-        Some(driver_arc.clone()),
-        add_tx,
-        set_tx,
-        set_value_tx,
-    );
-
-    let handle = reflect_signal_handle(signal.clone());
+    let handle = reflect_signal_handle(holder.clone(), version.clone(), notify_tx.clone(), notify_rx);
     let (handle_tx, handle_rx) = watch::channel(handle.clone());
 
     let mirror = ReflectResourceMirror {
         component_id,
         reflect_from_ptr: reflect_from_ptr.clone(),
-        signal: signal.clone(),
+        holder: holder.clone(),
+        version: version.clone(),
+        notify_tx: notify_tx.clone(),
         active_count: 1,
         elevated: false,
         last_written_version: 0,
-        driver: driver_arc.clone(),
         handle: handle.clone(),
         handle_tx,
     };
@@ -393,8 +419,14 @@ pub fn register_or_get_resource_dyn(
                 };
                 // SAFETY: ptr holds the type mirrored by reflect_from_ptr.
                 let value = unsafe { mirror.reflect_from_ptr.as_reflect(ptr) };
-                if let Ok(erased) = ErasedValue::new(value) {
-                    mirror.signal.set_value(erased);
+                if let Ok(arc) = clone_into_arc(value) {
+                    if mirror
+                        .holder
+                        .try_store_boxed(Box::new(arc))
+                        .is_ok()
+                    {
+                        bump_version(&mirror.version, &mirror.notify_tx);
+                    }
                 }
             },
         );
@@ -415,19 +447,20 @@ pub fn register_or_get_resource_dyn(
                 if mirror.elevated || mirror.active_count <= 0 {
                     return;
                 }
-                let version = mirror.signal.state.peek_version();
+                let version = mirror.version.load(Ordering::Relaxed);
                 if version == mirror.last_written_version {
                     return;
                 }
-                let guard = mirror.signal.read();
-                let pending: &dyn Reflect = guard.as_reflect();
+                let Some(arc) = read_holder_arc(&mirror.holder) else {
+                    return;
+                };
                 let Ok(untyped) = resources.get_mut_by_id(mirror.component_id) else {
                     return;
                 };
                 // SAFETY: untyped holds the type mirrored by reflect_from_ptr.
                 let mut reflect = untyped
                     .map_unchanged(|ptr| unsafe { mirror.reflect_from_ptr.as_reflect_mut(ptr) });
-                reflect.apply(pending);
+                reflect.apply(arc.as_ref());
                 reflect.set_changed();
                 mirror.last_written_version = version;
             },
@@ -445,7 +478,7 @@ pub fn register_or_get_resource_dyn(
 }
 
 /// Hook called from the typed resource request after the typed mirror exists.
-/// Replaces the erased mirror handle with the typed signal handle and notifies dioxus.
+/// Binds the erased mirror to the typed signal value and notifies dioxus.
 pub fn notify_typed_resource_mirror<T: ResourceDioxusSync>(world: &mut World) {
     let type_id = TypeId::of::<T>();
 
@@ -462,12 +495,16 @@ pub fn notify_typed_resource_mirror<T: ResourceDioxusSync>(world: &mut World) {
         mirror.reflect_from_ptr.clone()
     };
 
-    let handle = typed_signal_handle::<T>(typed_signal, reflect_from_ptr);
+    let handle = typed_signal_handle::<T>(typed_signal.clone(), reflect_from_ptr.clone());
 
     let mut registry = world.resource_mut::<ReflectResourceRegistry>();
     let Some(mirror) = registry.map.get_mut(&type_id) else {
         return;
     };
+    // Bind the erased holder to the typed cell so both share the one T value.
+    mirror
+        .holder
+        .bind_reflect(&typed_signal.state.cell, reflect_from_ptr);
     mirror.elevated = true;
     mirror.active_count = 0;
     mirror.handle = handle.clone();

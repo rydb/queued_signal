@@ -3,7 +3,6 @@ use dioxus::signals::Signal;
 use dioxus_core::Task;
 use flume::{Receiver, Sender};
 use parking_lot::Mutex;
-use queued_signal_tracing::error;
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::ops::Deref;
@@ -12,22 +11,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
+use crate::atom_coerce::{AtomCoerce, AtomCoerceHandle, RcuGuard};
 use crate::macros::warn;
-use crate::swap_cell::{ReadGuard, ReadHandle, SwapCellSync};
 
 /// Health status of QueuedSignal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HealthStatus {
-    /// All readers are responding within the watchdog timeout.
+    /// All readers release their snapshots within the watchdog timeout.
     Healthy,
-    /// One reader has stalled beyond the watchdog timeout.
+    /// One reader has held a snapshot beyond the watchdog timeout.
     Degraded {
-        /// Number of stalled (pinned) read buffers.
+        /// Number of pinned snapshots.
         pinned_buffers: usize,
     },
-    /// Two or more readers have stalled.
+    /// Two or more readers have held snapshots too long.
     Stalled {
-        /// Number of stalled (pinned) read buffers.
+        /// Number of pinned snapshots.
         pinned_buffers: usize,
     },
 }
@@ -46,7 +45,7 @@ impl Display for HealthStatus {
     }
 }
 
-/// Registry tracking active readers for stall detection.
+/// Registry tracking active read guards for snapshot pin detection.
 #[derive(Debug)]
 pub struct ReaderRegistry {
     readers: Mutex<HashMap<u64, Instant>>,
@@ -102,14 +101,14 @@ impl ReaderRegistry {
 /// Closure mutation operation.
 pub type MutationOp<T> = Arc<dyn Fn(&mut T) + Send + Sync>;
 
-/// Full-value replacement operation carrying an owned value.
+/// Full-value replacement operation carrying an owned value
 #[derive(Debug)]
-pub struct SetValueOp<T>(pub T);
+pub struct SetValueOp<T>(pub Arc<T>);
 
 /// Inner state of a QueuedSignal.
-pub struct QueuedState<T: Clone + Send + Sync> {
+pub struct QueuedState<T: Clone + Send + Sync + 'static> {
     /// Shared read handle over the read buffer.
-    pub cell: ReadHandle<T>,
+    pub cell: AtomCoerceHandle<T>,
     /// Version notification channel. Readers await changes here.
     pub notify_rx: watch::Receiver<u64>,
     /// Health status notification channel.
@@ -118,7 +117,7 @@ pub struct QueuedState<T: Clone + Send + Sync> {
     pub registry: Arc<ReaderRegistry>,
 }
 
-impl<T: Clone + Send + Sync> Debug for QueuedState<T> {
+impl<T: Clone + Send + Sync + 'static> Debug for QueuedState<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QueuedState")
             .field("notify_rx", &self.notify_rx)
@@ -128,7 +127,7 @@ impl<T: Clone + Send + Sync> Debug for QueuedState<T> {
     }
 }
 
-impl<T: Clone + Send + Sync> Clone for QueuedState<T> {
+impl<T: Clone + Send + Sync + 'static> Clone for QueuedState<T> {
     fn clone(&self) -> Self {
         Self {
             cell: self.cell.clone(),
@@ -139,10 +138,10 @@ impl<T: Clone + Send + Sync> Clone for QueuedState<T> {
     }
 }
 
-impl<T: Clone + Send + Sync> QueuedState<T> {
+impl<T: Clone + Send + Sync + 'static> QueuedState<T> {
     /// Returns a tracked read guard over the current read buffer.
     pub fn read(&self) -> TrackedReadGuard<T> {
-        let guard = self.cell.read();
+        let guard = self.cell.read_owned();
         TrackedReadGuard::new(guard, self.registry.clone())
     }
 
@@ -190,17 +189,54 @@ impl<T: Clone + Send + Sync + 'static> QueuedState<T> {
             }
         })
     }
+
+    /// Spawns a task forwarding the mapped value and health into dioxus signals.
+    pub fn forward_value_to<V, E>(
+        &self,
+        value_signal: Signal<Result<V, E>>,
+        health_signal: Signal<HealthStatus>,
+        map: impl Fn(Arc<T>) -> Result<V, E> + Send + Sync + 'static,
+    ) -> Task
+    where
+        V: 'static,
+        E: 'static,
+    {
+        let state = self.clone();
+        let map = Arc::new(map);
+        spawn(async move {
+            let mut value_signal = value_signal;
+            let mut health_signal = health_signal;
+            let mut nr = state.notify_rx();
+            let mut hr = state.health_rx.clone();
+            let cell = state.cell.clone();
+            let map = map.clone();
+            loop {
+                tokio::select! {
+                    Ok(()) = nr.changed() => {
+                        let guard = cell.read_owned();
+                        let arc = Arc::new((*guard).clone());
+                        value_signal.set(map(arc));
+                    }
+                    Ok(()) = hr.changed() => {
+                        health_signal.set(*hr.borrow());
+                    }
+                    else => break,
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+    }
 }
 
 /// Read guard for a QueuedSignal.
-pub struct TrackedReadGuard<T: Clone + Send + Sync> {
-    guard: ReadGuard<T>,
+pub struct TrackedReadGuard<T: Clone + Send + Sync + 'static> {
+    guard: RcuGuard<T>,
     registry: Arc<ReaderRegistry>,
     reader_id: u64,
 }
 
-impl<T: Clone + Send + Sync> TrackedReadGuard<T> {
-    fn new(guard: ReadGuard<T>, registry: Arc<ReaderRegistry>) -> Self {
+impl<T: Clone + Send + Sync + 'static> TrackedReadGuard<T> {
+    fn new(guard: RcuGuard<T>, registry: Arc<ReaderRegistry>) -> Self {
         let reader_id = registry.register();
         registry.heartbeat(reader_id);
         Self {
@@ -214,15 +250,20 @@ impl<T: Clone + Send + Sync> TrackedReadGuard<T> {
     pub fn heartbeat(&self) {
         self.registry.heartbeat(self.reader_id);
     }
+
+    /// Borrows the underlying value.
+    pub fn as_ref(&self) -> &T {
+        &self.guard
+    }
 }
 
-impl<T: Clone + Send + Sync> Drop for TrackedReadGuard<T> {
+impl<T: Clone + Send + Sync + 'static> Drop for TrackedReadGuard<T> {
     fn drop(&mut self) {
         self.registry.unregister(self.reader_id);
     }
 }
 
-impl<T: Clone + Send + Sync> Deref for TrackedReadGuard<T> {
+impl<T: Clone + Send + Sync + 'static> Deref for TrackedReadGuard<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -235,8 +276,8 @@ impl<T: Clone + Send + Sync> Deref for TrackedReadGuard<T> {
 /// Owns the read buffer and the channels for receiving mutations. Call
 /// [`tick`](Self::tick) regularly to drain pending operations, publish
 /// to readers, and update health.
-pub struct WriterDriver<T: Clone + Send + Sync> {
-    cell: SwapCellSync<T>,
+pub struct WriterDriver<T: Clone + Send + Sync + 'static> {
+    cell: AtomCoerce<T>,
     set_value_rx: Receiver<SetValueOp<T>>,
     set_rx: Receiver<MutationOp<T>>,
     add_rx: Receiver<MutationOp<T>>,
@@ -260,7 +301,7 @@ pub struct WriterDriver<T: Clone + Send + Sync> {
     publish_counter: Option<Arc<AtomicU64>>,
 }
 
-impl<T: Debug + Clone + Send + Sync> Debug for WriterDriver<T> {
+impl<T: Debug + Clone + Send + Sync + 'static> Debug for WriterDriver<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WriterDriver")
             .field("version", &self.version)
@@ -274,7 +315,7 @@ impl<T: Debug + Clone + Send + Sync> Debug for WriterDriver<T> {
 }
 
 impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
-    fn build(cell: SwapCellSync<T>) -> Self {
+    fn build(cell: AtomCoerce<T>) -> Self {
         let (notify_tx, notify_rx) = watch::channel(0u64);
         let (health_tx, health_rx) = watch::channel(HealthStatus::Healthy);
 
@@ -285,7 +326,7 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
         let registry = Arc::new(ReaderRegistry::default());
 
         let state = QueuedState {
-            cell: cell.share(),
+            cell: cell.handle(),
             notify_rx,
             health_rx,
             registry: registry.clone(),
@@ -314,7 +355,7 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
 
     /// Create a new driver with an initial read buffer value.
     pub fn new(initial: T) -> Self {
-        Self::build(SwapCellSync::new(initial))
+        Self::build(AtomCoerce::new(initial))
     }
 
     /// Attach a counter that will be incremented on each publish.
@@ -323,26 +364,16 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
     }
 
     /// Drains all channels and returns the pending operations.
-    pub fn drain_ops(&mut self) -> (Vec<T>, Vec<MutationOp<T>>, Vec<MutationOp<T>>) {
-        let set_values = self.set_value_rx.drain().map(|op| op.0).collect();
+    pub fn drain_ops(&mut self) -> (Vec<SetValueOp<T>>, Vec<MutationOp<T>>, Vec<MutationOp<T>>) {
+        let set_values = self.set_value_rx.drain().collect();
         let sets = self.set_rx.drain().collect();
         let adds = self.add_rx.drain().collect();
         (set_values, sets, adds)
     }
 
-    /// Borrows the read buffer value.
-    pub fn read(&self) -> ReadGuard<T> {
-        self.cell.read()
-    }
-
-    /// Returns mutable access to the read buffer when no readers exist.
-    pub fn get_mut(&mut self) -> Result<&mut T, usize> {
-        self.cell.get_mut()
-    }
-
-    /// Swaps the read buffer value with `with`, zero clone.
-    pub fn try_swap(&mut self, with: &mut T) -> Result<(), usize> {
-        self.cell.try_swap(with)
+    /// Reads the current value through an owned guard.
+    pub fn read(&self) -> RcuGuard<T> {
+        self.cell.read_owned()
     }
 
     /// Publishes the current version to readers.
@@ -352,6 +383,12 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
         if let Some(ref counter) = self.publish_counter {
             counter.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Stores a value into the read buffer and publishes a new version.
+    pub fn publish_value(&mut self, value: T) {
+        self.cell.store(value);
+        self.publish();
     }
 
     /// Drains all buffers and replaces with the given value.
@@ -374,20 +411,11 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
         let did_work;
 
         if let Some(abs_val) = abs_taken {
-            match self.cell.get_mut() {
-                Ok(slot) => {
-                    *slot = abs_val;
-                    self.set_value_rx.drain();
-                    self.set_rx.drain();
-                    self.add_rx.drain();
-                    did_work = true;
-                }
-                Err(_count) => {
-                    error!("readers active, deferring absolute write: {}", _count);
-                    *self.abs_slot.lock() = Some(abs_val);
-                    did_work = false;
-                }
-            }
+            self.cell.store(abs_val);
+            self.set_value_rx.drain();
+            self.set_rx.drain();
+            self.add_rx.drain();
+            did_work = true;
         } else {
             let (set_values, sets, adds) = self.drain_ops();
             let has_ops = !set_values.is_empty() || !sets.is_empty() || !adds.is_empty();
@@ -395,33 +423,20 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
                 self.update_health();
                 return;
             }
-            match self.cell.get_mut() {
-                Ok(slot) => {
-                    for value in set_values {
-                        *slot = value;
-                    }
-                    for f in sets {
-                        f(slot);
-                    }
-                    for f in adds {
-                        f(slot);
-                    }
-                    did_work = true;
+            self.cell.rcu(|old| {
+                let mut working = old.clone();
+                for op in &set_values {
+                    working = (*op.0).clone();
                 }
-                Err(_count) => {
-                    error!("readers active, deferring mutations: {}", _count);
-                    for value in set_values {
-                        let _ = self.set_value_tx.send(SetValueOp(value));
-                    }
-                    for f in sets {
-                        let _ = self.set_tx.send(f);
-                    }
-                    for f in adds {
-                        let _ = self.add_tx.send(f);
-                    }
-                    did_work = false;
+                for f in &sets {
+                    f(&mut working);
                 }
-            }
+                for f in &adds {
+                    f(&mut working);
+                }
+                working
+            });
+            did_work = true;
         }
 
         if did_work && self.last_publish.elapsed() >= publish_interval {
@@ -454,7 +469,7 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
 
 /// A signal providing borrow reads and queued writes.
 #[derive(Clone)]
-pub struct QueuedSignal<T: Clone + Send + Sync> {
+pub struct QueuedSignal<T: Clone + Send + Sync + 'static> {
     /// The read-side state that consumers subscribe to.
     pub state: QueuedState<T>,
     // keep the writer alive as long as this signal exists
@@ -464,7 +479,7 @@ pub struct QueuedSignal<T: Clone + Send + Sync> {
     set_value_tx: Sender<SetValueOp<T>>,
 }
 
-impl<T: Clone + Send + Sync> Deref for QueuedSignal<T> {
+impl<T: Clone + Send + Sync + 'static> Deref for QueuedSignal<T> {
     type Target = QueuedState<T>;
 
     fn deref(&self) -> &Self::Target {
@@ -472,7 +487,7 @@ impl<T: Clone + Send + Sync> Deref for QueuedSignal<T> {
     }
 }
 
-impl<T: Clone + Send + Sync + Debug> Debug for QueuedSignal<T> {
+impl<T: Clone + Send + Sync + Debug + 'static> Debug for QueuedSignal<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QueuedSignal")
             .field("state", &self.state)
@@ -524,7 +539,7 @@ impl<T: Clone + Send + Sync + 'static> QueuedSignal<T> {
 
     /// Enqueue an authoritative full-value replacement.
     pub fn set_value(&self, value: T) {
-        let _ = self.set_value_tx.send(SetValueOp(value));
+        let _ = self.set_value_tx.send(SetValueOp(Arc::new(value)));
     }
 
     /// Current health status.
@@ -536,12 +551,12 @@ impl<T: Clone + Send + Sync + 'static> QueuedSignal<T> {
     pub fn use_hook<E: 'static>(
         &self,
         error_state: E,
-    ) -> (Signal<Result<ReadGuard<T>, E>>, Signal<HealthStatus>) {
+    ) -> (Signal<Result<RcuGuard<T>, E>>, Signal<HealthStatus>) {
         use_queued_state(self.state.clone(), error_state)
     }
 
     /// Like [`use_hook`], but passes the read guard directly.
-    pub fn use_hook_direct(&self, initial: T) -> (Signal<ReadGuard<T>>, Signal<HealthStatus>) {
+    pub fn use_hook_direct(&self, initial: T) -> (Signal<RcuGuard<T>>, Signal<HealthStatus>) {
         use_queued_state_direct(self.state.clone(), initial)
     }
 }
@@ -550,7 +565,7 @@ impl<T: Clone + Send + Sync + 'static> QueuedSignal<T> {
 fn use_queued_state_inner<T: Clone + Send + Sync + 'static, V: 'static>(
     state: QueuedState<T>,
     initial: V,
-    map: impl Fn(ReadGuard<T>) -> V + 'static,
+    map: impl Fn(RcuGuard<T>) -> V + 'static,
 ) -> (Signal<V>, Signal<HealthStatus>) {
     let mut value_signal = use_signal(|| initial);
     let mut health_signal = use_signal(|| HealthStatus::Healthy);
@@ -566,7 +581,7 @@ fn use_queued_state_inner<T: Clone + Send + Sync + 'static, V: 'static>(
             loop {
                 tokio::select! {
                     Ok(()) = notify_rx.changed() => {
-                        value_signal.set(map(cell.read()));
+                        value_signal.set(map(cell.read_owned()));
                     }
                     Ok(()) = health_rx.changed() => {
                         health_signal.set(*health_rx.borrow());
@@ -585,7 +600,7 @@ fn use_queued_state_inner<T: Clone + Send + Sync + 'static, V: 'static>(
 pub fn use_queued_state<T: Clone + Send + Sync + 'static, E: 'static>(
     state: QueuedState<T>,
     error_state: E,
-) -> (Signal<Result<ReadGuard<T>, E>>, Signal<HealthStatus>) {
+) -> (Signal<Result<RcuGuard<T>, E>>, Signal<HealthStatus>) {
     use_queued_state_inner(state, Err(error_state), |guard| Ok(guard))
 }
 
@@ -593,8 +608,8 @@ pub fn use_queued_state<T: Clone + Send + Sync + 'static, E: 'static>(
 pub fn use_queued_state_direct<T: Clone + Send + Sync + 'static>(
     state: QueuedState<T>,
     _initial: T,
-) -> (Signal<ReadGuard<T>>, Signal<HealthStatus>) {
-    let guard = state.cell.read();
+) -> (Signal<RcuGuard<T>>, Signal<HealthStatus>) {
+    let guard = state.cell.read_owned();
     use_queued_state_inner(state, guard, |guard| guard)
 }
 
@@ -664,7 +679,7 @@ mod tests {
     fn writer_driver_tick_ordering() {
         let mut driver = WriterDriver::new(0i32);
 
-        driver.set_value_tx.send(SetValueOp(42)).unwrap();
+        driver.set_value_tx.send(SetValueOp(Arc::new(42))).unwrap();
         driver
             .set_tx
             .send(Arc::new(|v: &mut i32| *v += 10))
@@ -681,7 +696,7 @@ mod tests {
     fn writer_driver_tick_set_value_alone() {
         let mut driver = WriterDriver::new(0i32);
 
-        driver.set_value_tx.send(SetValueOp(99)).unwrap();
+        driver.set_value_tx.send(SetValueOp(Arc::new(99))).unwrap();
 
         driver.tick(Duration::ZERO);
 
@@ -729,52 +744,22 @@ mod tests {
         );
     }
 
-    /// Sentinel whose Clone counts invocations, to prove the write path
-    /// never clones the inner value.
-    #[derive(Debug)]
-    struct CountClones {
-        counter: Arc<AtomicU64>,
-        value: i32,
-    }
-
-    impl Clone for CountClones {
-        fn clone(&self) -> Self {
-            self.counter.fetch_add(1, Ordering::Relaxed);
-            Self {
-                counter: self.counter.clone(),
-                value: self.value,
-            }
-        }
-    }
-
     #[test]
-    fn writer_driver_write_path_does_not_clone() {
-        let counter = Arc::new(AtomicU64::new(0));
-        let initial = CountClones {
-            counter: counter.clone(),
-            value: 0,
-        };
-        let mut driver = WriterDriver::new(initial);
+    fn writer_driver_old_snapshot_stays_valid() {
+        let mut driver = WriterDriver::new(0i32);
 
-        assert_eq!(counter.load(Ordering::Relaxed), 0);
+        let old_guard = driver.read();
+        assert_eq!(*old_guard, 0);
 
         driver
             .set_value_tx
-            .send(SetValueOp(CountClones {
-                counter: counter.clone(),
-                value: 7,
-            }))
+            .send(SetValueOp(Arc::new(42)))
             .unwrap();
-        driver
-            .add_tx
-            .send(Arc::new(|v: &mut CountClones| v.value += 1))
-            .unwrap();
-
         driver.tick(Duration::ZERO);
 
-        assert_eq!(counter.load(Ordering::Relaxed), 0);
+        assert_eq!(*old_guard, 0);
         let val = driver.queued_state.read().clone();
-        assert_eq!(val.value, 8);
+        assert_eq!(val, 42);
     }
 
     #[test]

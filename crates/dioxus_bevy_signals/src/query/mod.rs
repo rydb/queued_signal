@@ -31,7 +31,9 @@ use dioxus_core::use_drop;
 use dioxus_hooks::{use_context, use_effect, use_future, use_memo, use_signal};
 use dioxus_signals::{ReadableExt, Signal, WritableExt};
 use parking_lot::Mutex;
-use queued_signal::state::{HealthStatus, QueuedSignal, SignalReadGuard, WriterDriver};
+use queued_signal::state::{
+    HealthStatus, QueuedSignal, SignalReadGuard, TrackedReadGuard, WriterDriver,
+};
 use tokio::sync::oneshot;
 use trait_set::trait_set;
 
@@ -244,7 +246,7 @@ fn sync_component_to_mirror<T: DioxusComponentSync>(
             None => true,
         };
         if is_changed {
-            *value = mirror.value.read().as_ref().clone();
+            *value = mirror.value.read().clone();
             recently_written.entities.insert(entity);
             mirror.set_changed();
             last_versions.insert(entity, current_version);
@@ -493,11 +495,11 @@ impl<T: DioxusComponentSync> Command for RequestComponentsMirror<T> {
     }
 }
 /// Command requesting a mirror for a specific query type.
-pub struct RequestQueryMirror<T: DioxusQuerySync, F: QueryFilter + 'static> {
+pub struct RequestQueryMirror<T: DioxusQuerySync + 'static, F: QueryFilter + 'static> {
     response_tx: oneshot::Sender<QueuedSignal<MirrorQuery<T, F>>>,
 }
 
-impl<T: DioxusQuerySync + 'static, F: QueryFilter> Command for RequestQueryMirror<T, F> {
+impl<T: DioxusQuerySync + 'static, F: QueryFilter + 'static> Command for RequestQueryMirror<T, F> {
     type Out = ();
 
     fn apply(self, world: &mut World) {
@@ -844,9 +846,11 @@ impl<T: MirrorQueryData, F: QueryFilter> Default for MirrorQuery<T, F> {
 }
 /// A mirrored bevy query holding signals for matching components.
 #[derive(Resource)]
-pub struct MirrorQuerySignal<Q: MirrorQueryData, F: QueryFilter>(QueuedSignal<MirrorQuery<Q, F>>);
+pub struct MirrorQuerySignal<Q: MirrorQueryData + 'static, F: QueryFilter + 'static>(
+    QueuedSignal<MirrorQuery<Q, F>>,
+);
 
-impl<Q: MirrorQueryData, F: QueryFilter> MirrorQuerySignal<Q, F> {
+impl<Q: MirrorQueryData + 'static, F: QueryFilter + 'static> MirrorQuerySignal<Q, F> {
     /// The underlying query signal.
     pub fn signal(&self) -> &QueuedSignal<MirrorQuery<Q, F>> {
         &self.0
@@ -860,13 +864,13 @@ impl<Q: MirrorQueryData, F: QueryFilter> MirrorQuerySignal<Q, F> {
 
 /// Write driver for ticking query signal updates.
 #[derive(Resource)]
-pub struct MirrorQueryWriteDriver<Q: DioxusQuerySync, F: QueryFilter>(
+pub struct MirrorQueryWriteDriver<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>(
     Arc<Mutex<WriterDriver<MirrorQuery<Q, F>>>>,
 );
 
 /// Handle to a mirrored bevy query, usable from dioxus.
-pub struct MirrorQuerySignalHandle<Q: MirrorQueryData, F: QueryFilter> {
-    pub(crate) signal: Signal<Result<Arc<MirrorQuery<Q, F>>, QueryNoneState>>,
+pub struct MirrorQuerySignalHandle<Q: MirrorQueryData + 'static, F: QueryFilter + 'static> {
+    version: Signal<u64>,
     /// Health status of the underlying signal.
     pub health: Signal<HealthStatus>,
     /// None until the bevy round-trip completes.
@@ -874,13 +878,13 @@ pub struct MirrorQuerySignalHandle<Q: MirrorQueryData, F: QueryFilter> {
     _filter: PhantomData<F>,
 }
 
-impl<Q: MirrorQueryData, F: QueryFilter> Clone for MirrorQuerySignalHandle<Q, F> {
+impl<Q: MirrorQueryData + 'static, F: QueryFilter + 'static> Clone for MirrorQuerySignalHandle<Q, F> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<Q: MirrorQueryData, F: QueryFilter> Copy for MirrorQuerySignalHandle<Q, F> {}
+impl<Q: MirrorQueryData + 'static, F: QueryFilter + 'static> Copy for MirrorQuerySignalHandle<Q, F> {}
 
 /// Iterator over mirrored query results.
 pub struct MirrorQueryIter<Q: MirrorQueryData, F: QueryFilter> {
@@ -901,18 +905,26 @@ impl<Q: MirrorQueryData, F: QueryFilter> Iterator for MirrorQueryIter<Q, F> {
 }
 
 impl<Q: MirrorQueryData + 'static, F: QueryFilter + 'static> MirrorQuerySignalHandle<Q, F> {
-    /// Read into a guard of the query. Use `&*self.read()` to obtain
-    /// a reference to the inner result.
-    pub fn read(&self) -> SignalReadGuard<'_, Result<Arc<MirrorQuery<Q, F>>, QueryNoneState>> {
-        SignalReadGuard::new(self.signal.read())
+    /// Read the current query map, subscribing to version updates.
+    pub fn read(&self) -> Result<TrackedReadGuard<MirrorQuery<Q, F>>, QueryNoneState> {
+        let _ = self.version.read();
+        let writer = self.writer.read();
+        match writer.as_ref() {
+            Some(signal) => Ok(signal.read()),
+            None => Err(QueryNoneState::NotInitialized),
+        }
     }
 
     /// Iterate over all mirrored query items.
     pub fn iter(&self) -> MirrorQueryIter<Q, F> {
-        let guard = self.read();
-        let items = match &*guard {
-            Ok(mq) => mq.value.values().cloned().collect::<Vec<_>>(),
-            Err(_) => Vec::new(),
+        let _ = self.version.read();
+        let writer = self.writer.read();
+        let items = match writer.as_ref() {
+            Some(signal) => {
+                let guard = signal.read();
+                guard.value.values().cloned().collect::<Vec<_>>()
+            }
+            None => Vec::new(),
         };
 
         MirrorQueryIter {
@@ -951,7 +963,7 @@ pub fn use_bevy_query<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>()
         let _ = r.tx.send(queue);
     });
 
-    let mut value_signal = use_signal(|| Err(QueryNoneState::NotInitialized));
+    let mut version: Signal<u64> = use_signal(|| 0);
     let health_signal = use_signal(|| HealthStatus::Healthy);
     let mut writer: Signal<Option<QueuedSignal<MirrorQuery<Q, F>>>> = use_signal(|| None);
 
@@ -968,13 +980,7 @@ pub fn use_bevy_query<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>()
                 .await
             {
                 Ok(signal) => {
-                    // Eagerly read the current value so it is available
-                    // immediately, even if forward_to misses the initial
-                    // publish (e.g. when bevy publishes before the
-                    // dioxus async task subscribes).
-                    let current = signal.read().clone();
-                    value_signal.set(Ok(current));
-                    signal.state.forward_to(value_signal, health_signal, Ok);
+                    signal.state.forward_to(version, health_signal);
                     writer.set(Some(signal));
                 }
                 Err(_err) => warn!("use_bevy_query: {}", _err),
@@ -983,7 +989,7 @@ pub fn use_bevy_query<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>()
     });
 
     MirrorQuerySignalHandle {
-        signal: value_signal,
+        version,
         health: health_signal,
         writer,
         _filter: PhantomData,

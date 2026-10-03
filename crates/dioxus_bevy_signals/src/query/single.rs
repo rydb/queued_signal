@@ -49,7 +49,7 @@ pub fn resolve_single<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>(
 
     use_memo(move || {
         let dep = query_handle.read();
-        let new_val = match &*dep {
+        let new_val = match &dep {
             Err(_) => Err(SingleQueryError::NotInitialized),
             Ok(mq) => match mq.value.len() {
                 0 => Err(SingleQueryError::NoMatchingEntity),
@@ -70,7 +70,7 @@ pub fn resolve_single<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>(
 }
 
 /// Handle to a single-entity mirrored bevy query.
-pub struct MirrorQuerySingleHandle<Q: MirrorQueryData, F: QueryFilter> {
+pub struct MirrorQuerySingleHandle<Q: MirrorQueryData + 'static, F: QueryFilter + 'static> {
     /// The single matched item, or an error describing why resolution failed.
     item: Signal<Result<Q::MirrorItemHandles, SingleQueryError>>,
     /// Health of the underlying signal.
@@ -80,13 +80,13 @@ pub struct MirrorQuerySingleHandle<Q: MirrorQueryData, F: QueryFilter> {
     _filter: PhantomData<F>,
 }
 
-impl<Q: MirrorQueryData, F: QueryFilter> Clone for MirrorQuerySingleHandle<Q, F> {
+impl<Q: MirrorQueryData + 'static, F: QueryFilter + 'static> Clone for MirrorQuerySingleHandle<Q, F> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<Q: MirrorQueryData, F: QueryFilter> Copy for MirrorQuerySingleHandle<Q, F> {}
+impl<Q: MirrorQueryData + 'static, F: QueryFilter + 'static> Copy for MirrorQuerySingleHandle<Q, F> {}
 
 impl<Q: MirrorQueryData + 'static, F: QueryFilter + 'static> MirrorQuerySingleHandle<Q, F> {
     /// Aquires a read guard on the inner read value of the signal

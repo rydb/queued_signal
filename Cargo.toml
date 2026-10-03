@@ -32,6 +32,9 @@ flume = {version = "0.12"}
 anyhow = "1"
 tokio = "1.51"
 parking_lot = "0.12.5"
+kovan = "0.1.22"
+ptr_meta = "0.3.2"
+
 # flashmap = "0.2"
 bevy_ecs = {version = "0.19"}
 bevy_app = {version = "0.19"}
@@ -42,6 +45,7 @@ bevy_transform = {version = "0.19"}
 bevy_time = {version = "0.19"}
 bevy_log = {version = "0.19"}
 bevy_reflect = {version = "0.19"}
+bevy_ptr = {version = "0.19"}
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 glam = {version = "0.32"}
 trait-set = {version = "0.3"}

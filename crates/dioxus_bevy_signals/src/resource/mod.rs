@@ -122,11 +122,11 @@ impl<T: ResourceDioxusSync> Command for RequestBevyResource<T> {
 /// Sync bevy <-> dioxus resource values
 fn sync_resource<T: ResourceDioxusSync>(
     mut resource: ResMut<T>,
-    mut driver: ResMut<ResourceWriteDriver<T>>,
+    driver: Res<ResourceWriteDriver<T>>,
 ) {
     let bevy_changed = resource.is_changed();
     let mut guard = driver.0.lock();
-    let (set_values, sets, adds) = guard.drain_ops();
+    let (mut set_values, mut sets, adds) = guard.drain_ops();
     let has_dioxus_ops = !set_values.is_empty() || !sets.is_empty() || !adds.is_empty();
 
     if !bevy_changed && !has_dioxus_ops {
@@ -135,51 +135,30 @@ fn sync_resource<T: ResourceDioxusSync>(
     }
 
     if bevy_changed {
-        // Bevy wins authoritative sets; relative adds compose on top.
+        // Bevy wins authoritative ops; only relative adds compose.
+        set_values.clear();
+        sets.clear();
         for f in adds {
             f(&mut *resource);
         }
-        if let Ok(()) = guard.try_swap(&mut *resource) {
-            let value = (*guard.read()).clone();
-            *resource = value;
-            guard.publish();
+        // Publish bevy's value to the cell.
+        guard.publish_value(resource.clone());
+    } 
+    
+    else {
+        // Apply the oplog to the bevy resource, the write buffer.
+        for op in &set_values {
+            *resource = (*op.0).clone();
         }
-    } else {
-        // Dioxus wins; apply operations to the read buffer.
-        match guard.get_mut() {
-            Ok(slot) => {
-                for value in set_values {
-                    *slot = value;
-                }
-                for f in sets {
-                    f(slot);
-                }
-                for f in adds {
-                    f(slot);
-                }
-            }
-            Err(_count) => {
-                warn!("readers active, deferring mutations: {}", _count);
-                for value in set_values {
-                    let _ = guard.set_value_tx.send(SetValueOp(value));
-                }
-                for f in sets {
-                    let _ = guard.set_tx.send(f);
-                }
-                for f in adds {
-                    let _ = guard.add_tx.send(f);
-                }
-                guard.update_health();
-                return;
-            }
+        for f in &sets {
+            f(&mut *resource);
         }
-        if let Ok(()) = guard.try_swap(&mut *resource) {
-            let value = resource.clone();
-            if let Ok(slot) = guard.get_mut() {
-                *slot = value;
-            }
-            guard.publish();
+        for f in &adds {
+            f(&mut *resource);
         }
+
+        // Publish the bevy resource as the new snapshot.
+        guard.publish_value(resource.clone());
     }
 
     guard.update_health();
@@ -323,7 +302,7 @@ where
 {
     let ctx = use_context::<CommandQueueSender>();
 
-    let mut version: Signal<u64> = use_signal(|| 0);
+    let version: Signal<u64> = use_signal(|| 0);
     let health_signal = use_signal(|| HealthStatus::Healthy);
     let mut writer: Signal<Option<QueuedSignal<T>>> = use_signal(|| None);
 

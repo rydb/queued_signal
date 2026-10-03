@@ -23,7 +23,7 @@ use dioxus_hooks::{use_context, use_future, use_memo, use_signal};
 use dioxus_signals::{Memo, ReadableExt, Signal, WritableExt};
 use flume::{Receiver, Sender};
 use parking_lot::Mutex;
-use queued_signal::state::{HealthStatus, QueuedSignal, SignalReadGuard, WriterDriver};
+use queued_signal::state::{HealthStatus, QueuedSignal, TrackedReadGuard, WriterDriver};
 use tokio::sync::oneshot;
 use trait_set::trait_set;
 
@@ -515,11 +515,11 @@ impl<A: DioxusAssetSync> Command for UpdateTrackingAssets<A> {
 /// Returns either the underlying asset or an none-state.
 #[derive(Clone)]
 pub struct AssetMaybeMirrorSignal<A: DioxusAssetSync> {
-    value: Signal<Arc<Result<A, AssetNoneState>>>,
+    version: Signal<u64>,
     /// None until the bevy round-trip completes.
     /// Writes are silently ignored while pending.
     signal: Signal<Option<QueuedSignal<Result<A, AssetNoneState>>>>,
-    extra_info: Signal<Result<Arc<AssetUpdateExtraInfo<A>>, AssetNoneState>>,
+    extra_info: Signal<Option<QueuedSignal<AssetUpdateExtraInfo<A>>>>,
     health: Signal<HealthStatus>,
 }
 
@@ -545,36 +545,49 @@ impl<A: DioxusAssetSync> AssetMaybeMirrorSignal<A> {
             }
         });
         drop(signal_guard);
-        let r = self.extra_info.read();
-        let extra_info = match &*r {
-            Ok(extra_info) => extra_info,
-            Err(_err) => {
-                error!("could not notify bevy that asset was mutated: {}", _err);
-                return;
-            }
+        let extra_guard = self.extra_info.read();
+        let Some(extra_signal) = extra_guard.as_ref() else {
+            warn!(
+                "AssetMaybeMirrorSignal::mutate dropped: extra info not yet available (Bevy round-trip pending)"
+            );
+            return;
         };
-        // notify bevy that the inner value was changed
-        let _ = extra_info
+        let info = extra_signal.read();
+        // Notify bevy that the inner value was changed.
+        let _ = info
             .changed_sender
-            .send(extra_info.asset_id)
+            .send(info.asset_id)
             .inspect_err(|_err| warn!("{_err}"));
     }
 
-    /// Read asset state
-    pub fn read(&self) -> SignalReadGuard<'_, Arc<Result<A, AssetNoneState>>> {
-        SignalReadGuard::new(self.value.read())
+    /// Read asset state, subscribing to version updates.
+    pub fn read(&self) -> Result<TrackedReadGuard<Result<A, AssetNoneState>>, AssetNoneState> {
+        let _ = self.version.read();
+        let writer = self.signal.read();
+        match writer.as_ref() {
+            Some(signal) => Ok(signal.read()),
+            None => Err(AssetNoneState::Fetching),
+        }
     }
-    /// Returns signal health
+
+    /// Returns signal health.
     pub fn health(&self) -> HealthStatus {
         *self.health.read()
     }
 
-    /// Read + map asset state
+    /// Read + map asset state.
     pub fn read_ok<U>(&self, f: impl FnOnce(&A) -> U) -> Result<U, AssetNoneState> {
-        let guard = self.value.read();
-        match guard.as_ref() {
-            Ok(t) => Ok(f(t)),
-            Err(e) => Err(e.clone()),
+        let _ = self.version.read();
+        let writer = self.signal.read();
+        match writer.as_ref() {
+            Some(signal) => {
+                let guard = signal.read();
+                match &*guard {
+                    Ok(t) => Ok(f(t)),
+                    Err(e) => Err(e.clone()),
+                }
+            }
+            None => Err(AssetNoneState::Fetching),
         }
     }
 }
@@ -587,10 +600,10 @@ pub fn use_bevy_asset<A: DioxusAssetSync>(
 ) -> AssetMaybeMirrorSignal<A> {
     let ctx = use_context::<CommandQueueSender>();
 
-    let mut asset_value_signal = use_signal(|| Arc::new(Err(AssetNoneState::Fetching)));
+    let version = use_signal(|| 0u64);
     let health_signal = use_signal(|| HealthStatus::Healthy);
-    let mut extra_info_signal = use_signal(|| Err(AssetNoneState::Fetching));
     let mut writer_signal = use_signal(|| None);
+    let mut extra_writer_signal = use_signal(|| None);
 
     let mut requested_id = use_signal(|| None::<AssetId<A>>);
 
@@ -618,7 +631,6 @@ pub fn use_bevy_asset<A: DioxusAssetSync>(
         let mut id_rx = id_rx.take().unwrap();
         async move {
             let mut state_forward: Option<Task> = None;
-            let mut extra_forward: Option<Task> = None;
             loop {
                 let Some(mut next) = id_rx.recv().await else {
                     break;
@@ -630,19 +642,16 @@ pub fn use_bevy_asset<A: DioxusAssetSync>(
 
                 let id = match next {
                     Ok(id) => id,
-                    Err(state) => {
-                        debug!("asset id unavailable: {}", state);
+                    Err(_state) => {
+                        debug!("asset id unavailable: {}", _state);
                         if let Some(old) = requested_id.write().take() {
                             send_tracking_delta::<A>(&ctx, old, -1);
                         }
                         if let Some(task) = state_forward.take() {
                             task.cancel();
                         }
-                        if let Some(task) = extra_forward.take() {
-                            task.cancel();
-                        }
-                        asset_value_signal.set(Arc::new(Err(state)));
                         writer_signal.set(None);
+                        extra_writer_signal.set(None);
                         continue;
                     }
                 };
@@ -658,9 +667,6 @@ pub fn use_bevy_asset<A: DioxusAssetSync>(
                     send_tracking_delta::<A>(&ctx, old, -1);
                 }
                 if let Some(task) = state_forward.take() {
-                    task.cancel();
-                }
-                if let Some(task) = extra_forward.take() {
                     task.cancel();
                 }
 
@@ -687,24 +693,12 @@ pub fn use_bevy_asset<A: DioxusAssetSync>(
                 requested_id.set(Some(id));
                 send_tracking_delta::<A>(&ctx, id, 1);
 
-                state_forward = Some(resp.asset_state.forward_to(
-                    asset_value_signal,
-                    health_signal,
-                    |arc| arc,
-                ));
-                extra_forward = Some(resp.extra_info.forward_to(
-                    extra_info_signal,
-                    health_signal,
-                    Ok,
-                ));
+                state_forward = Some(resp.asset_state.state.forward_to(version, health_signal));
 
                 // Set current values eagerly so they are available
                 // before the next publish.
-                let extra_info_arc = resp.extra_info.read().clone();
-                extra_info_signal.set(Ok(extra_info_arc));
-                let asset_arc = resp.asset_state.read().clone();
-                asset_value_signal.set(asset_arc);
                 writer_signal.set(Some(resp.asset_state.clone()));
+                extra_writer_signal.set(Some(resp.extra_info.clone()));
             }
         }
     });
@@ -721,9 +715,9 @@ pub fn use_bevy_asset<A: DioxusAssetSync>(
     });
 
     AssetMaybeMirrorSignal {
-        value: asset_value_signal,
+        version,
         health: health_signal,
         signal: writer_signal,
-        extra_info: extra_info_signal,
+        extra_info: extra_writer_signal,
     }
 }

@@ -16,9 +16,11 @@ dioxus-signals = {workspace = true}
 
 flume = {workspace = true}
 tokio = {workspace = true, features = ["rt", "time", "sync", "macros"]}
-arc-swap = "1.9"
+kovan = {workspace = true}
 parking_lot = {workspace = true}
 queued_signal_tracing = { workspace = true }
+bevy_reflect = { workspace = true }
+bevy_ptr = {workspace = true}
 
 [features]
 trace = ["queued_signal_tracing/trace"]

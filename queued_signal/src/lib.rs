@@ -6,6 +6,6 @@
 pub mod signal;
 /// Core state types: [`QueuedSignal`], [`WriterDriver`], [`HealthStatus`].
 pub mod state;
-pub mod swap_cell;
-
+pub mod atom_coerce;
+pub mod atom_coerce_dyn;
 pub(crate) mod macros;

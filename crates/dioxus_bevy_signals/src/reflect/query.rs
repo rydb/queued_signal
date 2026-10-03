@@ -1049,7 +1049,7 @@ pub fn use_bevy_query_dyn<const N: usize>(names: [&str; N]) -> ReflectQuerySigna
             handles
                 .signal
                 .state
-                .forward_to(value_signal, health_signal, |arc| Ok((*arc).clone()));
+                .forward_value_to(value_signal, health_signal, |arc| Ok((*arc).clone()));
 
             handle_signal.set(Some(handles.handle.clone()));
 
