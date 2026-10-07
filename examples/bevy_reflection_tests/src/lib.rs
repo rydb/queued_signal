@@ -15,6 +15,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry;
 use tracing_subscriber::util::SubscriberInitExt;
 
+pub mod asset;
 pub mod query;
 pub mod resource;
 
@@ -39,6 +40,7 @@ impl bevy_app::Plugin for ReflectionTestsPlugin {
             bevy_command_txrx: self.cmd_channels.clone(),
             ..Default::default()
         });
+        app.add_plugins(asset::AssetDynPlugin);
         app.add_plugins(query::QueryDynPlugin);
         app.add_plugins(resource::ResourceDynPlugin);
     }
@@ -100,8 +102,22 @@ pub fn reflection_app() -> Element {
 
     rsx! {
         div {
-            query::QueryElevationTest {}
-            resource::ReflectElevationTest {}
+            style: "display: flex; flex-direction: column; gap: 16px;",
+            div {
+                style: "border: 2px solid black; padding: 12px; border-radius: 8px;",
+                h2 { "Query Elevation Test" }
+                query::QueryElevationTest {}
+            }
+            div {
+                style: "border: 2px solid black; padding: 12px; border-radius: 8px;",
+                h2 { "Resource Elevation Test" }
+                resource::ReflectElevationTest {}
+            }
+            div {
+                style: "border: 2px solid black; padding: 12px; border-radius: 8px;",
+                h2 { "Asset Elevation Test" }
+                asset::AssetElevationTest {}
+            }
         }
     }
 }

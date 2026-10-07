@@ -178,6 +178,8 @@ pub fn setup(app: &mut App) {
     app.init_resource::<query::ReflectQueryRegistry>();
     app.init_resource::<query::ReflectActiveTypedQueries>();
     app.init_resource::<query::TypedQuerySpawnerRegistry>();
+    app.init_resource::<asset::ReflectAssetRegistry>();
+    app.init_resource::<asset::TypedAssetSpawnerRegistry>();
 
     app.add_systems(
         crate::schedules::DioxusSyncUpdate,

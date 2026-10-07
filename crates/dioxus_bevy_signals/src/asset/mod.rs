@@ -84,29 +84,27 @@ impl Display for AssetNoneState {
 /// Extra metadata for asset update propagation.
 #[derive(Clone, Debug)]
 pub struct AssetUpdateExtraInfo<A: DioxusAssetSync> {
-    changed_sender: Sender<AssetId<A>>,
-    asset_id: AssetId<A>,
+    pub(crate) changed_sender: Sender<AssetId<A>>,
+    pub(crate) asset_id: AssetId<A>,
 }
 
 /// Stores a dioxus signal that mirrors a bevy asset.
 /// Dioxus hooks cannot conditionally exist, so this returns either
 /// the asset or a none-state when the asset is unavailable.
 pub struct AssetMaybeMirror<A: DioxusAssetSync> {
-    state: QueuedSignal<Result<A, AssetNoneState>>,
-    extra_update_info: QueuedSignal<AssetUpdateExtraInfo<A>>,
+    pub(crate) state: QueuedSignal<Result<A, AssetNoneState>>,
+    pub(crate) extra_update_info: QueuedSignal<AssetUpdateExtraInfo<A>>,
     state_driver: Arc<Mutex<WriterDriver<Result<A, AssetNoneState>>>>,
     extra_update_info_driver: Arc<Mutex<WriterDriver<AssetUpdateExtraInfo<A>>>>,
     /// Number of signals actively reading this asset mirror.
-    ///
-    /// Asset mirror is cleaned up when this hits zero.
     tracking_signals: i32,
 }
 
 /// Maps asset IDs to their dioxus mirror state.
 #[derive(Resource)]
 pub struct AssetMirrorMap<A: DioxusAssetSync> {
-    assets: HashMap<AssetId<A>, AssetMaybeMirror<A>>,
-    init_requests: HashSet<AssetId<A>>,
+    pub(crate) assets: HashMap<AssetId<A>, AssetMaybeMirror<A>>,
+    pub(crate) init_requests: HashSet<AssetId<A>>,
 }
 
 impl<A: DioxusAssetSync> Default for AssetMirrorMap<A> {
@@ -311,8 +309,10 @@ pub struct AssetMirrorRequestResponse<A: DioxusAssetSync> {
 
 /// Command requesting a mirror for a specific bevy asset.
 pub struct RequestBevyAssetMirror<A: DioxusAssetSync> {
-    response_tx: oneshot::Sender<AssetMirrorRequestResponse<A>>,
-    asset_id: AssetId<A>,
+    /// Response channel for the mirrored signals.
+    pub response_tx: oneshot::Sender<AssetMirrorRequestResponse<A>>,
+    /// Asset id to mirror.
+    pub asset_id: AssetId<A>,
 }
 
 impl<A: DioxusAssetSync> Command for RequestBevyAssetMirror<A> {
@@ -422,6 +422,12 @@ impl<A: DioxusAssetSync> Command for RequestBevyAssetMirror<A> {
             }
         };
 
+        #[cfg(feature = "reflect")]
+        {
+            crate::reflect::asset::register_typed_asset_spawner_runtime::<A>(world);
+            crate::reflect::asset::notify_typed_asset_mirror::<A>(world, self.asset_id);
+        }
+
         trace!("sending back signal response for {}", type_name::<A>());
         let _ = self.response_tx.send(AssetMirrorRequestResponse {
             asset_state,
@@ -497,9 +503,9 @@ fn send_tracking_delta<A: DioxusAssetSync>(
 
 /// update number of signals tracking an asset(for cleanup on un-monitored assets)
 pub struct UpdateTrackingAssets<A: DioxusAssetSync> {
-    delta: i32,
-    asset_id: AssetId<A>,
-    _phantom: PhantomData<A>,
+    pub(crate) delta: i32,
+    pub(crate) asset_id: AssetId<A>,
+    pub(crate) _phantom: PhantomData<A>,
 }
 
 impl<A: DioxusAssetSync> Command for UpdateTrackingAssets<A> {

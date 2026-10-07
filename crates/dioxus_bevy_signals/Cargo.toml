@@ -38,6 +38,6 @@ bevy_ecs = {workspace = true, features = ["debug"]}
 asset = []
 query = []
 resource = []
-reflect = ["dep:bevy_reflect", "resource", "query"]
+reflect = ["dep:bevy_reflect", "asset", "resource", "query"]
 trace = ["queued_signal_tracing/trace"]
 default = ["asset", "query", "resource"]

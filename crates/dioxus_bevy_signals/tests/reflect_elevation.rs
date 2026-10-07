@@ -1,11 +1,17 @@
 //! Verifies that an untyped reflect query elevates to a typed query on request.
 
 use std::any::TypeId;
+use std::marker::PhantomData;
 
 use bevy_app::App;
+use bevy_asset::{Asset, AssetApp, AssetPlugin, Assets};
 use bevy_ecs::prelude::*;
 use bevy_ecs::world::CommandQueue;
 use bevy_reflect::Reflect;
+use dioxus_bevy_signals::asset::{AssetMirrorRequestResponse, RequestBevyAssetMirror};
+use dioxus_bevy_signals::reflect::asset::{
+    AdoptTypedAsset, ReflectAssetRegistry, register_or_get_asset_dyn,
+};
 use dioxus_bevy_signals::reflect::query::{
     ElevateReflectQuery, ReflectQueryRegistry, TypedQuerySpawnerRegistry, register_or_get_query_dyn,
     register_typed_query_spawner_runtime,
@@ -17,6 +23,7 @@ use dioxus_bevy_signals::resource::ResourceQueuedSignalMirror;
 use parking_lot::Mutex;
 use queued_signal::state::{QueuedSignal, WriterDriver};
 use std::sync::Arc;
+use tokio::sync::oneshot;
 
 #[derive(Component, Reflect, Default, Clone)]
 #[reflect(Component)]
@@ -201,5 +208,99 @@ fn unknown_query_name_errors() {
         world.register_component::<Name>();
         let result = register_or_get_query_dyn(world, &["DoesNotExist".to_string()]);
         assert!(result.is_err(), "unknown component names fail");
+    }
+}
+
+#[derive(Asset, Reflect, Clone, Debug, PartialEq)]
+struct TestAsset {
+    value: i32,
+}
+
+fn setup_asset_app() -> (App, bevy_asset::UntypedAssetId) {
+    let mut app = App::new();
+    app.add_plugins(AssetPlugin::default());
+    app.init_asset::<TestAsset>()
+        .register_asset_reflect::<TestAsset>();
+    app.init_resource::<ReflectAssetRegistry>();
+
+    let id = {
+        let mut assets = app.world_mut().resource_mut::<Assets<TestAsset>>();
+        assets.add(TestAsset { value: 7 }).id().untyped()
+    };
+
+    (app, id)
+}
+
+#[test]
+fn untyped_asset_registers_and_elevates_to_typed() {
+    let (mut app, untyped_id) = setup_asset_app();
+
+    {
+        let world = app.world_mut();
+        register_or_get_asset_dyn(world, untyped_id).expect("reflect asset should register");
+
+        let mirror = &world.resource::<ReflectAssetRegistry>().map[&untyped_id];
+        assert!(!mirror.elevated, "mirror starts unelevated");
+        assert_eq!(mirror.active_count, 1, "reflect sync starts active");
+    }
+
+    {
+        let world = app.world_mut();
+        let (tx, _rx) = oneshot::channel::<AssetMirrorRequestResponse<TestAsset>>();
+        let mut queue = CommandQueue::default();
+        queue.push(RequestBevyAssetMirror::<TestAsset> {
+            response_tx: tx,
+            asset_id: untyped_id.typed_debug_checked::<TestAsset>(),
+        });
+        queue.apply(world);
+    }
+
+    {
+        let world = app.world_mut();
+        let mirror = &world.resource::<ReflectAssetRegistry>().map[&untyped_id];
+        assert!(mirror.elevated, "mirror should be elevated after typed request");
+        assert_eq!(mirror.active_count, 0, "reflect sync should be disabled");
+    }
+}
+
+#[test]
+fn typed_asset_elevates_late_untyped_mirror() {
+    let (mut app, untyped_id) = setup_asset_app();
+    let typed_id = untyped_id.typed_debug_checked::<TestAsset>();
+
+    {
+        let world = app.world_mut();
+        let (tx, _rx) = oneshot::channel::<AssetMirrorRequestResponse<TestAsset>>();
+        let mut queue = CommandQueue::default();
+        queue.push(RequestBevyAssetMirror::<TestAsset> {
+            response_tx: tx,
+            asset_id: typed_id,
+        });
+        queue.apply(world);
+    }
+
+    {
+        let world = app.world_mut();
+        register_or_get_asset_dyn(world, untyped_id).expect("reflect asset should register");
+
+        let mirror = &world.resource::<ReflectAssetRegistry>().map[&untyped_id];
+        assert!(!mirror.elevated, "late mirror starts unelevated");
+    }
+
+    {
+        let world = app.world_mut();
+        let mut queue = CommandQueue::default();
+        queue.push(AdoptTypedAsset::<TestAsset> {
+            asset_id: typed_id,
+            _marker: PhantomData,
+        });
+        queue.apply(world);
+    }
+
+    {
+        let world = app.world_mut();
+        let mirror = &world.resource::<ReflectAssetRegistry>().map[&untyped_id];
+        assert!(mirror.elevated, "late mirror should elevate on adoption");
+        assert_eq!(mirror.active_count, 0, "reflect sync should be disabled");
     }
 }
