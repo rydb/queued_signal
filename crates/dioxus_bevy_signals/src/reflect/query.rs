@@ -1,8 +1,10 @@
 //! Reflect-driven component and query mirroring.
 
 use std::{
-    any::TypeId,
+    any::{Any, TypeId},
     collections::{HashMap, HashSet},
+    future::Future,
+    pin::Pin,
     sync::Arc,
     time::Duration,
 };
@@ -19,15 +21,25 @@ use bevy_ecs::system::{
 };
 use bevy_ecs::world::CommandQueue;
 use bevy_ecs::world::unsafe_world_cell::UnsafeWorldCell;
+use bevy_ptr::{Ptr, PtrMut};
 use bevy_reflect::{Reflect, ReflectFromPtr};
+use dioxus_core::{Task, use_drop};
 use dioxus_hooks::{use_context, use_future, use_signal};
 use dioxus_signals::{ReadableExt, Signal, WritableExt};
+use imbl::HashMap as ImHashMap;
+use kovan::Atom;
 use parking_lot::Mutex;
-use queued_signal::state::{HealthStatus, QueuedSignal, SignalReadGuard, WriterDriver};
-use queued_signal_tracing::error;
+use queued_signal::atom_coerce::AtomCoerceHandle;
+use queued_signal::atom_coerce_dyn::{AtomCoerceDyn, AtomCoerceDynHandle, Erase};
+use queued_signal::state::{
+    HealthStatus, QueuedSignal, QueuedStateDyn, TrackedReadGuardDyn, WriterDriver,
+};
+use queued_signal_tracing::{error, warn};
 use tokio::sync::{oneshot, watch};
 
-use crate::query::{DioxusComponentSync, MirrorQuery, MirrorQueryData, MirrorQuerySignal};
+use crate::query::{
+    MirrorQuery, MirrorQueryData, MirrorQuerySignal, RequestQueryMirror, UpdateTrackingQueries,
+};
 use crate::reflect::NameResolutionError;
 use crate::schedules::{DioxusSyncPostUpdate, DioxusSyncUpdate};
 use crate::{CommandQueueSender, add_systems_through_world};
@@ -64,18 +76,232 @@ impl ReflectComponentHandle {
     }
 }
 
-/// Type-erased handle to the active mutation routing for a query mirror.
+/// Type-erased routing for per-component query mutations.
+trait QueryWriteRouter: Send + Sync {
+    /// Apply a relative reflect mutation to one component.
+    fn mutate(&self, entity: Entity, idx: usize, f: ErasedMutation);
+
+    /// Replace one component value.
+    fn set_value(&self, entity: Entity, idx: usize, value: Arc<dyn Reflect>);
+}
+
+/// Routes writes into the owned reflect snapshot.
+struct SnapshotQueryWriteRouter {
+    signal: QueuedSignal<OwnedQuerySnapshot>,
+}
+
+impl QueryWriteRouter for SnapshotQueryWriteRouter {
+    fn mutate(&self, entity: Entity, idx: usize, f: ErasedMutation) {
+        self.signal.mutate(move |snapshot: &mut OwnedQuerySnapshot| {
+            let Some(values) = snapshot.map.get(&entity) else {
+                return;
+            };
+            let mut new_values = values.clone();
+            let Some(slot) = new_values.get_mut(idx) else {
+                return;
+            };
+            let Some(inner) = slot else {
+                return;
+            };
+            apply_cow(inner, f.clone());
+            snapshot.map.insert(entity, new_values);
+        });
+    }
+
+    fn set_value(&self, entity: Entity, idx: usize, value: Arc<dyn Reflect>) {
+        self.signal
+            .mutate_set(move |snapshot: &mut OwnedQuerySnapshot| {
+                let Some(values) = snapshot.map.get(&entity) else {
+                    return;
+                };
+                let mut new_values = values.clone();
+                if let Some(slot) = new_values.get_mut(idx) {
+                    *slot = Some(value.clone());
+                }
+                snapshot.map.insert(entity, new_values);
+            });
+    }
+}
+
+/// Routes writes into the typed per-component signals.
+struct TypedQueryWriteRouter<Q: MirrorQueryData + Send + Sync + 'static, F: QueryFilter + 'static> {
+    typed: QueuedSignal<MirrorQuery<Q, F>>,
+}
+
+impl<Q: MirrorQueryData + Send + Sync + 'static, F: QueryFilter + 'static> QueryWriteRouter
+    for TypedQueryWriteRouter<Q, F>
+{
+    fn mutate(&self, entity: Entity, idx: usize, f: ErasedMutation) {
+        let guard = self.typed.read();
+        let reflect = &guard.as_ref().reflect;
+        for handles in guard.as_ref() {
+            if Q::handles_entity(handles) == entity {
+                Q::mutate_component(reflect, handles, idx, f.clone());
+                return;
+            }
+        }
+    }
+
+    fn set_value(&self, entity: Entity, idx: usize, value: Arc<dyn Reflect>) {
+        let guard = self.typed.read();
+        let reflect = &guard.as_ref().reflect;
+        for handles in guard.as_ref() {
+            if Q::handles_entity(handles) == entity {
+                Q::set_component(reflect, handles, idx, value.clone());
+                return;
+            }
+        }
+    }
+}
+
+/// Zero-copy reflect read that keeps the backing allocation alive.
+pub struct ReflectReadGuard {
+    _keep_alive: Box<dyn Any>,
+    ptr: *const dyn Reflect,
+}
+
+impl ReflectReadGuard {
+    /// Wraps an owned reflected arc.
+    fn from_arc(arc: Arc<dyn Reflect>) -> Self {
+        let ptr: *const dyn Reflect = arc.as_ref();
+        ReflectReadGuard {
+            _keep_alive: Box::new(arc),
+            ptr,
+        }
+    }
+
+    /// Wraps a raw pointer whose backing owner is kept alive.
+    fn from_raw(owner: Box<dyn Any>, ptr: *const dyn Reflect) -> Self {
+        ReflectReadGuard {
+            _keep_alive: owner,
+            ptr,
+        }
+    }
+
+    /// The reflected value this guard reads.
+    pub fn as_reflect(&self) -> &dyn Reflect {
+        // SAFETY: ptr points into the allocation owned by _keep_alive.
+        unsafe { &*self.ptr }
+    }
+}
+
+impl std::ops::Deref for ReflectReadGuard {
+    type Target = dyn Reflect;
+
+    fn deref(&self) -> &dyn Reflect {
+        self.as_reflect()
+    }
+}
+
+/// Type-erased view over a query's entities and component reads.
+pub trait QueryView: Any + Send + Sync {
+    /// Entity ids in this query.
+    fn entities(&self) -> Vec<Entity>;
+
+    /// Number of components per item.
+    fn component_count(&self) -> usize;
+
+    /// Read one component as a zero-copy reflect guard.
+    fn read_component(
+        &self,
+        entity: Entity,
+        idx: usize,
+    ) -> Option<Result<ReflectReadGuard, ComponentReflectError>>;
+}
+
+/// Owned reflect snapshot backing an unelevated query mirror.
 #[derive(Clone)]
-pub struct QueryMutationHandle {
+pub struct OwnedQuerySnapshot {
+    /// Per-entity component values with structural sharing.
+    pub map: ImHashMap<Entity, Vec<Option<Arc<dyn Reflect>>>>,
+    /// Number of components per item.
+    pub component_count: usize,
+}
+
+impl Erase<dyn QueryView> for OwnedQuerySnapshot {
+    fn erase(ptr: *const ()) -> *const dyn QueryView {
+        let this: *const OwnedQuerySnapshot = ptr.cast();
+        this
+    }
+}
+
+impl<Q: MirrorQueryData + Send + Sync + 'static, F: QueryFilter + 'static> Erase<dyn QueryView>
+    for MirrorQuery<Q, F>
+{
+    fn erase(ptr: *const ()) -> *const dyn QueryView {
+        let this: *const MirrorQuery<Q, F> = ptr.cast();
+        this
+    }
+}
+
+impl QueryView for OwnedQuerySnapshot {
+    fn entities(&self) -> Vec<Entity> {
+        let mut out: Vec<Entity> = self.map.keys().copied().collect();
+        out.sort_unstable();
+        out
+    }
+
+    fn component_count(&self) -> usize {
+        self.component_count
+    }
+
+    fn read_component(
+        &self,
+        entity: Entity,
+        idx: usize,
+    ) -> Option<Result<ReflectReadGuard, ComponentReflectError>> {
+        let values = self.map.get(&entity)?;
+        match values.get(idx)? {
+            Some(arc) => Some(Ok(ReflectReadGuard::from_arc(arc.clone()))),
+            None => Some(Err(ComponentReflectError::NoReflectData)),
+        }
+    }
+}
+
+impl<Q: MirrorQueryData + Send + Sync + 'static, F: QueryFilter + 'static> QueryView
+    for MirrorQuery<Q, F>
+{
+    fn entities(&self) -> Vec<Entity> {
+        let mut out: Vec<Entity> = self
+            .into_iter()
+            .map(|handles| Q::handles_entity(handles))
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    fn component_count(&self) -> usize {
+        Q::component_type_ids().len()
+    }
+
+    fn read_component(
+        &self,
+        entity: Entity,
+        idx: usize,
+    ) -> Option<Result<ReflectReadGuard, ComponentReflectError>> {
+        let handles = self
+            .into_iter()
+            .find(|handles| Q::handles_entity(handles) == entity)?;
+        Q::read_component(&self.reflect, handles, idx)
+    }
+}
+
+/// Type-erased handle to the active query view and mutation routing.
+#[derive(Clone)]
+pub struct QuerySignalHandle {
+    /// Rebindable erased read view into the current query snapshot.
+    view: QueuedStateDyn<dyn QueryView>,
     /// Number of components per query item.
     component_count: Arc<dyn Fn() -> usize + Send + Sync>,
     /// Build a per-component mutation handle for an entity and component index.
     component_handle: Arc<dyn Fn(Entity, usize) -> ReflectComponentHandle + Send + Sync>,
     /// Component names in query order.
     component_names: Vec<String>,
+    /// Forward version changes into dioxus signals, returning the forward task.
+    forward_to: Arc<dyn Fn(Signal<u64>, Signal<HealthStatus>) -> Task + Send + Sync>,
 }
 
-impl QueryMutationHandle {
+impl QuerySignalHandle {
     /// Number of components per query item.
     pub fn component_count(&self) -> usize {
         (self.component_count)()
@@ -90,125 +316,110 @@ impl QueryMutationHandle {
     pub fn component_names(&self) -> &[String] {
         &self.component_names
     }
+
+    /// A zero-copy read view over the current query snapshot.
+    pub fn read_view(&self) -> TrackedReadGuardDyn<dyn QueryView> {
+        self.view.read()
+    }
+
+    /// Forward version and health into dioxus signals, returning the forward task.
+    pub fn forward_to(&self, version: Signal<u64>, health: Signal<HealthStatus>) -> Task {
+        (self.forward_to)(version, health)
+    }
 }
 
-/// Type-erased dispatch over a typed query's per-component handles.
-pub trait ReflectMirrorQueryData: MirrorQueryData {
-    /// Type ids of the queried components, in tuple order.
-    fn type_ids() -> Vec<TypeId>;
-
+/// Runtime reflect operations for mirror queries with per-component reflect data.
+pub trait ReflectRuntimeOps: MirrorQueryData {
     /// Number of components in this query item, excluding the entity.
-    fn component_count() -> usize;
+    fn component_count() -> usize {
+        Self::component_type_ids().len()
+    }
 
-    /// The entity of a mirror item handle tuple.
-    fn handles_entity(handles: &Self::MirrorItemHandles) -> Entity;
-
-    /// Read the idx-th component value as a reflected Arc.
-    fn read_component(handles: &Self::MirrorItemHandles, idx: usize) -> Option<Arc<dyn Reflect>>;
+    /// Read the idx-th component as a zero-copy reflect guard.
+    fn read_component(
+        reflect: &[Option<Arc<dyn Any + Send + Sync>>],
+        handles: &Self::MirrorItemHandles,
+        idx: usize,
+    ) -> Option<Result<ReflectReadGuard, ComponentReflectError>>;
 
     /// Enqueue a relative reflect mutation into the idx-th component.
-    fn mutate_component(handles: &Self::MirrorItemHandles, idx: usize, f: ErasedMutation);
+    fn mutate_component(
+        reflect: &[Option<Arc<dyn Any + Send + Sync>>],
+        handles: &Self::MirrorItemHandles,
+        idx: usize,
+        f: ErasedMutation,
+    );
 
     /// Replace the idx-th component value.
-    fn set_component(handles: &Self::MirrorItemHandles, idx: usize, value: Arc<dyn Reflect>);
+    fn set_component(
+        reflect: &[Option<Arc<dyn Any + Send + Sync>>],
+        handles: &Self::MirrorItemHandles,
+        idx: usize,
+        value: Arc<dyn Reflect>,
+    );
 }
 
-impl<A: DioxusComponentSync + Reflect> ReflectMirrorQueryData for (Entity, &mut A) {
-    fn type_ids() -> Vec<TypeId> {
-        vec![TypeId::of::<A>()]
+impl<Q: MirrorQueryData> ReflectRuntimeOps for Q {
+    fn read_component(
+        reflect: &[Option<Arc<dyn Any + Send + Sync>>],
+        handles: &Self::MirrorItemHandles,
+        idx: usize,
+    ) -> Option<Result<ReflectReadGuard, ComponentReflectError>> {
+        let slot = reflect.get(idx)?;
+        let Some(rfp) = slot
+            .as_ref()
+            .and_then(|any| any.clone().downcast::<ReflectFromPtr>().ok())
+        else {
+            return Some(Err(ComponentReflectError::NoReflectData));
+        };
+        let Some(guard) = Q::read_component_erased(handles, idx) else {
+            return None;
+        };
+        // SAFETY: guard.ptr points at the live component mirrored by rfp.
+        let value = unsafe { rfp.as_reflect(Ptr::new(guard.ptr)) };
+        Some(Ok(ReflectReadGuard::from_raw(guard.owner, value)))
     }
 
-    fn component_count() -> usize {
-        1
+    fn mutate_component(
+        reflect: &[Option<Arc<dyn Any + Send + Sync>>],
+        handles: &Self::MirrorItemHandles,
+        idx: usize,
+        f: ErasedMutation,
+    ) {
+        let Some(rfp) = reflect
+            .get(idx)
+            .and_then(|slot| slot.as_ref())
+            .and_then(|any| any.clone().downcast::<ReflectFromPtr>().ok())
+        else {
+            return;
+        };
+        Q::with_component_mut(handles, idx, Box::new(move |ptr| {
+            // SAFETY: ptr points at the live component mirrored by rfp.
+            let value = unsafe { rfp.as_reflect_mut(PtrMut::new(ptr)) };
+            f(value);
+        }));
     }
 
-    fn handles_entity(handles: &Self::MirrorItemHandles) -> Entity {
-        handles.0
-    }
-
-    fn read_component(handles: &Self::MirrorItemHandles, idx: usize) -> Option<Arc<dyn Reflect>> {
-        if idx == 0 {
-            let guard = handles.1.read();
-            clone_into_arc(guard.as_ref()).ok()
-        } else {
-            None
-        }
-    }
-
-    fn mutate_component(handles: &Self::MirrorItemHandles, idx: usize, f: ErasedMutation) {
-        if idx == 0 {
-            handles
-                .1
-                .mutate(move |value: &mut A| f(value.as_reflect_mut()));
-        }
-    }
-
-    fn set_component(handles: &Self::MirrorItemHandles, idx: usize, value: Arc<dyn Reflect>) {
-        if idx == 0 {
-            handles.1.mutate_set(move |v: &mut A| {
-                if let Err(err) = v.as_reflect_mut().try_apply(value.as_ref()) {
-                    error!("reflect apply failed: {}", err);
-                }
-            });
-        }
-    }
-}
-
-impl<A: DioxusComponentSync + Reflect, B: DioxusComponentSync + Reflect> ReflectMirrorQueryData
-    for (Entity, &mut A, &mut B)
-{
-    fn type_ids() -> Vec<TypeId> {
-        vec![TypeId::of::<A>(), TypeId::of::<B>()]
-    }
-
-    fn component_count() -> usize {
-        2
-    }
-
-    fn handles_entity(handles: &Self::MirrorItemHandles) -> Entity {
-        handles.0
-    }
-
-    fn read_component(handles: &Self::MirrorItemHandles, idx: usize) -> Option<Arc<dyn Reflect>> {
-        match idx {
-            0 => {
-                let guard = handles.1.read();
-                clone_into_arc(guard.as_ref()).ok()
+    fn set_component(
+        reflect: &[Option<Arc<dyn Any + Send + Sync>>],
+        handles: &Self::MirrorItemHandles,
+        idx: usize,
+        value: Arc<dyn Reflect>,
+    ) {
+        let Some(rfp) = reflect
+            .get(idx)
+            .and_then(|slot| slot.as_ref())
+            .and_then(|any| any.clone().downcast::<ReflectFromPtr>().ok())
+        else {
+            return;
+        };
+        Q::with_component_mut(handles, idx, Box::new(move |ptr| {
+            // SAFETY: ptr points at the live component mirrored by rfp.
+            let target = unsafe { rfp.as_reflect_mut(PtrMut::new(ptr)) };
+            if let Err(err) = target.try_apply(value.as_ref()) {
+                error!("reflect apply failed: {}", err);
             }
-            1 => {
-                let guard = handles.2.read();
-                clone_into_arc(guard.as_ref()).ok()
-            }
-            _ => None,
-        }
-    }
-
-    fn mutate_component(handles: &Self::MirrorItemHandles, idx: usize, f: ErasedMutation) {
-        match idx {
-            0 => handles
-                .1
-                .mutate(move |value: &mut A| f(value.as_reflect_mut())),
-            1 => handles
-                .2
-                .mutate(move |value: &mut B| f(value.as_reflect_mut())),
-            _ => {}
-        }
-    }
-
-    fn set_component(handles: &Self::MirrorItemHandles, idx: usize, value: Arc<dyn Reflect>) {
-        match idx {
-            0 => handles.1.mutate_set(move |v: &mut A| {
-                if let Err(err) = v.as_reflect_mut().try_apply(value.as_ref()) {
-                    error!("reflect apply failed: {}", err);
-                }
-            }),
-            1 => handles.2.mutate_set(move |v: &mut B| {
-                if let Err(err) = v.as_reflect_mut().try_apply(value.as_ref()) {
-                    error!("reflect apply failed: {}", err);
-                }
-            }),
-            _ => {}
-        }
+        }));
     }
 }
 
@@ -238,25 +449,29 @@ pub struct ReflectQueryMirror {
     /// ComponentIds of the query.
     pub component_ids: Vec<ComponentId>,
     /// Type data for pointer conversion per component.
-    pub reflect_from_ptrs: Vec<ReflectFromPtr>,
-    /// The erased signal mirror mapping entities to per-component values.
-    pub signal: QueuedSignal<HashMap<Entity, Vec<Arc<dyn Reflect>>>>,
+    pub reflect_from_ptrs: Vec<Option<ReflectFromPtr>>,
+    /// Queued signal holding the owned snapshot with ordered mutations.
+    pub signal: Option<QueuedSignal<OwnedQuerySnapshot>>,
+    /// Driver that publishes queued mutations into the signal read buffer.
+    pub driver: Option<Arc<Mutex<WriterDriver<OwnedQuerySnapshot>>>>,
+    /// Erased read view bound to the signal cell or the typed query cell.
+    pub view: AtomCoerceDyn<dyn QueryView>,
     /// Active selection count.
     pub active_count: i32,
     /// Whether a typed query has taken over.
     pub elevated: bool,
-    /// Last signal version written back to bevy.
+    /// Last version written back to bevy.
     pub last_written_version: u64,
     /// Last world change tick observed by the read system.
     pub last_change_tick: Tick,
     /// Entities written back to bevy by this mirror's write system.
     pub recently_written: HashSet<Entity>,
-    /// Driver that publishes queued mutations into the signal read buffer.
-    pub driver: Arc<Mutex<WriterDriver<HashMap<Entity, Vec<Arc<dyn Reflect>>>>>>,
-    /// Handle to the active mutation routing.
-    pub handle: QueryMutationHandle,
+    /// Rebindable router for per-component writes.
+    write: Arc<Atom<Box<dyn QueryWriteRouter>>>,
+    /// Handle to the active query view and mutation routing.
+    pub handle: QuerySignalHandle,
     /// Sender for replacing the active handle when elevation happens.
-    pub handle_tx: watch::Sender<QueryMutationHandle>,
+    pub handle_tx: watch::Sender<QuerySignalHandle>,
 }
 
 /// Registry of reflect query mirrors.
@@ -266,11 +481,166 @@ pub struct ReflectQueryRegistry {
     pub map: HashMap<Vec<TypeId>, ReflectQueryMirror>,
 }
 
+/// Sorted component TypeId keys with an active typed query mirror.
+#[derive(Resource, Default)]
+pub struct ReflectActiveTypedQueries {
+    /// Active typed query keys.
+    pub keys: HashSet<Vec<TypeId>>,
+}
+
+/// Marks a typed query's component set as active and elevates any matching
+/// reflect mirror so its sync systems stop writing.
+pub fn register_typed_query_active(world: &mut World, mut ids: Vec<TypeId>) {
+    ids.sort_unstable();
+    world
+        .get_resource_or_init::<ReflectActiveTypedQueries>()
+        .keys
+        .insert(ids.clone());
+    if let Some(mirror) = world
+        .resource_mut::<ReflectQueryRegistry>()
+        .map
+        .get_mut(&ids)
+    {
+        mirror.elevated = true;
+        mirror.active_count = 0;
+    }
+}
+
+/// Future returned by a typed query spawner.
+pub type TypedSpawnFuture = Pin<Box<dyn Future<Output = Result<(), String>>>>;
+
+/// Type-erased handle for spinning up a typed query and sharing its count.
+#[derive(Clone)]
+pub struct TypedQuerySpawner {
+    /// Spins up the typed query, adopts the reflect mirror, and increments the count.
+    pub spawn: Arc<dyn Fn(CommandQueueSender) -> TypedSpawnFuture + Send + Sync>,
+    /// Decrements the shared count when the untyped query unmounts.
+    pub despawn: Arc<dyn Fn(&CommandQueueSender) + Send + Sync>,
+}
+
+impl TypedQuerySpawner {
+    /// Spins up the typed query and shares its count.
+    pub fn spawn(&self, ctx: CommandQueueSender) -> TypedSpawnFuture {
+        (self.spawn)(ctx)
+    }
+
+    /// Decrements the shared count.
+    pub fn despawn(&self, ctx: &CommandQueueSender) {
+        (self.despawn)(ctx)
+    }
+}
+
+/// Spawners keyed by sorted component TypeIds.
+#[derive(Resource, Default)]
+pub struct TypedQuerySpawnerRegistry {
+    /// Registered typed query spawners.
+    pub spawners: HashMap<Vec<TypeId>, TypedQuerySpawner>,
+}
+
+/// Command fetching a spawner for a component TypeId key.
+pub struct GetTypedQuerySpawner {
+    /// Sorted component TypeIds to look up.
+    pub key: Vec<TypeId>,
+    /// Response channel.
+    pub response_tx: oneshot::Sender<Option<TypedQuerySpawner>>,
+}
+
+impl Command for GetTypedQuerySpawner {
+    type Out = ();
+
+    fn apply(self, world: &mut World) {
+        let spawner = world
+            .resource::<TypedQuerySpawnerRegistry>()
+            .spawners
+            .get(&self.key)
+            .cloned();
+        let _ = self.response_tx.send(spawner);
+    }
+}
+
+/// Registers a spawner for a typed query when at least one component reflects.
+pub fn register_typed_query_spawner_runtime<Q, F>(world: &mut World)
+where
+    Q: MirrorQueryData + Send + Sync + 'static,
+    F: QueryFilter + 'static,
+{
+    let mut key = Q::component_type_ids();
+    key.sort_unstable();
+
+    let any_reflectable = {
+        let Some(registry) = world.get_resource::<AppTypeRegistry>() else {
+            return;
+        };
+        let registry = registry.read();
+        key.iter().any(|type_id| {
+            registry
+                .get(*type_id)
+                .is_some_and(|registration| registration.data::<ReflectFromPtr>().is_some())
+        })
+    };
+    if !any_reflectable {
+        return;
+    }
+
+    let spawner = TypedQuerySpawner {
+        spawn: Arc::new(|ctx: CommandQueueSender| -> TypedSpawnFuture {
+            Box::pin(spawn_typed_query::<Q, F>(ctx))
+        }),
+        despawn: Arc::new(|ctx: &CommandQueueSender| {
+            let mut q = CommandQueue::default();
+            q.push(UpdateTrackingQueries::<Q, F> {
+                delta: -1,
+                _phantom: || std::marker::PhantomData,
+            });
+            let _ = ctx.tx.send(q);
+        }),
+    };
+
+    world
+        .get_resource_or_init::<TypedQuerySpawnerRegistry>()
+        .spawners
+        .insert(key, spawner);
+}
+
+async fn spawn_typed_query<Q, F>(ctx: CommandQueueSender) -> Result<(), String>
+where
+    Q: MirrorQueryData + Send + Sync + 'static,
+    F: QueryFilter + 'static,
+{
+    let _: QueuedSignal<MirrorQuery<Q, F>> = ctx
+        .send_command_async(|tx| {
+            let mut q = CommandQueue::default();
+            q.push(RequestQueryMirror::<Q, F> { response_tx: tx });
+            q
+        })
+        .await?;
+
+    let mut q = CommandQueue::default();
+    q.push(AdoptTypedQuery::<Q, F> {
+        _marker: std::marker::PhantomData,
+    });
+    let _ = ctx.tx.send(q);
+
+    let mut q = CommandQueue::default();
+    q.push(UpdateTrackingQueries::<Q, F> {
+        delta: 1,
+        _phantom: || std::marker::PhantomData,
+    });
+    let _ = ctx.tx.send(q);
+
+    Ok(())
+}
+
 /// Ticks every reflect query driver so queued mutations publish.
 pub fn drive_reflect_query_signals(mut registry: ResMut<ReflectQueryRegistry>) {
     for mirror in registry.map.values_mut() {
-        let mut guard = mirror.driver.lock();
-        guard.tick(Duration::ZERO);
+        if mirror.elevated {
+            continue;
+        }
+        if let Some(driver) = &mirror.driver {
+            let mut guard = driver.lock();
+            guard.tick(Duration::ZERO);
+        }
     }
 }
 
@@ -444,12 +814,12 @@ pub fn elevate_query(ctx: &CommandQueueSender, type_ids: impl IntoIterator<Item 
 /// Handles for a reflect query mirror returned to dioxus.
 #[derive(Clone)]
 pub struct ReflectQueryHandles {
-    /// The snapshot signal, forwarded into the dioxus value signal.
-    pub signal: QueuedSignal<HashMap<Entity, Vec<Arc<dyn Reflect>>>>,
-    /// Handle to the active mutation routing.
-    pub handle: QueryMutationHandle,
+    /// Handle to the active query view and mutation routing.
+    pub handle: QuerySignalHandle,
     /// Receiver observing replacements of the active handle.
-    pub handle_rx: watch::Receiver<QueryMutationHandle>,
+    pub handle_rx: watch::Receiver<QuerySignalHandle>,
+    /// Sorted component TypeIds for this query.
+    pub type_ids: Vec<TypeId>,
 }
 
 /// Command requesting a reflect mirror for a query by component names.
@@ -477,95 +847,97 @@ fn apply_cow(slot: &mut Arc<dyn Reflect>, f: ErasedMutation) {
     }
 }
 
-/// Builds the mutation handle routing to the reflect snapshot.
-fn reflect_query_mutation_handle(
-    signal: QueuedSignal<HashMap<Entity, Vec<Arc<dyn Reflect>>>>,
-    component_count: usize,
-    names: Vec<String>,
-) -> QueryMutationHandle {
-    let count = Arc::new(move || component_count);
-
-    let s = signal.clone();
-    let component_handle = Arc::new(move |entity: Entity, idx: usize| {
-        let s_mutate = s.clone();
+/// Builds a component handle that dispatches through the current router.
+fn component_handle_from_slot(
+    write: Arc<Atom<Box<dyn QueryWriteRouter>>>,
+) -> Arc<dyn Fn(Entity, usize) -> ReflectComponentHandle + Send + Sync> {
+    Arc::new(move |entity: Entity, idx: usize| {
+        let mutate_write = write.clone();
         let mutate = Arc::new(move |f: ErasedMutation| {
-            s_mutate.mutate(move |map: &mut HashMap<Entity, Vec<Arc<dyn Reflect>>>| {
-                let Some(values) = map.get_mut(&entity) else {
-                    return;
-                };
-                let Some(slot) = values.get_mut(idx) else {
-                    return;
-                };
-                apply_cow(slot, f.clone());
-            });
+            let router = mutate_write.load();
+            router.mutate(entity, idx, f);
         });
 
-        let s_set = s.clone();
+        let set_write = write.clone();
         let set_value = Arc::new(move |value: Arc<dyn Reflect>| {
-            s_set.mutate_set(move |map: &mut HashMap<Entity, Vec<Arc<dyn Reflect>>>| {
-                let Some(values) = map.get_mut(&entity) else {
-                    return;
-                };
-                if let Some(slot) = values.get_mut(idx) {
-                    *slot = value.clone();
-                }
-            });
+            let router = set_write.load();
+            router.set_value(entity, idx, value);
         });
 
         ReflectComponentHandle { mutate, set_value }
-    });
+    })
+}
 
-    QueryMutationHandle {
+/// Builds the query handle routing to the owned reflect snapshot.
+fn reflect_query_handle(
+    signal: QueuedSignal<OwnedQuerySnapshot>,
+    view: AtomCoerceDynHandle<dyn QueryView>,
+    write: Arc<Atom<Box<dyn QueryWriteRouter>>>,
+    component_count: usize,
+    names: Vec<String>,
+) -> QuerySignalHandle {
+    let count = Arc::new(move || component_count);
+    let component_handle = component_handle_from_slot(write);
+
+    let view = QueuedStateDyn {
+        view,
+        notify_rx: signal.state.notify_rx(),
+        health_rx: signal.state.health_rx.clone(),
+        registry: signal.state.registry.clone(),
+    };
+
+    let state = signal.state.clone();
+    let forward_to = Arc::new(
+        move |version_signal: Signal<u64>, health_signal: Signal<HealthStatus>| {
+            state.forward_to(version_signal, health_signal)
+        },
+    );
+
+    QuerySignalHandle {
+        view,
         component_count: count,
         component_handle,
         component_names: names,
+        forward_to,
     }
 }
 
-/// Builds the mutation handle routing to the typed per-component signals.
-fn typed_query_mutation_handle<Q: ReflectMirrorQueryData + 'static, F: QueryFilter + 'static>(
+/// Builds the query handle routing to the typed per-component signals.
+fn typed_query_handle<Q: MirrorQueryData + Send + Sync + 'static, F: QueryFilter + 'static>(
+    view: AtomCoerceDynHandle<dyn QueryView>,
+    write: Arc<Atom<Box<dyn QueryWriteRouter>>>,
     typed: QueuedSignal<MirrorQuery<Q, F>>,
     names: Vec<String>,
-) -> QueryMutationHandle {
-    let count = Arc::new(|| Q::component_count());
+) -> QuerySignalHandle {
+    let count = Arc::new(|| Q::component_type_ids().len());
+    let component_handle = component_handle_from_slot(write);
 
-    let t = typed.clone();
-    let component_handle = Arc::new(move |entity: Entity, idx: usize| {
-        let t_mutate = t.clone();
-        let mutate = Arc::new(move |f: ErasedMutation| {
-            let guard = t_mutate.read();
-            for handles in guard.as_ref() {
-                if Q::handles_entity(handles) == entity {
-                    Q::mutate_component(handles, idx, f.clone());
-                    return;
-                }
-            }
-        });
+    let view = QueuedStateDyn {
+        view,
+        notify_rx: typed.state.notify_rx(),
+        health_rx: typed.state.health_rx.clone(),
+        registry: typed.state.registry.clone(),
+    };
 
-        let t_set = t.clone();
-        let set_value = Arc::new(move |value: Arc<dyn Reflect>| {
-            let guard = t_set.read();
-            for handles in guard.as_ref() {
-                if Q::handles_entity(handles) == entity {
-                    Q::set_component(handles, idx, value.clone());
-                    return;
-                }
-            }
-        });
+    let state = typed.state.clone();
+    let forward_to = Arc::new(
+        move |version_signal: Signal<u64>, health_signal: Signal<HealthStatus>| {
+            state.forward_to(version_signal, health_signal)
+        },
+    );
 
-        ReflectComponentHandle { mutate, set_value }
-    });
-
-    QueryMutationHandle {
+    QuerySignalHandle {
+        view,
         component_count: count,
         component_handle,
         component_names: names,
+        forward_to,
     }
 }
 
 /// The sorted type id list for a typed query.
-fn query_type_ids<Q: ReflectMirrorQueryData>() -> Vec<TypeId> {
-    let mut ids = Q::type_ids();
+fn query_type_ids<Q: MirrorQueryData>() -> Vec<TypeId> {
+    let mut ids = Q::component_type_ids();
     ids.sort_unstable();
     ids
 }
@@ -591,6 +963,8 @@ fn type_short_path(world: &World, type_id: TypeId) -> String {
 pub enum ComponentReflectError {
     /// Component id is valid but the component does not reflect.
     ValidIDNoReflect(String),
+    /// Component has no reflect data at runtime.
+    NoReflectData,
     /// Error resolving component name.
     NameError(NameResolutionError),
 }
@@ -602,6 +976,7 @@ impl std::fmt::Display for ComponentReflectError {
                 f,
                 "{name} exists, but does not reflect. Did you add #[reflect(Component)] to it?"
             ),
+            ComponentReflectError::NoReflectData => write!(f, "component has no reflect data"),
             ComponentReflectError::NameError(e) => write!(f, "{e:?}"),
         }
     }
@@ -615,32 +990,58 @@ pub fn register_or_get_query_dyn(
     let type_registry = world.resource::<AppTypeRegistry>();
     let infos = enumerate_reflect_types(&type_registry);
 
+    let registry = type_registry.read();
     let mut type_ids = Vec::with_capacity(names.len());
+    let mut component_ids = Vec::with_capacity(names.len());
+    let mut reflect_from_ptrs: Vec<Option<ReflectFromPtr>> = Vec::with_capacity(names.len());
     let mut errors = vec![];
+
     for name in names {
-        let type_id = match resolve_name(&infos, name) {
-            Ok(type_id) => type_id,
-            Err(e) => {
-                // A component registered with the world that lacks reflection
-                // data should produce a targeted hint instead of a bare name error.
-                let exists = world.components().iter_registered().any(|info| {
-                    let debug_name = info.name();
-                    let short = debug_name.shortname();
-                    let short_str: &str = &short.0;
-                    let full_str: &str = &debug_name;
-                    full_str == name.as_str() || short_str == name.as_str()
-                });
-                if exists {
-                    errors.push(ComponentReflectError::ValidIDNoReflect(name.to_owned()));
+        if let Ok(type_id) = resolve_name(&infos, name) {
+            let Some(component_id) = world.components().get_id(type_id) else {
+                errors.push(ComponentReflectError::NameError(
+                    NameResolutionError::NotFound(name.to_owned()),
+                ));
+                continue;
+            };
+            let reflect_from_ptr = registry
+                .get(type_id)
+                .and_then(|registration| registration.data::<ReflectFromPtr>())
+                .cloned();
+            type_ids.push(type_id);
+            component_ids.push(component_id);
+            reflect_from_ptrs.push(reflect_from_ptr);
+            continue;
+        }
+
+        // A component registered with the world that lacks reflection data
+        // becomes a non-reflectable slot instead of a hard failure.
+        let found = world.components().iter_registered().find(|info| {
+            let debug_name = info.name();
+            let full_str: &str = &debug_name;
+            full_str == name.as_str() || debug_name.shortname().to_string() == *name
+        });
+        match found {
+            Some(info) => {
+                let Some(type_id) = info.type_id() else {
+                    errors.push(ComponentReflectError::NameError(
+                        NameResolutionError::NotFound(name.to_owned()),
+                    ));
                     continue;
-                } else {
-                    errors.push(ComponentReflectError::NameError(e));
-                    continue;
-                }
+                };
+                type_ids.push(type_id);
+                component_ids.push(info.id());
+                reflect_from_ptrs.push(None);
             }
-        };
-        type_ids.push(type_id);
+            None => {
+                errors.push(ComponentReflectError::NameError(
+                    NameResolutionError::NotFound(name.to_owned()),
+                ));
+            }
+        }
     }
+    drop(registry);
+
     if !errors.is_empty() {
         return Err(errors);
     }
@@ -652,26 +1053,17 @@ pub fn register_or_get_query_dyn(
     let query_registry = world.resource::<ReflectQueryRegistry>();
     if let Some(mirror) = query_registry.map.get(&key_type_ids) {
         return Ok(ReflectQueryHandles {
-            signal: mirror.signal.clone(),
             handle: mirror.handle.clone(),
             handle_rx: mirror.handle_tx.subscribe(),
+            type_ids: key_type_ids.clone(),
         });
     }
 
-    let registry = type_registry.read();
-    let mut component_ids = Vec::with_capacity(type_ids.len());
-    let mut reflect_from_ptrs = Vec::with_capacity(type_ids.len());
-    for type_id in &type_ids {
-        let registration = registry.get(*type_id).unwrap();
-        let reflect_from_ptr = registration.data::<ReflectFromPtr>().unwrap().clone();
-        let component_id = world.components().get_id(*type_id).unwrap();
-        component_ids.push(component_id);
-        reflect_from_ptrs.push(reflect_from_ptr);
-    }
-    drop(registry);
-
     let component_count = component_ids.len();
-    let initial: HashMap<Entity, Vec<Arc<dyn Reflect>>> = HashMap::new();
+    let initial = OwnedQuerySnapshot {
+        map: ImHashMap::new(),
+        component_count,
+    };
 
     let driver = WriterDriver::new(initial);
     let set_value_tx = driver.set_value_tx.clone();
@@ -688,19 +1080,44 @@ pub fn register_or_get_query_dyn(
         set_value_tx,
     );
 
-    let handle = reflect_query_mutation_handle(signal.clone(), component_count, names.to_vec());
+    // The read view shares the signal cell allocation.
+    let view = AtomCoerceDyn::<dyn QueryView>::new(OwnedQuerySnapshot {
+        map: ImHashMap::new(),
+        component_count,
+    });
+    view.bind_handle(signal.state.cell.coerce::<dyn QueryView>());
+
+    let write: Arc<Atom<Box<dyn QueryWriteRouter>>> =
+        Arc::new(Atom::new(Box::new(SnapshotQueryWriteRouter {
+            signal: signal.clone(),
+        })));
+
+    let handle = reflect_query_handle(
+        signal.clone(),
+        view.handle_dyn(),
+        write.clone(),
+        component_count,
+        names.to_vec(),
+    );
     let (handle_tx, handle_rx) = watch::channel(handle.clone());
+
+    let auto_elevated = world
+        .get_resource::<ReflectActiveTypedQueries>()
+        .map(|active| active.keys.contains(&key_type_ids))
+        .unwrap_or(false);
 
     let mirror = ReflectQueryMirror {
         component_ids: component_ids.clone(),
         reflect_from_ptrs: reflect_from_ptrs.clone(),
-        signal: signal.clone(),
-        active_count: 1,
-        elevated: false,
+        signal: Some(signal.clone()),
+        driver: Some(driver_arc.clone()),
+        view,
+        active_count: if auto_elevated { 0 } else { 1 },
+        elevated: auto_elevated,
         last_written_version: 0,
         last_change_tick: Tick::new(0),
         recently_written: HashSet::new(),
-        driver: driver_arc.clone(),
+        write,
         handle: handle.clone(),
         handle_tx,
     };
@@ -724,31 +1141,48 @@ pub fn register_or_get_query_dyn(
                 if mirror.elevated || mirror.active_count <= 0 {
                     return;
                 }
+                let Some(signal) = mirror.signal.clone() else {
+                    return;
+                };
                 // Skip reading while a signal edit has not yet reached bevy.
-                let version = mirror.signal.state.peek_version();
+                let version = signal.state.peek_version();
                 if version != mirror.last_written_version {
                     return;
                 }
                 let this_run = components.world().change_tick();
                 let last_run = mirror.last_change_tick;
                 mirror.last_change_tick = this_run;
+
+                let guard = signal.read();
+                let current: &OwnedQuerySnapshot = guard.as_ref();
+
+                let mut changes: Vec<(Entity, Vec<Option<Arc<dyn Reflect>>>)> = Vec::new();
+                let mut removals: Vec<Entity> = Vec::new();
+                let mut matched: HashSet<Entity> = HashSet::new();
                 let mut any_changed = false;
-                let mut out: HashMap<Entity, Vec<Arc<dyn Reflect>>> = HashMap::new();
+
                 for &archetype_id in components.matched_archetypes() {
                     let archetype = &components.world().archetypes()[archetype_id];
                     for archetype_entity in archetype.entities() {
                         let entity = archetype_entity.id();
+                        matched.insert(entity);
                         let self_written = mirror.recently_written.remove(&entity);
                         let Ok(entity_cell) = components.world().get_entity(entity) else {
                             continue;
                         };
-                        let mut values = Vec::with_capacity(mirror.component_ids.len());
+                        let mut values: Vec<Option<Arc<dyn Reflect>>> =
+                            Vec::with_capacity(mirror.component_ids.len());
                         let mut complete = true;
+                        let mut changed = false;
                         for (cid, reflect_from_ptr) in mirror
                             .component_ids
                             .iter()
                             .zip(mirror.reflect_from_ptrs.iter())
                         {
+                            let Some(reflect_from_ptr) = reflect_from_ptr else {
+                                values.push(None);
+                                continue;
+                            };
                             // SAFETY: cid was declared in init_access.
                             let Some(ptr) = (unsafe { entity_cell.get_by_id(*cid) }) else {
                                 complete = false;
@@ -760,12 +1194,12 @@ pub fn register_or_get_query_dyn(
                                 && (unsafe { entity_cell.get_change_ticks_by_id(*cid) })
                                     .is_some_and(|ticks| ticks.is_changed(last_run, this_run))
                             {
-                                any_changed = true;
+                                changed = true;
                             }
                             // SAFETY: ptr holds the type mirrored by reflect_from_ptr.
                             let value = unsafe { reflect_from_ptr.as_reflect(ptr) };
                             match clone_into_arc(value) {
-                                Ok(arc) => values.push(arc),
+                                Ok(arc) => values.push(Some(arc)),
                                 Err(err) => {
                                     error!("reflect clone failed: {}", err);
                                     complete = false;
@@ -773,13 +1207,30 @@ pub fn register_or_get_query_dyn(
                                 }
                             }
                         }
-                        if complete {
-                            out.insert(entity, values);
+                        if complete && (changed || current.map.get(&entity).is_none()) {
+                            any_changed = true;
+                            changes.push((entity, values));
                         }
                     }
                 }
+
+                // Drop entities that left the query.
+                for &entity in current.map.keys() {
+                    if !matched.contains(&entity) {
+                        removals.push(entity);
+                        any_changed = true;
+                    }
+                }
+
                 if any_changed {
-                    mirror.signal.set_value(out);
+                    signal.mutate_set(move |snapshot: &mut OwnedQuerySnapshot| {
+                        for entity in &removals {
+                            snapshot.map.remove(entity);
+                        }
+                        for (entity, values) in &changes {
+                            snapshot.map.insert(*entity, values.clone());
+                        }
+                    });
                 }
             },
         );
@@ -800,42 +1251,74 @@ pub fn register_or_get_query_dyn(
                 if mirror.elevated || mirror.active_count <= 0 {
                     return;
                 }
-                let version = mirror.signal.state.peek_version();
+                let Some(signal) = mirror.signal.clone() else {
+                    return;
+                };
+                let version = signal.state.peek_version();
                 if version == mirror.last_written_version {
                     return;
                 }
                 let mut written = Vec::new();
+                let mut gone_entities = Vec::new();
+                let mut all_written = true;
                 {
-                    let guard = mirror.signal.read();
-                    let map: &HashMap<Entity, Vec<Arc<dyn Reflect>>> = guard.as_ref();
-                    for (&entity, values) in map {
+                    let guard = signal.read();
+                    let snapshot: &OwnedQuerySnapshot = guard.as_ref();
+                    for (&entity, values) in &snapshot.map {
                         let Ok(entity_cell) = components.world().get_entity(entity) else {
+                            gone_entities.push(entity);
+                            all_written = false;
                             continue;
                         };
+                        let mut entity_written = true;
                         for ((cid, reflect_from_ptr), value) in mirror
                             .component_ids
                             .iter()
                             .zip(mirror.reflect_from_ptrs.iter())
                             .zip(values)
                         {
+                            let (Some(reflect_from_ptr), Some(value)) = (reflect_from_ptr, value)
+                            else {
+                                continue;
+                            };
                             // SAFETY: cid was declared in init_access.
                             let Ok(untyped) = (unsafe { entity_cell.get_mut_by_id(*cid) }) else {
-                                continue;
+                                gone_entities.push(entity);
+                                entity_written = false;
+                                break;
                             };
                             // SAFETY: untyped holds the type mirrored by reflect_from_ptr.
                             let mut reflect = untyped.map_unchanged(|ptr| unsafe {
                                 reflect_from_ptr.as_reflect_mut(ptr)
                             });
-                            // Marking the component changed lets the typed query
-                            // observe this write. The read system skips these
-                            // entities to avoid echoing the write back.
-                            reflect.apply(value.as_ref());
+                            if let Err(err) = reflect.try_apply(value.as_ref()) {
+                                error!("reflect apply failed: {}", err);
+                                entity_written = false;
+                                break;
+                            }
                         }
-                        written.push(entity);
+                        if entity_written {
+                            written.push(entity);
+                        } else {
+                            all_written = false;
+                        }
                     }
                 }
+
+                // Despawned or no-longer-matching entities cannot be written
+                // back. Remove them so a later flush can complete.
+                if !gone_entities.is_empty() {
+                    signal.mutate_set(move |snapshot: &mut OwnedQuerySnapshot| {
+                        for entity in &gone_entities {
+                            snapshot.map.remove(entity);
+                        }
+                    });
+                }
+
                 mirror.recently_written.extend(written);
-                mirror.last_written_version = version;
+                if all_written {
+                    mirror.last_written_version = version;
+                }
             },
         );
 
@@ -846,58 +1329,67 @@ pub fn register_or_get_query_dyn(
     );
     add_systems_through_world(world, DioxusSyncPostUpdate, write_system);
 
+    let handle_type_ids = key_type_ids.clone();
     world
         .resource_mut::<ReflectQueryRegistry>()
         .map
         .insert(key_type_ids, mirror);
 
     Ok(ReflectQueryHandles {
-        signal,
         handle,
         handle_rx,
+        type_ids: handle_type_ids,
     })
 }
 
-/// Composes the typed query snapshot into the reflect snapshot when elevated.
-pub fn bridge_typed_query<Q: ReflectMirrorQueryData + 'static, F: QueryFilter + 'static>(
-    typed: Res<MirrorQuerySignal<Q, F>>,
-    mut erased: ResMut<ReflectQueryRegistry>,
-) {
-    let Some(mirror) = erased.map.get_mut(&query_type_ids::<Q>()) else {
-        return;
-    };
-    if !mirror.elevated {
-        return;
-    }
-    let guard = typed.signal().read();
-    let mut out: HashMap<Entity, Vec<Arc<dyn Reflect>>> = HashMap::new();
-    for handles in guard.as_ref() {
-        let mut values = Vec::with_capacity(Q::component_count());
-        for idx in 0..Q::component_count() {
-            if let Some(value) = Q::read_component(handles, idx) {
-                values.push(value);
-            }
-        }
-        out.insert(Q::handles_entity(handles), values);
-    }
-    mirror.signal.set_value(out);
-}
-
 /// Hook called from the typed query request after the typed mirror exists.
-/// Replaces the erased mirror handle with the typed handle and notifies dioxus.
-pub fn notify_typed_query_mirror<Q: ReflectMirrorQueryData + 'static, F: QueryFilter + 'static>(
+/// Binds the erased mirror view to the typed query cell and notifies dioxus.
+pub fn notify_typed_query_mirror<
+    Q: MirrorQueryData + Send + Sync + 'static,
+    F: QueryFilter + 'static,
+>(
     world: &mut World,
 ) {
+    register_typed_query_spawner_runtime::<Q, F>(world);
+
     let type_ids = query_type_ids::<Q>();
 
     let Some(typed) = world.get_resource::<MirrorQuerySignal<Q, F>>() else {
         return;
     };
-    let names = Q::type_ids()
+    let typed_signal = typed.signal_cloned();
+    let names = Q::component_type_ids()
         .into_iter()
         .map(|type_id| type_short_path(world, type_id))
         .collect();
-    let handle = typed_query_mutation_handle::<Q, F>(typed.signal_cloned(), names);
+
+    {
+        let registry = world.resource::<ReflectQueryRegistry>();
+        let Some(mirror) = registry.map.get(&type_ids) else {
+            return;
+        };
+        let typed_cell = &typed_signal.state.cell;
+        // Rebind the erased view so every existing read handle reveals the
+        // typed query cell instead of the owned snapshot.
+        let view: &AtomCoerceHandle<MirrorQuery<Q, F>, dyn QueryView> = typed_cell.coerce();
+        mirror.view.bind_handle(view);
+    }
+
+    let (view, write) = {
+        let registry = world.resource::<ReflectQueryRegistry>();
+        let Some(mirror) = registry.map.get(&type_ids) else {
+            return;
+        };
+        (mirror.view.handle_dyn(), mirror.write.clone())
+    };
+
+    // Route component writes through the typed signal so handles created
+    // before elevation continue to work.
+    write.store(Box::new(TypedQueryWriteRouter::<Q, F> {
+        typed: typed_signal.clone(),
+    }));
+
+    let handle = typed_query_handle::<Q, F>(view, write, typed_signal.clone(), names);
 
     let mut registry = world.resource_mut::<ReflectQueryRegistry>();
     let Some(mirror) = registry.map.get_mut(&type_ids) else {
@@ -905,19 +1397,22 @@ pub fn notify_typed_query_mirror<Q: ReflectMirrorQueryData + 'static, F: QueryFi
     };
     mirror.elevated = true;
     mirror.active_count = 0;
+    mirror.signal.take();
+    mirror.driver.take();
     mirror.handle = handle.clone();
     let _ = mirror.handle_tx.send_replace(handle);
-
-    add_systems_through_world(world, DioxusSyncUpdate, bridge_typed_query::<Q, F>);
 }
 
 /// Command adopting a reflect query mirror into a concrete typed query.
-pub struct AdoptTypedQuery<Q: ReflectMirrorQueryData + 'static, F: QueryFilter + 'static> {
+pub struct AdoptTypedQuery<
+    Q: MirrorQueryData + Send + Sync + 'static,
+    F: QueryFilter + 'static,
+> {
     /// Marker for the typed query data and filter.
     pub _marker: std::marker::PhantomData<fn() -> (Q, F)>,
 }
 
-impl<Q: ReflectMirrorQueryData + 'static, F: QueryFilter + 'static> Command
+impl<Q: MirrorQueryData + Send + Sync + 'static, F: QueryFilter + 'static> Command
     for AdoptTypedQuery<Q, F>
 {
     type Out = ();
@@ -928,7 +1423,10 @@ impl<Q: ReflectMirrorQueryData + 'static, F: QueryFilter + 'static> Command
 }
 
 /// Adopt a reflect query mirror into a concrete typed query.
-pub fn adopt_typed_query<Q: ReflectMirrorQueryData + 'static, F: QueryFilter + 'static>(
+pub fn adopt_typed_query<
+    Q: MirrorQueryData + Send + Sync + 'static,
+    F: QueryFilter + 'static,
+>(
     ctx: &CommandQueueSender,
 ) {
     let mut queue = CommandQueue::default();
@@ -938,21 +1436,55 @@ pub fn adopt_typed_query<Q: ReflectMirrorQueryData + 'static, F: QueryFilter + '
     let _ = ctx.tx.send(queue);
 }
 
+/// Zero-copy read view over a reflect query snapshot.
+pub struct ReflectQueryViewGuard {
+    view: TrackedReadGuardDyn<dyn QueryView>,
+}
+
+impl ReflectQueryViewGuard {
+    /// Number of components per query item.
+    pub fn component_count(&self) -> usize {
+        self.view.as_ref().component_count()
+    }
+
+    /// Entity ids in this query.
+    pub fn entities(&self) -> Vec<Entity> {
+        self.view.as_ref().entities()
+    }
+
+    /// Read one component as a zero-copy reflect guard.
+    pub fn read_component(
+        &self,
+        entity: Entity,
+        idx: usize,
+    ) -> Option<Result<ReflectReadGuard, ComponentReflectError>> {
+        self.view.as_ref().read_component(entity, idx)
+    }
+}
+
 /// Dioxus handle for a reflect query mirror.
 #[derive(Clone, Copy)]
 pub struct ReflectQuerySignal {
-    value: Signal<Result<HashMap<Entity, Vec<Arc<dyn Reflect>>>, ReflectQueryNoneState>>,
+    version: Signal<u64>,
     health: Signal<HealthStatus>,
-    handle: Signal<Option<QueryMutationHandle>>,
+    handle: Signal<Option<QuerySignalHandle>>,
+    error: Signal<Option<ReflectQueryNoneState>>,
 }
 
 impl ReflectQuerySignal {
-    /// Read the current query snapshot.
-    pub fn read(
-        &self,
-    ) -> SignalReadGuard<'_, Result<HashMap<Entity, Vec<Arc<dyn Reflect>>>, ReflectQueryNoneState>>
-    {
-        SignalReadGuard::new(self.value.read())
+    /// Read the current query snapshot as a zero-copy view.
+    pub fn read(&self) -> Result<ReflectQueryViewGuard, ReflectQueryNoneState> {
+        let _ = self.version.read();
+        if let Some(err) = self.error.read().clone() {
+            return Err(err);
+        }
+        let handle = self.handle.read();
+        match handle.as_ref() {
+            Some(h) => Ok(ReflectQueryViewGuard {
+                view: h.read_view(),
+            }),
+            None => Err(ReflectQueryNoneState::NotInitialized),
+        }
     }
 
     /// Current health status of the underlying signal.
@@ -971,21 +1503,20 @@ impl ReflectQuerySignal {
 
     /// Iterate over entities with named per-component mutation handles.
     pub fn iter(&self) -> Vec<(Entity, Vec<(String, ReflectComponentHandle)>)> {
-        let Some(handle) = self.handle.read().clone() else {
-            return Vec::new();
+        let _ = self.version.read();
+        let handle = match self.handle.read().as_ref() {
+            Some(h) => h.clone(),
+            None => return Vec::new(),
         };
         let count = handle.component_count();
         let names = handle.component_names().to_vec();
-        let guard = self.value.read();
-        let Ok(map) = &*guard else {
-            return Vec::new();
-        };
-        let mut entities: Vec<Entity> = map.keys().copied().collect();
+        let view = handle.read_view();
+        let mut entities = view.as_ref().entities();
         entities.sort_unstable();
         entities
             .into_iter()
             .map(|entity| {
-                let handles = (0..count)
+                let component_handles = (0..count)
                     .map(|idx| {
                         let name = names
                             .get(idx)
@@ -994,7 +1525,7 @@ impl ReflectQuerySignal {
                         (name, handle.component_handle(entity, idx))
                     })
                     .collect();
-                (entity, handles)
+                (entity, component_handles)
             })
             .collect()
     }
@@ -1005,11 +1536,11 @@ pub fn use_bevy_query_dyn<const N: usize>(names: [&str; N]) -> ReflectQuerySigna
     let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
     let ctx = use_context::<CommandQueueSender>();
 
-    let mut value_signal: Signal<
-        Result<HashMap<Entity, Vec<Arc<dyn Reflect>>>, ReflectQueryNoneState>,
-    > = use_signal(|| Err(ReflectQueryNoneState::NotInitialized));
+    let version_signal = use_signal(|| 0u64);
     let health_signal = use_signal(|| HealthStatus::Healthy);
-    let mut handle_signal: Signal<Option<QueryMutationHandle>> = use_signal(|| None);
+    let mut handle_signal: Signal<Option<QuerySignalHandle>> = use_signal(|| None);
+    let mut error_signal: Signal<Option<ReflectQueryNoneState>> = use_signal(|| None);
+    let mut spawner_signal: Signal<Option<TypedQuerySpawner>> = use_signal(|| None);
 
     let ctx_clone = ctx.clone();
     use_future(move || {
@@ -1034,36 +1565,62 @@ pub fn use_bevy_query_dyn<const N: usize>(names: [&str; N]) -> ReflectQuerySigna
                         .map(ToString::to_string)
                         .collect::<Vec<_>>()
                         .join("; ");
-                    value_signal.set(Err(ReflectQueryNoneState::NameError(message)));
+                    error_signal.set(Some(ReflectQueryNoneState::NameError(message)));
                     return;
                 }
                 Err(e) => {
-                    value_signal.set(Err(ReflectQueryNoneState::NameError(e)));
+                    error_signal.set(Some(ReflectQueryNoneState::NameError(e)));
                     return;
                 }
             };
 
-            // Forward the snapshot and seed the initial value.
-            let current = handles.signal.read().as_ref().clone();
-            value_signal.set(Ok(current));
-            handles
-                .signal
-                .state
-                .forward_value_to(value_signal, health_signal, |arc| Ok((*arc).clone()));
+            // Spin up and share the typed query when a spawner is registered.
+            let spawner = ctx
+                .send_command_async(|tx| {
+                    let mut q = CommandQueue::default();
+                    q.push(GetTypedQuerySpawner {
+                        key: handles.type_ids.clone(),
+                        response_tx: tx,
+                    });
+                    q
+                })
+                .await
+                .ok()
+                .flatten();
+            if let Some(spawner) = spawner {
+                if let Err(err) = spawner.spawn(ctx.clone()).await {
+                    warn!("typed query spawn failed: {}", err);
+                } else {
+                    spawner_signal.set(Some(spawner.clone()));
+                }
+            }
 
+            // Bind the initial handle and start forwarding version updates.
             handle_signal.set(Some(handles.handle.clone()));
+            let mut task = handles.handle.forward_to(version_signal, health_signal);
 
             // Re-bind mutation routing whenever the handle is replaced.
             let mut rx = handles.handle_rx;
             while rx.changed().await.is_ok() {
-                handle_signal.set(Some(rx.borrow().clone()));
+                let handle = rx.borrow().clone();
+                task.cancel();
+                handle_signal.set(Some(handle.clone()));
+                task = handle.forward_to(version_signal, health_signal);
             }
         }
     });
 
+    let ctx_drop = ctx.clone();
+    use_drop(move || {
+        if let Some(spawner) = spawner_signal.read().as_ref() {
+            spawner.despawn(&ctx_drop);
+        }
+    });
+
     ReflectQuerySignal {
-        value: value_signal,
+        version: version_signal,
         health: health_signal,
         handle: handle_signal,
+        error: error_signal,
     }
 }

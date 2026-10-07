@@ -138,23 +138,23 @@ fn sync_resource<T: ResourceDioxusSync>(
         // Bevy wins authoritative ops; only relative adds compose.
         set_values.clear();
         sets.clear();
-        for f in adds {
-            f(&mut *resource);
+        for op in adds {
+            op.apply(&mut *resource);
         }
         // Publish bevy's value to the cell.
         guard.publish_value(resource.clone());
-    } 
+    }
     
     else {
         // Apply the oplog to the bevy resource, the write buffer.
         for op in &set_values {
             *resource = (*op.0).clone();
         }
-        for f in &sets {
-            f(&mut *resource);
+        for op in &sets {
+            op.apply(&mut *resource);
         }
-        for f in &adds {
-            f(&mut *resource);
+        for op in &adds {
+            op.apply(&mut *resource);
         }
 
         // Publish the bevy resource as the new snapshot.

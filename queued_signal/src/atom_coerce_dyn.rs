@@ -10,9 +10,8 @@ use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 use std::sync::atomic::fence;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc as StdArc;
 
-use bevy_ptr::Ptr;
-use bevy_reflect::{Reflect, ReflectFromPtr};
 use kovan::{pin, Atom, Guard};
 
 use crate::atom_coerce::{Arc, ArcData, AtomCoerce, AtomCoerceHandle, CoerceShared, Value};
@@ -35,9 +34,20 @@ impl<T: Send + Sync + 'static> Erase<dyn Any> for T {
     }
 }
 
-impl<T: Reflect + Send + Sync + 'static> Erase<dyn Reflect> for T {
-    fn erase(ptr: *const ()) -> *const dyn Reflect {
-        let this: *const T = ptr.cast();
+/// Mutable counterpart to [`Erase`].
+///
+/// Implement this alongside [`Erase`] for trait objects that support mutable
+/// access through the erased view.
+pub trait EraseMut<D: ?Sized>: Erase<D> {
+    /// Unsizes a mutable pointer to this type into the erased view.
+    ///
+    /// The pointer must be the address of a live `Self` value.
+    fn erase_mut(ptr: *mut ()) -> *mut D;
+}
+
+impl<T: Send + Sync + 'static> EraseMut<dyn Any> for T {
+    fn erase_mut(ptr: *mut ()) -> *mut dyn Any {
+        let this: *mut T = ptr.cast();
         this
     }
 }
@@ -115,14 +125,14 @@ impl AtomCoerceDynGuard<'_, dyn Any> {
 
 /// A guard from a rebindable slot that dereferences to an erased view and
 /// keeps the bound shared allocation alive.
-pub struct AtomCoerceDynSlotGuard<'a, D: ?Sized + 'static> {
+pub struct AtomCoerceDynSlotGuard<D: ?Sized + 'static> {
     _guard: Guard,
     ptr: *const D,
     _shared: ErasedShared<D>,
-    marker: PhantomData<&'a D>,
+    marker: PhantomData<fn() -> D>,
 }
 
-impl<D: ?Sized + 'static> AtomCoerceDynSlotGuard<'_, D> {
+impl<D: ?Sized + 'static> AtomCoerceDynSlotGuard<D> {
     /// The erased view of the value this guard captured.
     pub fn as_dyn(&self) -> &D {
         // SAFETY: the guard keeps the shared allocation alive and the epoch guard keeps the node alive.
@@ -130,7 +140,7 @@ impl<D: ?Sized + 'static> AtomCoerceDynSlotGuard<'_, D> {
     }
 }
 
-impl AtomCoerceDynSlotGuard<'_, dyn Any> {
+impl AtomCoerceDynSlotGuard<dyn Any> {
     /// The erased Any view of the value this guard captured.
     pub fn as_any(&self) -> &dyn Any {
         self.as_dyn()
@@ -142,8 +152,11 @@ impl AtomCoerceDynSlotGuard<'_, dyn Any> {
     }
 }
 
+/// Marker for erased views that carry no extra runtime data.
+struct NoContext;
+
 /// A type-erased counted reference to a CoerceShared allocation.
-struct ErasedShared<D: ?Sized + 'static> {
+pub struct ErasedShared<D: ?Sized + 'static> {
     /// Points at the CoerceShared value, past the ArcData header.
     data: NonNull<()>,
     /// Strong count in the ArcData header, which sits at offset zero.
@@ -157,12 +170,49 @@ struct ErasedShared<D: ?Sized + 'static> {
         &ErasedShared<D>,
         Box<dyn Any + Send + Sync>,
     ) -> Result<(), Box<dyn Any + Send + Sync>>,
-    /// Runtime reflect conversion, present only for a reflect-bound view.
-    reflect_from_ptr: Option<ReflectFromPtr>,
+    /// Runtime data used by the load and store functions.
+    context: StdArc<dyn Any + Send + Sync>,
     marker: PhantomData<fn() -> D>,
 }
 
 impl<D: ?Sized + 'static> ErasedShared<D> {
+    /// Assembles an erased shared reference from raw parts.
+    ///
+    /// The caller must already own one strong count for the allocation, which
+    /// this reference adopts. The function pointers must match the allocation
+    /// and the runtime context.
+    pub fn from_raw_parts(
+        data: NonNull<()>,
+        strong: NonNull<AtomicUsize>,
+        drop_alloc: unsafe fn(NonNull<()>),
+        load: unsafe fn(&ErasedShared<D>) -> (*const D, Guard),
+        try_store: unsafe fn(
+            &ErasedShared<D>,
+            Box<dyn Any + Send + Sync>,
+        ) -> Result<(), Box<dyn Any + Send + Sync>>,
+        context: StdArc<dyn Any + Send + Sync>,
+    ) -> ErasedShared<D> {
+        ErasedShared {
+            data,
+            strong,
+            drop_alloc,
+            load,
+            try_store,
+            context,
+            marker: PhantomData,
+        }
+    }
+
+    /// Raw pointer to the CoerceShared value.
+    pub fn data(&self) -> NonNull<()> {
+        self.data
+    }
+
+    /// Runtime data shared by the load and store functions.
+    pub fn context(&self) -> &(dyn Any + Send + Sync) {
+        &*self.context
+    }
+
     /// Erases a typed shared reference without changing the count.
     fn from_arc<T>(typed: &Arc<CoerceShared<T, D>>) -> ErasedShared<D>
     where
@@ -170,14 +220,14 @@ impl<D: ?Sized + 'static> ErasedShared<D> {
     {
         let data = (&**typed as *const CoerceShared<T, D>) as *mut ();
         // SAFETY: the ArcData header is repr(C) with strong at offset zero.
-        let strong = unsafe { NonNull::new_unchecked(typed.ptr.as_ptr() as *mut AtomicUsize) };
+        let strong = unsafe { NonNull::new_unchecked(typed.as_ptr() as *mut AtomicUsize) };
         ErasedShared {
             data: NonNull::new(data).expect("Arc pointer is non-null"),
             strong,
             drop_alloc: drop_coerce_shared_alloc::<T, D>,
             load: load_erased::<T, D>,
             try_store: try_store_erased::<T, D>,
-            reflect_from_ptr: None,
+            context: StdArc::new(NoContext),
             marker: PhantomData,
         }
     }
@@ -194,31 +244,6 @@ impl<D: ?Sized + 'static> ErasedShared<D> {
     }
 }
 
-impl ErasedShared<dyn Reflect> {
-    /// Binds a typed cell's value as a runtime reflect view.
-    fn reflect_bound<T: Send + Sync + 'static>(
-        typed: &Arc<CoerceShared<T, dyn Any>>,
-        reflect_from_ptr: ReflectFromPtr,
-    ) -> ErasedShared<dyn Reflect> {
-        let data = (&**typed as *const CoerceShared<T, dyn Any>) as *mut ();
-        // SAFETY: the ArcData header is repr(C) with strong at offset zero.
-        let strong = unsafe { NonNull::new_unchecked(typed.ptr.as_ptr() as *mut AtomicUsize) };
-        // Bump the shared strong count so this reference owns the allocation.
-        unsafe {
-            strong.as_ref().fetch_add(1, Ordering::Relaxed);
-        }
-        ErasedShared {
-            data: NonNull::new(data).expect("Arc pointer is non-null"),
-            strong,
-            drop_alloc: drop_reflect_alloc::<T>,
-            load: load_reflect_bound::<T>,
-            try_store: try_store_reflect,
-            reflect_from_ptr: Some(reflect_from_ptr),
-            marker: PhantomData,
-        }
-    }
-}
-
 impl<D: ?Sized + 'static> Clone for ErasedShared<D> {
     fn clone(&self) -> Self {
         // SAFETY: strong points at a live AtomicUsize for the allocation.
@@ -232,7 +257,7 @@ impl<D: ?Sized + 'static> Clone for ErasedShared<D> {
             drop_alloc: self.drop_alloc,
             load: self.load,
             try_store: self.try_store,
-            reflect_from_ptr: self.reflect_from_ptr.clone(),
+            context: self.context.clone(),
             marker: PhantomData,
         }
     }
@@ -262,19 +287,6 @@ where
     D: ?Sized + 'static,
 {
     let ptr = header.as_ptr() as *mut ArcData<CoerceShared<T, D>>;
-    // SAFETY: the caller owns the final strong count, so no aliases remain.
-    unsafe {
-        ManuallyDrop::drop(&mut *(*ptr).data.get());
-    }
-    // SAFETY: ptr is the exact allocation produced by Arc::new.
-    unsafe {
-        drop(Box::from_raw(ptr));
-    }
-}
-
-/// Drops a reflect-bound CoerceShared and frees its ArcData allocation.
-unsafe fn drop_reflect_alloc<T: Send + Sync + 'static>(header: NonNull<()>) {
-    let ptr = header.as_ptr() as *mut ArcData<CoerceShared<T, dyn Any>>;
     // SAFETY: the caller owns the final strong count, so no aliases remain.
     unsafe {
         ManuallyDrop::drop(&mut *(*ptr).data.get());
@@ -323,35 +335,6 @@ where
     }
 }
 
-/// Loads a typed cell's value as a runtime reflect view.
-unsafe fn load_reflect_bound<T: Send + Sync + 'static>(
-    shared: &ErasedShared<dyn Reflect>,
-) -> (*const dyn Reflect, Guard) {
-    // SAFETY: data points at the live CoerceShared for the bound typed cell.
-    let typed = unsafe { &*(shared.data.as_ptr() as *const CoerceShared<T, dyn Any>) };
-    let epoch = pin();
-    let atom_guard = typed.atom.load();
-    let value: &Value<T, dyn Any> = &*atom_guard;
-    let raw = (&value.value as *const T).cast::<u8>() as *mut u8;
-    // SAFETY: raw points at the live T value and the pointer mirrors T.
-    let ptr = unsafe { Ptr::new(NonNull::new_unchecked(raw)) };
-    let reflect = shared
-        .reflect_from_ptr
-        .as_ref()
-        .expect("reflect bind missing ReflectFromPtr");
-    // SAFETY: ptr holds the type mirrored by reflect_from_ptr.
-    let reflect = unsafe { reflect.as_reflect(ptr) };
-    (reflect as *const dyn Reflect, epoch)
-}
-
-/// Rejects writes through a reflect-bound view, which shares the typed cell.
-unsafe fn try_store_reflect<D: ?Sized + 'static>(
-    _shared: &ErasedShared<D>,
-    value: Box<dyn Any + Send + Sync>,
-) -> Result<(), Box<dyn Any + Send + Sync>> {
-    Err(value)
-}
-
 impl<T: Send + Sync + 'static + Erase<D>, D: ?Sized + 'static> AtomCoerce<T, D> {
     /// The erased view of the current value.
     pub fn untyped(&self) -> AtomCoerceDynGuard<'_, D> {
@@ -390,12 +373,12 @@ impl<T: Send + Sync + 'static + Erase<D>, D: ?Sized + 'static> AtomCoerceHandle<
 
 /// A rebindable erased handle that reads the currently bound value.
 pub struct AtomCoerceDynHandle<D: ?Sized + 'static> {
-    slot: Arc<Atom<ErasedShared<D>>>,
+    slot: StdArc<Atom<ErasedShared<D>>>,
 }
 
 impl<D: ?Sized + 'static> AtomCoerceDynHandle<D> {
     /// The erased view of the currently bound value.
-    pub fn get(&self) -> AtomCoerceDynSlotGuard<'_, D> {
+    pub fn get(&self) -> AtomCoerceDynSlotGuard<D> {
         let slot_guard = self.slot.load();
         let shared: &ErasedShared<D> = &*slot_guard;
         // SAFETY: data points at the live CoerceShared and the load function matches.
@@ -432,10 +415,27 @@ impl<D: ?Sized + 'static> Clone for AtomCoerceDynHandle<D> {
 
 /// An erased holder that gives rebindable untyped handles.
 pub struct AtomCoerceDyn<D: ?Sized + 'static> {
-    slot: Arc<Atom<ErasedShared<D>>>,
+    slot: StdArc<Atom<ErasedShared<D>>>,
 }
 
 impl<D: ?Sized + 'static> AtomCoerceDyn<D> {
+    /// Creates a holder from a custom erased shared reference.
+    pub fn from_shared(shared: ErasedShared<D>) -> AtomCoerceDyn<D> {
+        AtomCoerceDyn {
+            slot: StdArc::new(Atom::new(shared)),
+        }
+    }
+
+    /// Creates a holder already bound to a typed handle.
+    pub fn bound<T>(typed: &AtomCoerceHandle<T, D>) -> AtomCoerceDyn<D>
+    where
+        T: Send + Sync + 'static + Erase<D>,
+    {
+        AtomCoerceDyn {
+            slot: StdArc::new(Atom::new(typed.shared_erased())),
+        }
+    }
+
     /// Creates a holder owning its own value.
     pub fn new<T>(value: T) -> AtomCoerceDyn<D>
     where
@@ -451,7 +451,7 @@ impl<D: ?Sized + 'static> AtomCoerceDyn<D> {
         // Transfer the single strong count to the erased view.
         std::mem::forget(shared);
         AtomCoerceDyn {
-            slot: Arc::new(Atom::new(erased)),
+            slot: StdArc::new(Atom::new(erased)),
         }
     }
 
@@ -471,6 +471,11 @@ impl<D: ?Sized + 'static> AtomCoerceDyn<D> {
         self.slot.store(typed.shared_erased());
     }
 
+    /// Replaces the bound source with a custom erased shared reference.
+    pub fn bind_shared(&self, shared: ErasedShared<D>) {
+        self.slot.store(shared);
+    }
+
     /// A rebindable erased handle.
     pub fn handle_dyn(&self) -> AtomCoerceDynHandle<D> {
         AtomCoerceDynHandle {
@@ -479,7 +484,7 @@ impl<D: ?Sized + 'static> AtomCoerceDyn<D> {
     }
 
     /// The erased view of the currently bound value.
-    pub fn get(&self) -> AtomCoerceDynSlotGuard<'_, D> {
+    pub fn get(&self) -> AtomCoerceDynSlotGuard<D> {
         let slot_guard = self.slot.load();
         let shared: &ErasedShared<D> = &*slot_guard;
         // SAFETY: data points at the live CoerceShared and the load function matches.
@@ -506,21 +511,6 @@ impl<D: ?Sized + 'static> AtomCoerceDyn<D> {
     }
 }
 
-impl AtomCoerceDyn<dyn Reflect> {
-    /// Binds the holder to a typed cell, viewing its value as a reflected value.
-    ///
-    /// The reflect pointer converts the typed cell's value in place, so the
-    /// erased view shares the typed cell's single allocation.
-    pub fn bind_reflect<T: Send + Sync + 'static>(
-        &self,
-        typed: &AtomCoerceHandle<T, dyn Any>,
-        reflect_from_ptr: ReflectFromPtr,
-    ) {
-        self.slot
-            .store(ErasedShared::reflect_bound(&typed.shared, reflect_from_ptr));
-    }
-}
-
 impl<D: ?Sized + 'static> Clone for AtomCoerceDyn<D> {
     fn clone(&self) -> Self {
         AtomCoerceDyn {
@@ -528,7 +518,6 @@ impl<D: ?Sized + 'static> Clone for AtomCoerceDyn<D> {
         }
     }
 }
-
 
 /// A registry mapping type names to typed identifiers.
 pub struct TypeRegistry {
@@ -599,25 +588,6 @@ fn test_atom_coerce() {
     assert_eq!(*coerce.load(), 200);
 
     drop(handle);
-}
-
-#[test]
-fn test_erase_reflect_view() {
-    let typed = AtomCoerce::<u64, dyn Reflect>::new(42u64);
-    assert_eq!(*typed.load(), 42);
-
-    let arc: std::sync::Arc<dyn Reflect> = std::sync::Arc::new(7u64);
-    let holder = AtomCoerceDyn::<dyn Reflect>::new(arc);
-    let view = holder.get();
-    let erased = view
-        .as_dyn()
-        .downcast_ref::<std::sync::Arc<dyn Reflect>>()
-        .unwrap();
-    assert_eq!(erased.as_ref().downcast_ref::<u64>().unwrap(), &7u64);
-
-    holder.bind(&typed);
-    let rebound = holder.get();
-    assert_eq!(rebound.as_dyn().downcast_ref::<u64>().unwrap(), &42u64);
 }
 
 #[test]
@@ -744,7 +714,7 @@ fn test_atom_coerce_dyn_handle() {
 fn test_atom_coerce_dyn_concurrent_rebind() {
     let holder = AtomCoerceDyn::<dyn Any>::new(Counter(0));
 
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = StdArc::new(std::sync::atomic::AtomicBool::new(false));
     let reader_stop = stop.clone();
     let reader_holder = holder.clone();
     let reader = std::thread::spawn(move || {

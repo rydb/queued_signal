@@ -25,6 +25,47 @@ macro_rules! impl_mirror_query_data {
                 world
                     .commands()
                     .queue(RequestComponentsMirror::<$T>::default());
+                #[cfg(feature = "reflect")]
+                crate::reflect::query::register_typed_query_active(
+                    world,
+                    vec![TypeId::of::<$T>()],
+                );
+            }
+
+            fn component_type_ids() -> Vec<TypeId> {
+                vec![TypeId::of::<$T>()]
+            }
+
+            fn handles_entity(handles: &Self::MirrorItemHandles) -> Entity {
+                handles.0
+            }
+
+            fn read_component_erased(
+                handles: &Self::MirrorItemHandles,
+                idx: usize,
+            ) -> Option<ErasedTypedReadGuard> {
+                if idx == 0 {
+                    let guard = handles.1.read();
+                    let ptr = NonNull::from(&*guard).cast::<u8>();
+                    Some(ErasedTypedReadGuard {
+                        owner: Box::new(guard),
+                        ptr,
+                    })
+                } else {
+                    None
+                }
+            }
+
+            fn with_component_mut(
+                handles: &Self::MirrorItemHandles,
+                idx: usize,
+                f: Box<dyn Fn(NonNull<u8>) + Send + Sync>,
+            ) {
+                if idx == 0 {
+                    handles
+                        .1
+                        .mutate(move |a: &mut $T| f(NonNull::from(&mut *a).cast::<u8>()));
+                }
             }
 
             fn get_mirror_entity<'w, 's>(
@@ -140,6 +181,44 @@ macro_rules! impl_mirror_query_data {
                 $(
                     world.commands().queue(RequestComponentsMirror::<$rest>::default());
                 )*
+                #[cfg(feature = "reflect")]
+                crate::reflect::query::register_typed_query_active(
+                    world,
+                    vec![
+                        TypeId::of::<$first>(),
+                        TypeId::of::<$second>(),
+                        TypeId::of::<$third>()
+                        $(, TypeId::of::<$rest>())*
+                    ],
+                );
+            }
+
+            fn component_type_ids() -> Vec<TypeId> {
+                vec![
+                    TypeId::of::<$first>(),
+                    TypeId::of::<$second>(),
+                    TypeId::of::<$third>()
+                    $(, TypeId::of::<$rest>())*
+                ]
+            }
+
+            fn handles_entity(handles: &Self::MirrorItemHandles) -> Entity {
+                handles.0
+            }
+
+            fn read_component_erased(
+                _handles: &Self::MirrorItemHandles,
+                _idx: usize,
+            ) -> Option<ErasedTypedReadGuard> {
+                None
+            }
+
+            fn with_component_mut(
+                _handles: &Self::MirrorItemHandles,
+                _idx: usize,
+                f: Box<dyn Fn(NonNull<u8>) + Send + Sync>,
+            ) {
+                drop(f);
             }
 
             fn get_mirror_entity<'w, 's>(

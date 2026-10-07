@@ -99,10 +99,8 @@ pub fn UntypedQuery() -> Element {
 
     let fields = use_memo(move || {
         let mut fields = vec![];
-        let snapshot = query.read();
-
-        let map = match &*snapshot {
-            Ok(map) => map,
+        let view = match query.read() {
+            Ok(view) => view,
             Err(err) => {
                 error!("{:#?}", err);
                 return vec![];
@@ -110,16 +108,17 @@ pub fn UntypedQuery() -> Element {
         };
 
         for (item_idx, (entity, handles)) in query.iter().into_iter().enumerate() {
-            let values = map.get(&entity).cloned().unwrap_or_default();
             let mut rows = vec![];
             for (idx, (name, handle)) in handles.iter().enumerate() {
-                let value = match values.get(idx) {
-                    Some(arc) => Ok(arc),
-                    None => Err(format!(
-                        "component {idx} value is missing for entity {entity:?}"
-                    )),
-                };
-                rows.extend(render_from(handle, name, value));
+                match view.read_component(entity, idx) {
+                    Some(Ok(guard)) => rows.extend(render_from(handle, name, guard.as_reflect())),
+                    Some(Err(err)) => rows.push(rsx! {
+                        div { "{name}: {err}" }
+                    }),
+                    None => rows.push(rsx! {
+                        div { "component {idx} value is missing for entity {entity:?}" }
+                    }),
+                }
             }
             fields.push(rsx! {
                 div {
@@ -141,17 +140,8 @@ pub fn UntypedQuery() -> Element {
     }
 }
 
-fn render_from(
-    handle: &ReflectComponentHandle,
-    name: &str,
-    value: std::result::Result<&Arc<dyn Reflect>, String>,
-) -> Vec<Element> {
-    let arc = match value {
-        Ok(arc) => arc,
-        Err(err) => return vec![rsx! { div { "{name}: {err}" } }],
-    };
-
-    let leaves = collect_primitive_leaves(arc.as_ref());
+fn render_from(handle: &ReflectComponentHandle, name: &str, value: &dyn Reflect) -> Vec<Element> {
+    let leaves = collect_primitive_leaves(value);
     if leaves.is_empty() {
         return vec![rsx! { div { "{name}: no editable fields" } }];
     }

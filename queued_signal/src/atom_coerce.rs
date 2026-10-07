@@ -15,7 +15,7 @@ use crate::atom_coerce_dyn::Erase;
 
 /// Shared allocation header holding one strong count and the data.
 #[repr(C)]
-pub(crate) struct ArcData<T> {
+pub struct ArcData<T> {
     pub(crate) strong: AtomicUsize,
     pub(crate) data: UnsafeCell<ManuallyDrop<T>>,
 }
@@ -26,6 +26,11 @@ pub struct Arc<T> {
 }
 
 impl<T> Arc<T> {
+    /// Raw pointer to the shared allocation header.
+    pub fn as_ptr(&self) -> *mut ArcData<T> {
+        self.ptr.as_ptr()
+    }
+
     pub(crate) fn data(&self) -> &ArcData<T> {
         // SAFETY: the allocation stays live while this Arc exists.
         unsafe { self.ptr.as_ref() }
@@ -91,9 +96,36 @@ pub struct Value<T: Send + Sync + 'static, D: ?Sized + 'static> {
     pub(crate) marker: PhantomData<fn() -> D>,
 }
 
+impl<T: Send + Sync + 'static, D: ?Sized + 'static> Value<T, D> {
+    /// Wraps a value with the target view marker.
+    pub fn new(value: T) -> Self {
+        Self {
+            value,
+            marker: PhantomData,
+        }
+    }
+
+    /// Shared access to the stored value.
+    pub fn value(&self) -> &T {
+        &self.value
+    }
+}
+
 /// One shared state, the atom whose node holds the value inline.
-pub(crate) struct CoerceShared<T: Send + Sync + 'static, D: ?Sized + 'static> {
+pub struct CoerceShared<T: Send + Sync + 'static, D: ?Sized + 'static> {
     pub(crate) atom: Atom<Value<T, D>>,
+}
+
+impl<T: Send + Sync + 'static, D: ?Sized + 'static> CoerceShared<T, D> {
+    /// Wraps an atom holding the current value node.
+    pub fn new(atom: Atom<Value<T, D>>) -> Self {
+        Self { atom }
+    }
+
+    /// The atom holding the current value node.
+    pub fn atom(&self) -> &Atom<Value<T, D>> {
+        &self.atom
+    }
 }
 
 /// A typed guard that dereferences to the value.
@@ -113,7 +145,7 @@ impl<T: Send + Sync + 'static, D: ?Sized + 'static> Deref for ValueGuard<'_, T, 
 ///
 /// The guard pins the epoch and holds a clone of the shared allocation, so
 /// the node it points at stays valid until the guard drops.
-pub struct RcuGuard<T: Send + Sync + 'static, D: ?Sized + 'static = dyn Any> {
+pub struct RcuGuard<T: Send + Sync + 'static, D: ?Sized + 'static> {
     _epoch: Guard,
     ptr: *const Value<T, D>,
     _shared: Arc<CoerceShared<T, D>>,
@@ -143,15 +175,124 @@ impl<T: Send + Sync + 'static, D: ?Sized + 'static> Deref for RcuGuard<T, D> {
     }
 }
 
+/// Drops the CoerceShared and frees its ArcData allocation.
+pub unsafe fn drop_coerce_shared_alloc<T, D>(header: NonNull<()>)
+where
+    T: Send + Sync + 'static,
+    D: ?Sized + 'static,
+{
+    let ptr = header.as_ptr() as *mut ArcData<CoerceShared<T, D>>;
+    // SAFETY: the caller owns the final strong count, so no aliases remain.
+    unsafe {
+        ManuallyDrop::drop(&mut *(*ptr).data.get());
+    }
+    // SAFETY: ptr is the exact allocation produced by Arc::new.
+    unsafe {
+        drop(Box::from_raw(ptr));
+    }
+}
+
+/// Type-erased keep-alive for a typed read guard.
+pub(crate) struct TypedShared {
+    strong: NonNull<AtomicUsize>,
+    drop_alloc: unsafe fn(NonNull<()>),
+}
+
+impl TypedShared {
+    /// Adopts one strong count from a typed shared reference.
+    fn from_arc<T, D>(typed: &Arc<CoerceShared<T, D>>) -> TypedShared
+    where
+        T: Send + Sync + 'static,
+        D: ?Sized + 'static,
+    {
+        // SAFETY: the ArcData header is repr(C) with strong at offset zero.
+        let strong = unsafe { NonNull::new_unchecked(typed.as_ptr() as *mut AtomicUsize) };
+        unsafe {
+            strong.as_ref().fetch_add(1, Ordering::Relaxed);
+        }
+        TypedShared {
+            strong,
+            drop_alloc: drop_coerce_shared_alloc::<T, D>,
+        }
+    }
+}
+
+impl Clone for TypedShared {
+    fn clone(&self) -> Self {
+        // SAFETY: strong points at a live AtomicUsize for the allocation.
+        let strong = unsafe { self.strong.as_ref() };
+        if strong.fetch_add(1, Ordering::Relaxed) > usize::MAX / 2 {
+            std::process::abort();
+        }
+        TypedShared {
+            strong: self.strong,
+            drop_alloc: self.drop_alloc,
+        }
+    }
+}
+
+impl Drop for TypedShared {
+    fn drop(&mut self) {
+        // SAFETY: strong points at a live AtomicUsize for the allocation.
+        let strong = unsafe { self.strong.as_ref() };
+        if strong.fetch_sub(1, Ordering::Release) == 1 {
+            fence(Ordering::Acquire);
+            // SAFETY: this reference owns the final strong count.
+            unsafe { (self.drop_alloc)(self.strong.cast::<()>()) };
+        }
+    }
+}
+
+/// A typed read guard that dereferences directly to the value.
+pub struct RcuGuardTyped<T: Send + Sync + 'static> {
+    _epoch: Guard,
+    ptr: *const T,
+    _shared: TypedShared,
+}
+
+impl<T: Send + Sync + 'static> RcuGuardTyped<T> {
+    pub(crate) fn new<D: ?Sized + 'static>(shared: Arc<CoerceShared<T, D>>) -> Self {
+        let epoch = pin();
+        let atom_guard = shared.atom.load();
+        let value: &Value<T, D> = &*atom_guard;
+        let ptr = &value.value as *const T;
+        let _shared = TypedShared::from_arc(&shared);
+        RcuGuardTyped {
+            _epoch: epoch,
+            ptr,
+            _shared,
+        }
+    }
+}
+
+impl<T: Send + Sync + 'static> Deref for RcuGuardTyped<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // SAFETY: the epoch guard keeps the node alive and ptr points into it.
+        unsafe { &*self.ptr }
+    }
+}
+
 /// A shared, mutable value with typed and erased access.
 pub struct AtomCoerce<T: Send + Sync + 'static, D: ?Sized + 'static = dyn Any> {
     pub(crate) shared: Arc<CoerceShared<T, D>>,
 }
 
 impl<T: Send + Sync + 'static, D: ?Sized + 'static> AtomCoerce<T, D> {
+    /// Shared reference to the allocation backing this cell.
+    pub fn shared(&self) -> &Arc<CoerceShared<T, D>> {
+        &self.shared
+    }
+
     /// Reads the current value through an owned guard.
     pub fn read_owned(&self) -> RcuGuard<T, D> {
         RcuGuard::new(self.shared.clone())
+    }
+
+    /// Reads the current value through a guard that points directly at T.
+    pub fn read_typed(&self) -> RcuGuardTyped<T> {
+        RcuGuardTyped::new(self.shared.clone())
     }
 
     /// Wraps a value, using the built-in metadata for the target view.
@@ -234,9 +375,19 @@ pub struct AtomCoerceHandle<T: Send + Sync + 'static, D: ?Sized + 'static = dyn 
 }
 
 impl<T: Send + Sync + 'static, D: ?Sized + 'static> AtomCoerceHandle<T, D> {
+    /// Shared reference to the allocation backing this handle.
+    pub fn shared(&self) -> &Arc<CoerceShared<T, D>> {
+        &self.shared
+    }
+
     /// Reads the current value through an owned guard.
     pub fn read_owned(&self) -> RcuGuard<T, D> {
         RcuGuard::new(self.shared.clone())
+    }
+
+    /// Reads the current value through a guard that points directly at T.
+    pub fn read_typed(&self) -> RcuGuardTyped<T> {
+        RcuGuardTyped::new(self.shared.clone())
     }
 
     /// Views this handle under a different erased trait object.

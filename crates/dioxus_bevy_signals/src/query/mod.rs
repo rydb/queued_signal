@@ -4,10 +4,11 @@
 //! signal mirrors of bevy queries, with automatic bidirectional synchronization.
 
 use std::{
-    any::TypeId,
+    any::{Any, TypeId},
     collections::{HashMap, HashSet},
     fmt::Debug,
     marker::PhantomData,
+    ptr::NonNull,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -308,7 +309,7 @@ impl<Q: MirrorQueryData, F: QueryFilter> Default for PendingQueryTrackingDeltas<
 pub struct UpdateTrackingQueries<Q: DioxusQuerySync, F: QueryFilter> {
     /// The tracking delta (+1 for mount, -1 for unmount).
     pub delta: i32,
-    _phantom: fn() -> PhantomData<(Q, F)>,
+    pub(crate) _phantom: fn() -> PhantomData<(Q, F)>,
 }
 
 impl<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static> Command
@@ -369,8 +370,10 @@ pub fn sync_query_mirror_to_signal<T: DioxusQuerySync + 'static, F: QueryFilter 
                 .iter()
                 .map(|item| (T::get_mirror_entity(&item), T::clone_dioxus_signals(&item)))
                 .collect::<HashMap<_, _>>();
+            let reflect = mirror_signal.0.read().reflect.clone();
             mirror_signal.0.set_value(MirrorQuery {
                 value: current_map,
+                reflect,
                 _marker: PhantomData,
             });
             init_status.initialized = true;
@@ -496,7 +499,7 @@ impl<T: DioxusComponentSync> Command for RequestComponentsMirror<T> {
 }
 /// Command requesting a mirror for a specific query type.
 pub struct RequestQueryMirror<T: DioxusQuerySync + 'static, F: QueryFilter + 'static> {
-    response_tx: oneshot::Sender<QueuedSignal<MirrorQuery<T, F>>>,
+    pub(crate) response_tx: oneshot::Sender<QueuedSignal<MirrorQuery<T, F>>>,
 }
 
 impl<T: DioxusQuerySync + 'static, F: QueryFilter + 'static> Command for RequestQueryMirror<T, F> {
@@ -509,7 +512,12 @@ impl<T: DioxusQuerySync + 'static, F: QueryFilter + 'static> Command for Request
                 None => {
                     T::register_mirror_sync_systems::<F>(world);
 
-                    let query_driver = WriterDriver::new(MirrorQuery::default());
+                    let reflect = component_reflect_from_ptrs::<T>(world);
+                    let query_driver = WriterDriver::new(MirrorQuery {
+                        value: HashMap::new(),
+                        reflect,
+                        _marker: PhantomData,
+                    });
                     // sync must run before drive: sync sends mutations to the
                     // flume, then drive ticks the writer and publishes them.
                     // .chain() guarantees this order.
@@ -551,6 +559,10 @@ impl<T: DioxusQuerySync + 'static, F: QueryFilter + 'static> Command for Request
 
                     world.insert_resource(MirrorQueryWriteDriver(driver_arc));
                     world.insert_resource(MirrorQuerySignal(signal.clone()));
+                    #[cfg(feature = "reflect")]
+                    crate::reflect::query::register_typed_query_spawner_runtime::<T, F>(world);
+                    #[cfg(feature = "reflect")]
+                    crate::reflect::query::notify_typed_query_mirror::<T, F>(world);
                     world.insert_resource(QueryMirrorInitialized::<T, F> {
                         initialized: false,
                         _querydata: || PhantomData,
@@ -578,6 +590,14 @@ impl<T: DioxusQuerySync + 'static, F: QueryFilter + 'static> Command for Request
 /// ```text
 /// let signal = MirrorQuery<(Entity, &mut A, &mut B)> -> Query<(Entity, &mut DioxusMirror<A>, &mut DioxusMirror<B>)> -> HashMap<Entity, (Entity, DioxusMirror<A>, DioxusMirror<B>)> -> QueuedQuerySignal
 /// ```
+/// A type-erased read guard over one component value.
+pub struct ErasedTypedReadGuard {
+    /// Keeps the typed read guard alive.
+    pub owner: Box<dyn Any>,
+    /// Raw pointer to the component value.
+    pub ptr: NonNull<u8>,
+}
+
 pub trait MirrorQueryData: QueryData + IterQueryData {
     /// Mirrored query item type.
     ///
@@ -668,6 +688,25 @@ pub trait MirrorQueryData: QueryData + IterQueryData {
             's,
         >,
     ) -> Self::MirrorItemHandles;
+
+    /// Component type ids in query order.
+    fn component_type_ids() -> Vec<TypeId>;
+
+    /// The entity of a mirror item handle tuple.
+    fn handles_entity(handles: &Self::MirrorItemHandles) -> Entity;
+
+    /// Read one component as a type-erased pointer and owner.
+    fn read_component_erased(
+        handles: &Self::MirrorItemHandles,
+        idx: usize,
+    ) -> Option<ErasedTypedReadGuard>;
+
+    /// Run a callback with a mutable pointer to one component value.
+    fn with_component_mut(
+        handles: &Self::MirrorItemHandles,
+        idx: usize,
+        f: Box<dyn Fn(NonNull<u8>) + Send + Sync>,
+    );
 }
 
 impl<A: DioxusComponentSync, B: DioxusComponentSync> MirrorQueryData for (Entity, &mut A, &mut B) {
@@ -694,6 +733,60 @@ impl<A: DioxusComponentSync, B: DioxusComponentSync> MirrorQueryData for (Entity
         world
             .commands()
             .queue(RequestComponentsMirror::<B>::default());
+        #[cfg(feature = "reflect")]
+        crate::reflect::query::register_typed_query_active(
+            world,
+            vec![TypeId::of::<A>(), TypeId::of::<B>()],
+        );
+    }
+
+    fn component_type_ids() -> Vec<TypeId> {
+        vec![TypeId::of::<A>(), TypeId::of::<B>()]
+    }
+
+    fn handles_entity(handles: &Self::MirrorItemHandles) -> Entity {
+        handles.0
+    }
+
+    fn read_component_erased(
+        handles: &Self::MirrorItemHandles,
+        idx: usize,
+    ) -> Option<ErasedTypedReadGuard> {
+        match idx {
+            0 => {
+                let guard = handles.1.read();
+                let ptr = NonNull::from(&*guard).cast::<u8>();
+                Some(ErasedTypedReadGuard {
+                    owner: Box::new(guard),
+                    ptr,
+                })
+            }
+            1 => {
+                let guard = handles.2.read();
+                let ptr = NonNull::from(&*guard).cast::<u8>();
+                Some(ErasedTypedReadGuard {
+                    owner: Box::new(guard),
+                    ptr,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn with_component_mut(
+        handles: &Self::MirrorItemHandles,
+        idx: usize,
+        f: Box<dyn Fn(NonNull<u8>) + Send + Sync>,
+    ) {
+        match idx {
+            0 => handles
+                .1
+                .mutate(move |a: &mut A| f(NonNull::from(&mut *a).cast::<u8>())),
+            1 => handles
+                .2
+                .mutate(move |b: &mut B| f(NonNull::from(&mut *b).cast::<u8>())),
+            _ => {}
+        }
     }
 
     fn get_mirror_entity<'w, 's>(
@@ -797,6 +890,8 @@ impl<A: DioxusComponentSync, B: DioxusComponentSync> crate::query::single::Singl
 /// A mirrored bevy query result: maps entities to their dioxus signal handles.
 pub struct MirrorQuery<Q: MirrorQueryData, F: QueryFilter> {
     value: HashMap<Entity, Q::MirrorItemHandles>,
+    /// Per-component runtime reflect access, in query order.
+    pub(crate) reflect: Vec<Option<Arc<dyn Any + Send + Sync>>>,
     _marker: PhantomData<fn() -> F>,
 }
 
@@ -804,6 +899,7 @@ impl<Q: MirrorQueryData, F: QueryFilter> Clone for MirrorQuery<Q, F> {
     fn clone(&self) -> Self {
         Self {
             value: self.value.clone(),
+            reflect: self.reflect.clone(),
             _marker: self._marker,
         }
     }
@@ -840,9 +936,42 @@ impl<T: MirrorQueryData, F: QueryFilter> Default for MirrorQuery<T, F> {
     fn default() -> Self {
         Self {
             value: Default::default(),
+            reflect: Default::default(),
             _marker: Default::default(),
         }
     }
+}
+
+/// Collects per-component runtime reflect access for a query's component types.
+#[cfg(feature = "reflect")]
+fn component_reflect_from_ptrs<T: MirrorQueryData>(
+    world: &World,
+) -> Vec<Option<Arc<dyn Any + Send + Sync>>> {
+    use bevy_ecs::reflect::AppTypeRegistry;
+    use bevy_reflect::ReflectFromPtr;
+
+    let Some(registry) = world.get_resource::<AppTypeRegistry>() else {
+        return vec![None; T::component_type_ids().len()];
+    };
+    let registry = registry.read();
+    T::component_type_ids()
+        .into_iter()
+        .map(|type_id| {
+            registry
+                .get(type_id)
+                .and_then(|registration| registration.data::<ReflectFromPtr>())
+                .cloned()
+                .map(|ptr| Arc::new(ptr) as Arc<dyn Any + Send + Sync>)
+        })
+        .collect()
+}
+
+/// Collects per-component reflect access when the reflect feature is disabled.
+#[cfg(not(feature = "reflect"))]
+fn component_reflect_from_ptrs<T: MirrorQueryData>(
+    _world: &World,
+) -> Vec<Option<Arc<dyn Any + Send + Sync>>> {
+    vec![None; T::component_type_ids().len()]
 }
 /// A mirrored bevy query holding signals for matching components.
 #[derive(Resource)]

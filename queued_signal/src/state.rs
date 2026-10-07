@@ -1,3 +1,4 @@
+use std::any::Any;
 use dioxus::prelude::*;
 use dioxus::signals::Signal;
 use dioxus_core::Task;
@@ -11,7 +12,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
-use crate::atom_coerce::{AtomCoerce, AtomCoerceHandle, RcuGuard};
+use crate::atom_coerce::{AtomCoerce, AtomCoerceHandle, RcuGuard, RcuGuardTyped};
+use crate::atom_coerce_dyn::{AtomCoerceDynHandle, AtomCoerceDynSlotGuard, EraseMut};
 use crate::macros::warn;
 
 /// Health status of QueuedSignal.
@@ -98,17 +100,43 @@ impl ReaderRegistry {
     }
 }
 
-/// Closure mutation operation.
-pub type MutationOp<T> = Arc<dyn Fn(&mut T) + Send + Sync>;
+/// A queued mutation operating on either the typed value or the erased view.
+pub enum MutationOp<T, D: ?Sized + 'static = dyn Any>
+where
+    T: Clone + Send + Sync + 'static,
+{
+    /// Mutation through the typed value.
+    Typed(Arc<dyn Fn(&mut T) + Send + Sync>),
+    /// Mutation through the erased view, coerced during application.
+    Untyped(Arc<dyn Fn(&mut D) + Send + Sync>),
+}
+
+impl<T: Clone + Send + Sync + 'static, D: ?Sized + 'static> MutationOp<T, D> {
+    /// Applies this mutation to a typed value.
+    pub fn apply(&self, value: &mut T)
+    where
+        T: EraseMut<D>,
+    {
+        match self {
+            MutationOp::Typed(f) => f(value),
+            MutationOp::Untyped(f) => {
+                let ptr = (value as *mut T) as *mut ();
+                // SAFETY: value is a live T and EraseMut unsizes it to D.
+                let view = unsafe { &mut *<T as EraseMut<D>>::erase_mut(ptr) };
+                f(view);
+            }
+        }
+    }
+}
 
 /// Full-value replacement operation carrying an owned value
 #[derive(Debug)]
 pub struct SetValueOp<T>(pub Arc<T>);
 
 /// Inner state of a QueuedSignal.
-pub struct QueuedState<T: Clone + Send + Sync + 'static> {
+pub struct QueuedState<T: Clone + Send + Sync + 'static, D: ?Sized + 'static = dyn Any> {
     /// Shared read handle over the read buffer.
-    pub cell: AtomCoerceHandle<T>,
+    pub cell: AtomCoerceHandle<T, D>,
     /// Version notification channel. Readers await changes here.
     pub notify_rx: watch::Receiver<u64>,
     /// Health status notification channel.
@@ -117,7 +145,7 @@ pub struct QueuedState<T: Clone + Send + Sync + 'static> {
     pub registry: Arc<ReaderRegistry>,
 }
 
-impl<T: Clone + Send + Sync + 'static> Debug for QueuedState<T> {
+impl<T: Clone + Send + Sync + 'static, D: ?Sized + 'static> Debug for QueuedState<T, D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QueuedState")
             .field("notify_rx", &self.notify_rx)
@@ -127,7 +155,7 @@ impl<T: Clone + Send + Sync + 'static> Debug for QueuedState<T> {
     }
 }
 
-impl<T: Clone + Send + Sync + 'static> Clone for QueuedState<T> {
+impl<T: Clone + Send + Sync + 'static, D: ?Sized + 'static> Clone for QueuedState<T, D> {
     fn clone(&self) -> Self {
         Self {
             cell: self.cell.clone(),
@@ -138,11 +166,16 @@ impl<T: Clone + Send + Sync + 'static> Clone for QueuedState<T> {
     }
 }
 
-impl<T: Clone + Send + Sync + 'static> QueuedState<T> {
+impl<T: Clone + Send + Sync + 'static, D: ?Sized + 'static> QueuedState<T, D> {
     /// Returns a tracked read guard over the current read buffer.
     pub fn read(&self) -> TrackedReadGuard<T> {
-        let guard = self.cell.read_owned();
+        let guard = self.cell.read_typed();
         TrackedReadGuard::new(guard, self.registry.clone())
+    }
+
+    /// The typed cell viewed through the erased trait object.
+    pub fn cell_dyn(&self) -> &AtomCoerceHandle<T, D> {
+        &self.cell
     }
 
     /// Current health status of the underlying signal.
@@ -161,7 +194,7 @@ impl<T: Clone + Send + Sync + 'static> QueuedState<T> {
     }
 }
 
-impl<T: Clone + Send + Sync + 'static> QueuedState<T> {
+impl<T: Clone + Send + Sync + 'static, D: ?Sized + 'static> QueuedState<T, D> {
     /// Spawn a background task forwarding the version into a dioxus signal.
     pub fn forward_to(
         &self,
@@ -228,15 +261,97 @@ impl<T: Clone + Send + Sync + 'static> QueuedState<T> {
     }
 }
 
+/// Read-side state for an erased queued signal view.
+pub struct QueuedStateDyn<D: ?Sized + 'static> {
+    /// Rebindable erased read handle over the current value.
+    pub view: AtomCoerceDynHandle<D>,
+    /// Version notification channel. Readers await changes here.
+    pub notify_rx: watch::Receiver<u64>,
+    /// Health status notification channel.
+    pub health_rx: watch::Receiver<HealthStatus>,
+    /// Shared reader registry for stall detection.
+    pub registry: Arc<ReaderRegistry>,
+}
+
+impl<D: ?Sized + 'static> Debug for QueuedStateDyn<D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueuedStateDyn")
+            .field("notify_rx", &self.notify_rx)
+            .field("health_rx", &self.health_rx)
+            .field("registry", &self.registry)
+            .finish()
+    }
+}
+
+impl<D: ?Sized + 'static> Clone for QueuedStateDyn<D> {
+    fn clone(&self) -> Self {
+        Self {
+            view: self.view.clone(),
+            notify_rx: self.notify_rx.clone(),
+            health_rx: self.health_rx.clone(),
+            registry: self.registry.clone(),
+        }
+    }
+}
+
+impl<D: ?Sized + 'static> QueuedStateDyn<D> {
+    /// Returns a tracked read guard over the erased view.
+    pub fn read(&self) -> TrackedReadGuardDyn<D> {
+        TrackedReadGuardDyn::new(self.view.get(), self.registry.clone())
+    }
+
+    /// Current health status of the underlying signal.
+    pub fn health(&self) -> HealthStatus {
+        *self.health_rx.borrow()
+    }
+
+    /// Clone of the version notification receiver.
+    pub fn notify_rx(&self) -> watch::Receiver<u64> {
+        self.notify_rx.clone()
+    }
+
+    /// Peek the current version without entering the read side.
+    pub fn peek_version(&self) -> u64 {
+        *self.notify_rx.borrow()
+    }
+
+    /// Spawn a background task forwarding the version into a dioxus signal.
+    pub fn forward_to(
+        &self,
+        version_signal: Signal<u64>,
+        health_signal: Signal<HealthStatus>,
+    ) -> Task {
+        let state = self.clone();
+        spawn(async move {
+            let mut version_signal = version_signal;
+            let mut health_signal = health_signal;
+            let mut nr = state.notify_rx();
+            let mut hr = state.health_rx.clone();
+            loop {
+                tokio::select! {
+                    Ok(()) = nr.changed() => {
+                        version_signal.set(*nr.borrow());
+                    }
+                    Ok(()) = hr.changed() => {
+                        health_signal.set(*hr.borrow());
+                    }
+                    else => break,
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+    }
+}
+
 /// Read guard for a QueuedSignal.
 pub struct TrackedReadGuard<T: Clone + Send + Sync + 'static> {
-    guard: RcuGuard<T>,
+    guard: RcuGuardTyped<T>,
     registry: Arc<ReaderRegistry>,
     reader_id: u64,
 }
 
 impl<T: Clone + Send + Sync + 'static> TrackedReadGuard<T> {
-    fn new(guard: RcuGuard<T>, registry: Arc<ReaderRegistry>) -> Self {
+    fn new(guard: RcuGuardTyped<T>, registry: Arc<ReaderRegistry>) -> Self {
         let reader_id = registry.register();
         registry.heartbeat(reader_id);
         Self {
@@ -263,6 +378,50 @@ impl<T: Clone + Send + Sync + 'static> Drop for TrackedReadGuard<T> {
     }
 }
 
+/// Read guard for an erased view over a queued signal.
+pub struct TrackedReadGuardDyn<D: ?Sized + 'static> {
+    guard: AtomCoerceDynSlotGuard<D>,
+    registry: Arc<ReaderRegistry>,
+    reader_id: u64,
+}
+
+impl<D: ?Sized + 'static> TrackedReadGuardDyn<D> {
+    /// Wraps an erased slot guard with reader tracking.
+    pub fn new(guard: AtomCoerceDynSlotGuard<D>, registry: Arc<ReaderRegistry>) -> Self {
+        let reader_id = registry.register();
+        registry.heartbeat(reader_id);
+        Self {
+            guard,
+            registry,
+            reader_id,
+        }
+    }
+
+    /// Record a heartbeat, resetting this reader's stall timer.
+    pub fn heartbeat(&self) {
+        self.registry.heartbeat(self.reader_id);
+    }
+
+    /// Borrows the erased value.
+    pub fn as_ref(&self) -> &D {
+        self.guard.as_dyn()
+    }
+}
+
+impl<D: ?Sized + 'static> Drop for TrackedReadGuardDyn<D> {
+    fn drop(&mut self) {
+        self.registry.unregister(self.reader_id);
+    }
+}
+
+impl<D: ?Sized + 'static> Deref for TrackedReadGuardDyn<D> {
+    type Target = D;
+
+    fn deref(&self) -> &Self::Target {
+        self.guard.as_dyn()
+    }
+}
+
 impl<T: Clone + Send + Sync + 'static> Deref for TrackedReadGuard<T> {
     type Target = T;
 
@@ -276,11 +435,11 @@ impl<T: Clone + Send + Sync + 'static> Deref for TrackedReadGuard<T> {
 /// Owns the read buffer and the channels for receiving mutations. Call
 /// [`tick`](Self::tick) regularly to drain pending operations, publish
 /// to readers, and update health.
-pub struct WriterDriver<T: Clone + Send + Sync + 'static> {
-    cell: AtomCoerce<T>,
+pub struct WriterDriver<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static = dyn Any> {
+    cell: AtomCoerce<T, D>,
     set_value_rx: Receiver<SetValueOp<T>>,
-    set_rx: Receiver<MutationOp<T>>,
-    add_rx: Receiver<MutationOp<T>>,
+    set_rx: Receiver<MutationOp<T, D>>,
+    add_rx: Receiver<MutationOp<T, D>>,
     abs_slot: Arc<Mutex<Option<T>>>,
     notify_tx: watch::Sender<u64>,
     version: u64,
@@ -293,15 +452,17 @@ pub struct WriterDriver<T: Clone + Send + Sync + 'static> {
     /// Sender for authoritative full-value replacements.
     pub set_value_tx: Sender<SetValueOp<T>>,
     /// Sender for authoritative closure mutations.
-    pub set_tx: Sender<MutationOp<T>>,
+    pub set_tx: Sender<MutationOp<T, D>>,
     /// Sender for relative closure mutations.
-    pub add_tx: Sender<MutationOp<T>>,
+    pub add_tx: Sender<MutationOp<T, D>>,
     /// The read-side state that consumers subscribe to.
-    pub queued_state: QueuedState<T>,
+    pub queued_state: QueuedState<T, D>,
     publish_counter: Option<Arc<AtomicU64>>,
 }
 
-impl<T: Debug + Clone + Send + Sync + 'static> Debug for WriterDriver<T> {
+impl<T: Debug + Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Debug
+    for WriterDriver<T, D>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WriterDriver")
             .field("version", &self.version)
@@ -314,8 +475,8 @@ impl<T: Debug + Clone + Send + Sync + 'static> Debug for WriterDriver<T> {
     }
 }
 
-impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
-    fn build(cell: AtomCoerce<T>) -> Self {
+impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> WriterDriver<T, D> {
+    fn build(cell: AtomCoerce<T, D>) -> Self {
         let (notify_tx, notify_rx) = watch::channel(0u64);
         let (health_tx, health_rx) = watch::channel(HealthStatus::Healthy);
 
@@ -325,7 +486,7 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
 
         let registry = Arc::new(ReaderRegistry::default());
 
-        let state = QueuedState {
+        let state: QueuedState<T, D> = QueuedState {
             cell: cell.handle(),
             notify_rx,
             health_rx,
@@ -364,7 +525,13 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
     }
 
     /// Drains all channels and returns the pending operations.
-    pub fn drain_ops(&mut self) -> (Vec<SetValueOp<T>>, Vec<MutationOp<T>>, Vec<MutationOp<T>>) {
+    pub fn drain_ops(
+        &mut self,
+    ) -> (
+        Vec<SetValueOp<T>>,
+        Vec<MutationOp<T, D>>,
+        Vec<MutationOp<T, D>>,
+    ) {
         let set_values = self.set_value_rx.drain().collect();
         let sets = self.set_rx.drain().collect();
         let adds = self.add_rx.drain().collect();
@@ -372,7 +539,7 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
     }
 
     /// Reads the current value through an owned guard.
-    pub fn read(&self) -> RcuGuard<T> {
+    pub fn read(&self) -> RcuGuard<T, D> {
         self.cell.read_owned()
     }
 
@@ -428,11 +595,11 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
                 for op in &set_values {
                     working = (*op.0).clone();
                 }
-                for f in &sets {
-                    f(&mut working);
+                for op in &sets {
+                    op.apply(&mut working);
                 }
-                for f in &adds {
-                    f(&mut working);
+                for op in &adds {
+                    op.apply(&mut working);
                 }
                 working
             });
@@ -468,26 +635,43 @@ impl<T: Clone + Send + Sync + 'static> WriterDriver<T> {
 }
 
 /// A signal providing borrow reads and queued writes.
-#[derive(Clone)]
-pub struct QueuedSignal<T: Clone + Send + Sync + 'static> {
+pub struct QueuedSignal<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static = dyn Any> {
     /// The read-side state that consumers subscribe to.
-    pub state: QueuedState<T>,
+    pub state: QueuedState<T, D>,
     // keep the writer alive as long as this signal exists
-    _driver: Option<Arc<Mutex<WriterDriver<T>>>>,
-    add_tx: Sender<MutationOp<T>>,
-    set_tx: Sender<MutationOp<T>>,
+    _driver: Option<Arc<Mutex<WriterDriver<T, D>>>>,
+    add_tx: Sender<MutationOp<T, D>>,
+    set_tx: Sender<MutationOp<T, D>>,
     set_value_tx: Sender<SetValueOp<T>>,
 }
 
-impl<T: Clone + Send + Sync + 'static> Deref for QueuedSignal<T> {
-    type Target = QueuedState<T>;
+impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Clone
+    for QueuedSignal<T, D>
+{
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+            _driver: self._driver.clone(),
+            add_tx: self.add_tx.clone(),
+            set_tx: self.set_tx.clone(),
+            set_value_tx: self.set_value_tx.clone(),
+        }
+    }
+}
+
+impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Deref
+    for QueuedSignal<T, D>
+{
+    type Target = QueuedState<T, D>;
 
     fn deref(&self) -> &Self::Target {
         &self.state
     }
 }
 
-impl<T: Clone + Send + Sync + Debug + 'static> Debug for QueuedSignal<T> {
+impl<T: Clone + Send + Sync + Debug + 'static + EraseMut<D>, D: ?Sized + 'static> Debug
+    for QueuedSignal<T, D>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QueuedSignal")
             .field("state", &self.state)
@@ -498,13 +682,13 @@ impl<T: Clone + Send + Sync + Debug + 'static> Debug for QueuedSignal<T> {
     }
 }
 
-impl<T: Clone + Send + Sync + 'static> QueuedSignal<T> {
+impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> QueuedSignal<T, D> {
     /// Assemble a QueuedSignal from its constituent parts.
     pub fn from_parts(
-        state: QueuedState<T>,
-        driver: Option<Arc<Mutex<WriterDriver<T>>>>,
-        add_tx: Sender<MutationOp<T>>,
-        set_tx: Sender<MutationOp<T>>,
+        state: QueuedState<T, D>,
+        driver: Option<Arc<Mutex<WriterDriver<T, D>>>>,
+        add_tx: Sender<MutationOp<T, D>>,
+        set_tx: Sender<MutationOp<T, D>>,
         set_value_tx: Sender<SetValueOp<T>>,
     ) -> Self {
         Self {
@@ -521,12 +705,22 @@ impl<T: Clone + Send + Sync + 'static> QueuedSignal<T> {
         self.state.read()
     }
 
+    /// Clone of the relative mutation sender.
+    pub(crate) fn add_tx(&self) -> Sender<MutationOp<T, D>> {
+        self.add_tx.clone()
+    }
+
+    /// Clone of the authoritative mutation sender.
+    pub(crate) fn set_tx(&self) -> Sender<MutationOp<T, D>> {
+        self.set_tx.clone()
+    }
+
     /// Enqueue a relative mutation.
     pub fn mutate<F>(&self, f: F)
     where
         F: Fn(&mut T) + Send + Sync + 'static,
     {
-        let _ = self.add_tx.send(Arc::new(f));
+        let _ = self.add_tx.send(MutationOp::Typed(Arc::new(f)));
     }
 
     /// Enqueue an authoritative mutation.
@@ -534,7 +728,7 @@ impl<T: Clone + Send + Sync + 'static> QueuedSignal<T> {
     where
         F: Fn(&mut T) + Send + Sync + 'static,
     {
-        let _ = self.set_tx.send(Arc::new(f));
+        let _ = self.set_tx.send(MutationOp::Typed(Arc::new(f)));
     }
 
     /// Enqueue an authoritative full-value replacement.
@@ -551,21 +745,21 @@ impl<T: Clone + Send + Sync + 'static> QueuedSignal<T> {
     pub fn use_hook<E: 'static>(
         &self,
         error_state: E,
-    ) -> (Signal<Result<RcuGuard<T>, E>>, Signal<HealthStatus>) {
+    ) -> (Signal<Result<RcuGuardTyped<T>, E>>, Signal<HealthStatus>) {
         use_queued_state(self.state.clone(), error_state)
     }
 
     /// Like [`use_hook`], but passes the read guard directly.
-    pub fn use_hook_direct(&self, initial: T) -> (Signal<RcuGuard<T>>, Signal<HealthStatus>) {
+    pub fn use_hook_direct(&self, initial: T) -> (Signal<RcuGuardTyped<T>>, Signal<HealthStatus>) {
         use_queued_state_direct(self.state.clone(), initial)
     }
 }
 
 /// Shared helper that subscribes a [`Signal`] to a [`QueuedState`].
-fn use_queued_state_inner<T: Clone + Send + Sync + 'static, V: 'static>(
-    state: QueuedState<T>,
+fn use_queued_state_inner<T: Clone + Send + Sync + 'static, D: ?Sized + 'static, V: 'static>(
+    state: QueuedState<T, D>,
     initial: V,
-    map: impl Fn(RcuGuard<T>) -> V + 'static,
+    map: impl Fn(RcuGuardTyped<T>) -> V + 'static,
 ) -> (Signal<V>, Signal<HealthStatus>) {
     let mut value_signal = use_signal(|| initial);
     let mut health_signal = use_signal(|| HealthStatus::Healthy);
@@ -581,7 +775,7 @@ fn use_queued_state_inner<T: Clone + Send + Sync + 'static, V: 'static>(
             loop {
                 tokio::select! {
                     Ok(()) = notify_rx.changed() => {
-                        value_signal.set(map(cell.read_owned()));
+                        value_signal.set(map(cell.read_typed()));
                     }
                     Ok(()) = health_rx.changed() => {
                         health_signal.set(*health_rx.borrow());
@@ -597,19 +791,19 @@ fn use_queued_state_inner<T: Clone + Send + Sync + 'static, V: 'static>(
 }
 
 /// Subscribe a [`Signal`] to a [`QueuedState`], wrapping each read in `Ok`.
-pub fn use_queued_state<T: Clone + Send + Sync + 'static, E: 'static>(
-    state: QueuedState<T>,
+pub fn use_queued_state<T: Clone + Send + Sync + 'static, D: ?Sized + 'static, E: 'static>(
+    state: QueuedState<T, D>,
     error_state: E,
-) -> (Signal<Result<RcuGuard<T>, E>>, Signal<HealthStatus>) {
+) -> (Signal<Result<RcuGuardTyped<T>, E>>, Signal<HealthStatus>) {
     use_queued_state_inner(state, Err(error_state), |guard| Ok(guard))
 }
 
 /// Subscribe a [`Signal`] to a [`QueuedState`], passing the guard directly.
-pub fn use_queued_state_direct<T: Clone + Send + Sync + 'static>(
-    state: QueuedState<T>,
+pub fn use_queued_state_direct<T: Clone + Send + Sync + 'static, D: ?Sized + 'static>(
+    state: QueuedState<T, D>,
     _initial: T,
-) -> (Signal<RcuGuard<T>>, Signal<HealthStatus>) {
-    let guard = state.cell.read_owned();
+) -> (Signal<RcuGuardTyped<T>>, Signal<HealthStatus>) {
+    let guard = state.cell.read_typed();
     use_queued_state_inner(state, guard, |guard| guard)
 }
 
@@ -682,9 +876,12 @@ mod tests {
         driver.set_value_tx.send(SetValueOp(Arc::new(42))).unwrap();
         driver
             .set_tx
-            .send(Arc::new(|v: &mut i32| *v += 10))
+            .send(MutationOp::Typed(Arc::new(|v: &mut i32| *v += 10)))
             .unwrap();
-        driver.add_tx.send(Arc::new(|v: &mut i32| *v += 1)).unwrap();
+        driver
+            .add_tx
+            .send(MutationOp::Typed(Arc::new(|v: &mut i32| *v += 1)))
+            .unwrap();
 
         driver.tick(Duration::ZERO);
 
@@ -708,8 +905,14 @@ mod tests {
     fn writer_driver_tick_mutate_set_wins_over_mutate() {
         let mut driver = WriterDriver::new(0i32);
 
-        driver.add_tx.send(Arc::new(|v: &mut i32| *v += 1)).unwrap();
-        driver.set_tx.send(Arc::new(|v: &mut i32| *v = 10)).unwrap();
+        driver
+            .add_tx
+            .send(MutationOp::Typed(Arc::new(|v: &mut i32| *v += 1)))
+            .unwrap();
+        driver
+            .set_tx
+            .send(MutationOp::Typed(Arc::new(|v: &mut i32| *v = 10)))
+            .unwrap();
 
         driver.tick(Duration::ZERO);
 

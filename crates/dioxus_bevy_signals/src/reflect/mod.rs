@@ -10,10 +10,21 @@ pub mod query;
 pub mod resource;
 
 use std::{any::TypeId, collections::HashSet, ops::Deref, sync::Arc};
+use std::any::Any;
+use std::marker::PhantomData;
+use std::ptr::NonNull;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc as StdArc;
 
 use bevy_app::prelude::*;
 use bevy_ecs::reflect::{AppTypeRegistry, ReflectComponent, ReflectResource};
-use bevy_reflect::{Reflect, ReflectCloneError};
+use bevy_ptr::Ptr;
+use bevy_reflect::{Reflect, ReflectCloneError, ReflectFromPtr};
+use kovan::{pin, Atom, Guard};
+use queued_signal::atom_coerce::{
+    Arc as QsArc, AtomCoerceHandle, CoerceShared, Value, drop_coerce_shared_alloc,
+};
+use queued_signal::atom_coerce_dyn::{AtomCoerceDyn, ErasedShared};
 
 /// Type-erased mutation operating on a reflected value.
 pub type ErasedMutation = Arc<dyn Fn(&mut dyn Reflect) + Send + Sync>;
@@ -165,6 +176,8 @@ pub fn setup(app: &mut App) {
     app.init_resource::<resource::ReflectResourceRegistry>();
     app.init_resource::<query::ReflectComponentRegistry>();
     app.init_resource::<query::ReflectQueryRegistry>();
+    app.init_resource::<query::ReflectActiveTypedQueries>();
+    app.init_resource::<query::TypedQuerySpawnerRegistry>();
 
     app.add_systems(
         crate::schedules::DioxusSyncUpdate,
@@ -174,4 +187,132 @@ pub fn setup(app: &mut App) {
         crate::schedules::DioxusSyncUpdate,
         query::drive_reflect_query_signals,
     );
+}
+
+/// Builds an owning erased holder around an Arc-backed reflected value.
+pub fn reflect_holder_owned(value: StdArc<dyn Reflect>) -> AtomCoerceDyn<dyn Reflect> {
+    AtomCoerceDyn::from_shared(reflect_shared_owned(value))
+}
+
+/// Extension for binding a reflected holder to a typed cell.
+pub trait AtomCoerceDynReflectExt {
+    /// Binds the holder to a typed cell, viewing its value as a reflected value.
+    fn bind_reflect<T: Send + Sync + 'static>(
+        &self,
+        typed: &AtomCoerceHandle<T, dyn Any>,
+        reflect_from_ptr: ReflectFromPtr,
+    );
+}
+
+impl AtomCoerceDynReflectExt for AtomCoerceDyn<dyn Reflect> {
+    fn bind_reflect<T: Send + Sync + 'static>(
+        &self,
+        typed: &AtomCoerceHandle<T, dyn Any>,
+        reflect_from_ptr: ReflectFromPtr,
+    ) {
+        self.bind_shared(reflect_bound_shared(typed, reflect_from_ptr));
+    }
+}
+
+/// Owned erased shared reference around an Arc-backed reflected value.
+fn reflect_shared_owned(value: StdArc<dyn Reflect>) -> ErasedShared<dyn Reflect> {
+    let shared = QsArc::new(CoerceShared::new(Atom::new(Value::new(value))));
+    let data = (&*shared as *const CoerceShared<StdArc<dyn Reflect>, dyn Reflect>) as *mut ();
+    let strong =
+        NonNull::new(shared.as_ptr() as *mut AtomicUsize).expect("arc pointer is non-null");
+    let erased = ErasedShared::from_raw_parts(
+        NonNull::new(data).expect("arc pointer is non-null"),
+        strong,
+        drop_coerce_shared_alloc::<StdArc<dyn Reflect>, dyn Reflect>,
+        load_arc_reflect::<StdArc<dyn Reflect>>,
+        try_store_arc_reflect::<StdArc<dyn Reflect>>,
+        StdArc::new(()),
+    );
+    std::mem::forget(shared);
+    erased
+}
+
+/// Builds an erased shared reference bound to a typed cell.
+fn reflect_bound_shared<T: Send + Sync + 'static>(
+    typed: &AtomCoerceHandle<T, dyn Any>,
+    reflect_from_ptr: ReflectFromPtr,
+) -> ErasedShared<dyn Reflect> {
+    let shared = typed.shared();
+    let data = (&**shared as *const CoerceShared<T, dyn Any>) as *mut ();
+    let strong =
+        NonNull::new(shared.as_ptr() as *mut AtomicUsize).expect("arc pointer is non-null");
+    // Adopt one strong count for this erased reference.
+    unsafe {
+        strong.as_ref().fetch_add(1, Ordering::Relaxed);
+    }
+    ErasedShared::from_raw_parts(
+        NonNull::new(data).expect("arc pointer is non-null"),
+        strong,
+        drop_coerce_shared_alloc::<T, dyn Any>,
+        load_reflect_bound::<T>,
+        try_store_reflect,
+        StdArc::new(reflect_from_ptr),
+    )
+}
+
+/// Loads an Arc-backed reflected value as a reflected view.
+unsafe fn load_arc_reflect<T>(shared: &ErasedShared<dyn Reflect>) -> (*const dyn Reflect, Guard)
+where
+    T: Reflect + Send + Sync + 'static,
+{
+    // SAFETY: data points at the live CoerceShared for the erased view.
+    let typed = unsafe { &*(shared.data().as_ptr() as *const CoerceShared<T, dyn Reflect>) };
+    let epoch = pin();
+    let atom_guard = typed.atom().load();
+    let value: &Value<T, dyn Reflect> = &*atom_guard;
+    let ptr = value.value() as *const T;
+    (ptr as *const dyn Reflect, epoch)
+}
+
+/// Stores an Arc-backed reflected value when the boxed value matches.
+unsafe fn try_store_arc_reflect<T>(
+    shared: &ErasedShared<dyn Reflect>,
+    value: Box<dyn Any + Send + Sync>,
+) -> Result<(), Box<dyn Any + Send + Sync>>
+where
+    T: Send + Sync + 'static,
+{
+    // SAFETY: data points at the live CoerceShared for the erased view.
+    let typed = unsafe { &*(shared.data().as_ptr() as *const CoerceShared<T, dyn Reflect>) };
+    match value.downcast::<T>() {
+        Ok(boxed) => {
+            typed.atom().store(Value::new(*boxed));
+            Ok(())
+        }
+        Err(boxed) => Err(boxed),
+    }
+}
+
+/// Loads a typed cell's value as a runtime reflect view.
+unsafe fn load_reflect_bound<T: Send + Sync + 'static>(
+    shared: &ErasedShared<dyn Reflect>,
+) -> (*const dyn Reflect, Guard) {
+    // SAFETY: data points at the live CoerceShared for the bound typed cell.
+    let typed = unsafe { &*(shared.data().as_ptr() as *const CoerceShared<T, dyn Any>) };
+    let epoch = pin();
+    let atom_guard = typed.atom().load();
+    let value: &Value<T, dyn Any> = &*atom_guard;
+    let raw = (value.value() as *const T).cast::<u8>() as *mut u8;
+    // SAFETY: raw points at the live T value and the pointer mirrors T.
+    let ptr = unsafe { Ptr::new(NonNull::new_unchecked(raw)) };
+    let reflect = shared
+        .context()
+        .downcast_ref::<ReflectFromPtr>()
+        .expect("reflect bind missing ReflectFromPtr");
+    // SAFETY: ptr holds the type mirrored by reflect_from_ptr.
+    let reflect = unsafe { reflect.as_reflect(ptr) };
+    (reflect as *const dyn Reflect, epoch)
+}
+
+/// Rejects writes through a reflect-bound view, which shares the typed cell.
+unsafe fn try_store_reflect(
+    _shared: &ErasedShared<dyn Reflect>,
+    value: Box<dyn Any + Send + Sync>,
+) -> Result<(), Box<dyn Any + Send + Sync>> {
+    Err(value)
 }

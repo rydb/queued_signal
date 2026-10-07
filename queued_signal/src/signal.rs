@@ -15,6 +15,7 @@ use flume::{Receiver, Sender};
 use parking_lot::Mutex;
 use tokio::sync::oneshot;
 
+use crate::atom_coerce_dyn::EraseMut;
 use crate::macros::warn;
 use crate::state::{HealthStatus, QueuedSignal, TrackedReadGuard, WriterDriver};
 
@@ -41,15 +42,20 @@ impl From<QueuedSignalNoneState> for String {
 }
 
 /// Handle to a globally registered queued signal.
-pub struct QueuedSignalHandle<T: Clone + Send + Sync + 'static> {
+pub struct QueuedSignalHandle<
+    T: Clone + Send + Sync + 'static + EraseMut<D>,
+    D: ?Sized + 'static = dyn Any,
+> {
     /// Version signal that triggers re-renders on publish.
     pub version: Signal<u64>,
     /// Health status of the underlying signal.
     pub health: Signal<HealthStatus>,
-    writer: Signal<Option<QueuedSignal<T>>>,
+    writer: Signal<Option<QueuedSignal<T, D>>>,
 }
 
-impl<T: Clone + Send + Sync + Display + 'static> Display for QueuedSignalHandle<T> {
+impl<T: Clone + Send + Sync + Display + 'static + EraseMut<D>, D: ?Sized + 'static> Display
+    for QueuedSignalHandle<T, D>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -60,15 +66,20 @@ impl<T: Clone + Send + Sync + Display + 'static> Display for QueuedSignalHandle<
     }
 }
 
-impl<T: Clone + Send + Sync + 'static> Copy for QueuedSignalHandle<T> {}
+impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Copy
+    for QueuedSignalHandle<T, D>
+{
+}
 
-impl<T: Clone + Send + Sync + 'static> Clone for QueuedSignalHandle<T> {
+impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Clone
+    for QueuedSignalHandle<T, D>
+{
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<T: Clone + Send + Sync + 'static> QueuedSignalHandle<T> {
+impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> QueuedSignalHandle<T, D> {
     /// Enqueue a relative mutation, applied after all authoritative operations.
     pub fn mutate<F>(&self, f: F)
     where

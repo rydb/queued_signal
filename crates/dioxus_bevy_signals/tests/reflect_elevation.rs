@@ -7,7 +7,8 @@ use bevy_ecs::prelude::*;
 use bevy_ecs::world::CommandQueue;
 use bevy_reflect::Reflect;
 use dioxus_bevy_signals::reflect::query::{
-    ElevateReflectQuery, ReflectQueryRegistry, register_or_get_query_dyn,
+    ElevateReflectQuery, ReflectQueryRegistry, TypedQuerySpawnerRegistry, register_or_get_query_dyn,
+    register_typed_query_spawner_runtime,
 };
 use dioxus_bevy_signals::reflect::resource::{
     ReflectResourceRegistry, notify_typed_resource_mirror, register_or_get_resource_dyn,
@@ -17,13 +18,16 @@ use parking_lot::Mutex;
 use queued_signal::state::{QueuedSignal, WriterDriver};
 use std::sync::Arc;
 
-#[derive(Component, Reflect, Default)]
+#[derive(Component, Reflect, Default, Clone)]
 #[reflect(Component)]
 struct Name(String);
 
 #[derive(Component, Reflect, Default)]
 #[reflect(Component)]
 struct Transform;
+
+#[derive(Component, Default, Clone)]
+struct NonReflect;
 
 #[test]
 fn untyped_query_elevates_to_typed() {
@@ -121,5 +125,81 @@ fn untyped_resource_elevates_to_typed() {
             "mirror should be elevated after typed request"
         );
         assert_eq!(mirror.active_count, 0, "reflect sync should be disabled");
+    }
+}
+
+#[test]
+fn mixed_query_registers_with_none_reflect_slot() {
+    let mut app = App::new();
+    app.register_type::<Name>();
+    app.init_resource::<ReflectQueryRegistry>();
+
+    {
+        let world = app.world_mut();
+        world.register_component::<Name>();
+        world.register_component::<NonReflect>();
+    }
+
+    let mut key = vec![TypeId::of::<Name>(), TypeId::of::<NonReflect>()];
+    key.sort_unstable();
+
+    {
+        let world = app.world_mut();
+        let handles = register_or_get_query_dyn(
+            world,
+            &["Name".to_string(), "NonReflect".to_string()],
+        )
+        .expect("mixed query should register");
+        drop(handles);
+
+        let mirror = &world.resource::<ReflectQueryRegistry>().map[&key];
+        assert_eq!(mirror.reflect_from_ptrs.len(), 2, "two component slots");
+        assert!(mirror.reflect_from_ptrs[0].is_some(), "Name reflects");
+        assert!(
+            mirror.reflect_from_ptrs[1].is_none(),
+            "NonReflect has no reflect data"
+        );
+    }
+}
+
+#[test]
+fn typed_spawner_registers_for_mixed_query() {
+    let mut app = App::new();
+    app.register_type::<Name>();
+    app.init_resource::<TypedQuerySpawnerRegistry>();
+
+    {
+        let world = app.world_mut();
+        world.register_component::<Name>();
+        world.register_component::<NonReflect>();
+    }
+
+    let mut key = vec![TypeId::of::<Name>(), TypeId::of::<NonReflect>()];
+    key.sort_unstable();
+
+    {
+        let world = app.world_mut();
+        register_typed_query_spawner_runtime::<(Entity, &mut Name, &mut NonReflect), ()>(world);
+        assert!(
+            world
+                .resource::<TypedQuerySpawnerRegistry>()
+                .spawners
+                .contains_key(&key),
+            "spawner registered for the mixed component set"
+        );
+    }
+}
+
+#[test]
+fn unknown_query_name_errors() {
+    let mut app = App::new();
+    app.register_type::<Name>();
+    app.init_resource::<ReflectQueryRegistry>();
+
+    {
+        let world = app.world_mut();
+        world.register_component::<Name>();
+        let result = register_or_get_query_dyn(world, &["DoesNotExist".to_string()]);
+        assert!(result.is_err(), "unknown component names fail");
     }
 }

@@ -25,7 +25,10 @@ use crate::resource::{ResourceDioxusSync, ResourceQueuedSignalMirror};
 use crate::schedules::{DioxusSyncPostUpdate, DioxusSyncUpdate};
 use crate::{CommandQueueSender, add_systems_through_world};
 
-use super::{ErasedMutation, clone_into_arc, enumerate_reflect_types, resolve_name};
+use super::{
+    AtomCoerceDynReflectExt, ErasedMutation, clone_into_arc, enumerate_reflect_types,
+    reflect_holder_owned, resolve_name,
+};
 
 /// Error state for a reflect resource signal that has not initialized yet.
 #[derive(Clone, Debug, PartialEq)]
@@ -379,7 +382,7 @@ pub fn register_or_get_resource_dyn(
         }
     };
 
-    let holder = AtomCoerceDyn::<dyn Reflect>::new(initial);
+    let holder = reflect_holder_owned(initial);
     let version = Arc::new(AtomicU64::new(0));
     let (notify_tx, notify_rx) = watch::channel(0u64);
 
@@ -419,15 +422,14 @@ pub fn register_or_get_resource_dyn(
                 };
                 // SAFETY: ptr holds the type mirrored by reflect_from_ptr.
                 let value = unsafe { mirror.reflect_from_ptr.as_reflect(ptr) };
-                if let Ok(arc) = clone_into_arc(value) {
-                    if mirror
+                if let Ok(arc) = clone_into_arc(value)
+                    && mirror
                         .holder
                         .try_store_boxed(Box::new(arc))
                         .is_ok()
                     {
                         bump_version(&mirror.version, &mirror.notify_tx);
                     }
-                }
             },
         );
 

@@ -34,6 +34,7 @@ tokio = "1.51"
 parking_lot = "0.12.5"
 kovan = "0.1.22"
 ptr_meta = "0.3.2"
+imbl = "7"
 
 # flashmap = "0.2"
 bevy_ecs = {version = "0.19"}

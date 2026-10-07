@@ -14,17 +14,25 @@ bevy_app = {workspace = true}
 bevy_asset = {workspace = true}
 bevy_time = {workspace = true}
 bevy_reflect = {workspace = true, optional = true}
+bevy_ptr = {workspace = true}
+
 dioxus-core = {workspace = true}
 dioxus-hooks = {workspace = true}
 dioxus-signals = {workspace = true}
+
+kovan = {workspace = true}
 parking_lot = {workspace = true}
 flume = {workspace = true}
 tokio = {workspace = true, features = ["sync"]}
 queued_signal = {workspace = true}
+imbl = {workspace = true}
 trait-set = {workspace = true}
 queued_signal_tracing = { workspace = true}
 variadics_please = {workspace = true}
 pastey = {workspace = true}
+
+[dev-dependencies]
+bevy_ecs = {workspace = true, features = ["debug"]}
 
 [features]
 asset = []

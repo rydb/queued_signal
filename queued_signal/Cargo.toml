@@ -19,8 +19,6 @@ tokio = {workspace = true, features = ["rt", "time", "sync", "macros"]}
 kovan = {workspace = true}
 parking_lot = {workspace = true}
 queued_signal_tracing = { workspace = true }
-bevy_reflect = { workspace = true }
-bevy_ptr = {workspace = true}
 
 [features]
 trace = ["queued_signal_tracing/trace"]

@@ -8,4 +8,5 @@ pub mod signal;
 pub mod state;
 pub mod atom_coerce;
 pub mod atom_coerce_dyn;
+pub mod queued_signal_dyn;
 pub(crate) mod macros;
