@@ -19,6 +19,7 @@ bevy_ptr = {workspace = true}
 dioxus-core = {workspace = true}
 dioxus-hooks = {workspace = true}
 dioxus-signals = {workspace = true}
+generational-box = {workspace = true}
 
 kovan = {workspace = true}
 parking_lot = {workspace = true}

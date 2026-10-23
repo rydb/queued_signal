@@ -13,8 +13,8 @@ use dioxus_bevy_signals::reflect::asset::{
     AdoptTypedAsset, ReflectAssetRegistry, register_or_get_asset_dyn,
 };
 use dioxus_bevy_signals::reflect::query::{
-    ElevateReflectQuery, ReflectQueryRegistry, TypedQuerySpawnerRegistry, register_or_get_query_dyn,
-    register_typed_query_spawner_runtime,
+    ElevateReflectQuery, ReflectQueryRegistry, TypedQuerySpawnerRegistry,
+    register_or_get_query_dyn, register_typed_query_spawner_runtime,
 };
 use dioxus_bevy_signals::reflect::resource::{
     ReflectResourceRegistry, notify_typed_resource_mirror, register_or_get_resource_dyn,
@@ -152,11 +152,9 @@ fn mixed_query_registers_with_none_reflect_slot() {
 
     {
         let world = app.world_mut();
-        let handles = register_or_get_query_dyn(
-            world,
-            &["Name".to_string(), "NonReflect".to_string()],
-        )
-        .expect("mixed query should register");
+        let handles =
+            register_or_get_query_dyn(world, &["Name".to_string(), "NonReflect".to_string()])
+                .expect("mixed query should register");
         drop(handles);
 
         let mirror = &world.resource::<ReflectQueryRegistry>().map[&key];
@@ -258,7 +256,10 @@ fn untyped_asset_registers_and_elevates_to_typed() {
     {
         let world = app.world_mut();
         let mirror = &world.resource::<ReflectAssetRegistry>().map[&untyped_id];
-        assert!(mirror.elevated, "mirror should be elevated after typed request");
+        assert!(
+            mirror.elevated,
+            "mirror should be elevated after typed request"
+        );
         assert_eq!(mirror.active_count, 0, "reflect sync should be disabled");
     }
 }

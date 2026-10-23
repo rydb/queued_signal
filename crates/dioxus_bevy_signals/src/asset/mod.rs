@@ -23,7 +23,7 @@ use dioxus_hooks::{use_context, use_future, use_memo, use_signal};
 use dioxus_signals::{Memo, ReadableExt, Signal, WritableExt};
 use flume::{Receiver, Sender};
 use parking_lot::Mutex;
-use queued_signal::state::{HealthStatus, QueuedSignal, TrackedReadGuard, WriterDriver};
+use queued_signal::state::{HealthStatus, ProjectedReadGuard, QueuedSignal, WriterDriver};
 use tokio::sync::oneshot;
 use trait_set::trait_set;
 
@@ -567,12 +567,12 @@ impl<A: DioxusAssetSync> AssetMaybeMirrorSignal<A> {
     }
 
     /// Read asset state, subscribing to version updates.
-    pub fn read(&self) -> Result<TrackedReadGuard<Result<A, AssetNoneState>>, AssetNoneState> {
+    pub fn read(&self) -> ProjectedReadGuard<Result<A, AssetNoneState>> {
         let _ = self.version.read();
         let writer = self.signal.read();
         match writer.as_ref() {
-            Some(signal) => Ok(signal.read()),
-            None => Err(AssetNoneState::Fetching),
+            Some(signal) => signal.read().project(|state| state),
+            None => ProjectedReadGuard::from_owned(Err(AssetNoneState::Fetching)),
         }
     }
 
@@ -581,24 +581,17 @@ impl<A: DioxusAssetSync> AssetMaybeMirrorSignal<A> {
         *self.health.read()
     }
 
-    /// Read + map asset state.
+    /// Read and map asset state.
     pub fn read_ok<U>(&self, f: impl FnOnce(&A) -> U) -> Result<U, AssetNoneState> {
-        let _ = self.version.read();
-        let writer = self.signal.read();
-        match writer.as_ref() {
-            Some(signal) => {
-                let guard = signal.read();
-                match &*guard {
-                    Ok(t) => Ok(f(t)),
-                    Err(e) => Err(e.clone()),
-                }
-            }
-            None => Err(AssetNoneState::Fetching),
+        let guard = self.read();
+        match &*guard {
+            Ok(asset) => Ok(f(asset)),
+            Err(err) => Err(err.clone()),
         }
     }
 }
 
-use std::fmt::{Debug, Display};
+use std::fmt::Display;
 
 /// Returns a synchronization mirror of a given result asset id.
 pub fn use_bevy_asset<A: DioxusAssetSync>(
@@ -725,5 +718,17 @@ pub fn use_bevy_asset<A: DioxusAssetSync>(
         health: health_signal,
         signal: writer_signal,
         extra_info: extra_writer_signal,
+    }
+}
+
+#[cfg(test)]
+mod read_shape_tests {
+    use super::*;
+
+    #[allow(dead_code)]
+    fn read_derefs_to_single_result<A: DioxusAssetSync>(signal: &AssetMaybeMirrorSignal<A>) {
+        let guard = signal.read();
+        let _: &Result<A, AssetNoneState> = guard.as_ref();
+        let _: &Result<A, AssetNoneState> = &guard;
     }
 }

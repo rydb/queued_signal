@@ -92,20 +92,21 @@ struct SnapshotQueryWriteRouter {
 
 impl QueryWriteRouter for SnapshotQueryWriteRouter {
     fn mutate(&self, entity: Entity, idx: usize, f: ErasedMutation) {
-        self.signal.mutate(move |snapshot: &mut OwnedQuerySnapshot| {
-            let Some(values) = snapshot.map.get(&entity) else {
-                return;
-            };
-            let mut new_values = values.clone();
-            let Some(slot) = new_values.get_mut(idx) else {
-                return;
-            };
-            let Some(inner) = slot else {
-                return;
-            };
-            apply_cow(inner, f.clone());
-            snapshot.map.insert(entity, new_values);
-        });
+        self.signal
+            .mutate(move |snapshot: &mut OwnedQuerySnapshot| {
+                let Some(values) = snapshot.map.get(&entity) else {
+                    return;
+                };
+                let mut new_values = values.clone();
+                let Some(slot) = new_values.get_mut(idx) else {
+                    return;
+                };
+                let Some(inner) = slot else {
+                    return;
+                };
+                apply_cow(inner, f.clone());
+                snapshot.map.insert(entity, new_values);
+            });
     }
 
     fn set_value(&self, entity: Entity, idx: usize, value: Arc<dyn Reflect>) {
@@ -393,11 +394,15 @@ impl<Q: MirrorQueryData> ReflectRuntimeOps for Q {
         else {
             return;
         };
-        Q::with_component_mut(handles, idx, Box::new(move |ptr| {
-            // SAFETY: ptr points at the live component mirrored by rfp.
-            let value = unsafe { rfp.as_reflect_mut(PtrMut::new(ptr)) };
-            f(value);
-        }));
+        Q::with_component_mut(
+            handles,
+            idx,
+            Box::new(move |ptr| {
+                // SAFETY: ptr points at the live component mirrored by rfp.
+                let value = unsafe { rfp.as_reflect_mut(PtrMut::new(ptr)) };
+                f(value);
+            }),
+        );
     }
 
     fn set_component(
@@ -413,13 +418,17 @@ impl<Q: MirrorQueryData> ReflectRuntimeOps for Q {
         else {
             return;
         };
-        Q::with_component_mut(handles, idx, Box::new(move |ptr| {
-            // SAFETY: ptr points at the live component mirrored by rfp.
-            let target = unsafe { rfp.as_reflect_mut(PtrMut::new(ptr)) };
-            if let Err(err) = target.try_apply(value.as_ref()) {
-                error!("reflect apply failed: {}", err);
-            }
-        }));
+        Q::with_component_mut(
+            handles,
+            idx,
+            Box::new(move |ptr| {
+                // SAFETY: ptr points at the live component mirrored by rfp.
+                let target = unsafe { rfp.as_reflect_mut(PtrMut::new(ptr)) };
+                if let Err(err) = target.try_apply(value.as_ref()) {
+                    error!("reflect apply failed: {}", err);
+                }
+            }),
+        );
     }
 }
 
@@ -1404,10 +1413,7 @@ pub fn notify_typed_query_mirror<
 }
 
 /// Command adopting a reflect query mirror into a concrete typed query.
-pub struct AdoptTypedQuery<
-    Q: MirrorQueryData + Send + Sync + 'static,
-    F: QueryFilter + 'static,
-> {
+pub struct AdoptTypedQuery<Q: MirrorQueryData + Send + Sync + 'static, F: QueryFilter + 'static> {
     /// Marker for the typed query data and filter.
     pub _marker: std::marker::PhantomData<fn() -> (Q, F)>,
 }
@@ -1423,10 +1429,7 @@ impl<Q: MirrorQueryData + Send + Sync + 'static, F: QueryFilter + 'static> Comma
 }
 
 /// Adopt a reflect query mirror into a concrete typed query.
-pub fn adopt_typed_query<
-    Q: MirrorQueryData + Send + Sync + 'static,
-    F: QueryFilter + 'static,
->(
+pub fn adopt_typed_query<Q: MirrorQueryData + Send + Sync + 'static, F: QueryFilter + 'static>(
     ctx: &CommandQueueSender,
 ) {
     let mut queue = CommandQueue::default();
@@ -1534,6 +1537,14 @@ impl ReflectQuerySignal {
 /// Create or fetch a reflect mirror for a query by component names.
 pub fn use_bevy_query_dyn<const N: usize>(names: [&str; N]) -> ReflectQuerySignal {
     let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+    use_bevy_query_dyn_vec(names)
+}
+
+/// Create or fetch a reflect mirror for a query by a dynamic component list.
+///
+/// The list is read once per mounted component, so callers remount the component when
+/// the requested names change.
+pub fn use_bevy_query_dyn_vec(names: Vec<String>) -> ReflectQuerySignal {
     let ctx = use_context::<CommandQueueSender>();
 
     let version_signal = use_signal(|| 0u64);

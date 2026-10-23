@@ -12,7 +12,7 @@ use dioxus_hooks::{use_context, use_future, use_memo, use_signal};
 use dioxus_signals::{Memo, ReadableExt, Signal, WritableExt};
 use parking_lot::Mutex;
 use queued_signal::state::{
-    HealthStatus, QueuedSignal, SetValueOp, TrackedReadGuard, WriterDriver,
+    HealthStatus, ProjectedReadGuard, QueuedSignal, TrackedReadGuard, WriterDriver,
 };
 use std::any::{TypeId, type_name};
 use std::collections::HashSet;
@@ -143,9 +143,7 @@ fn sync_resource<T: ResourceDioxusSync>(
         }
         // Publish bevy's value to the cell.
         guard.publish_value(resource.clone());
-    }
-    
-    else {
+    } else {
         // Apply the oplog to the bevy resource, the write buffer.
         for op in &set_values {
             *resource = (*op.0).clone();
@@ -164,11 +162,15 @@ fn sync_resource<T: ResourceDioxusSync>(
     guard.update_health();
 }
 
+trait_set! {
+    pub trait UBounds = Send + Sync + PartialEq + 'static
+}
+
 /// Dioxus signal for managing bevy resource synchronization.
 pub struct ResourceMirrorSignal<R, U, E>
 where
     R: Clone + Send + Sync + 'static,
-    U: 'static,
+    U: UBounds,
     E: 'static,
 {
     version: Signal<u64>,
@@ -176,55 +178,55 @@ where
     /// None until the bevy round-trip completes.
     /// Writes are silently ignored while pending.
     writer: Signal<Option<QueuedSignal<R>>>,
-    /// Memoized mapped value for reactive display in RSX.
-    display: Memo<Result<U, E>>,
+    /// Memoized projected value for reactive display in RSX.
+    display: Memo<Result<ProjectedReadGuard<U>, E>>,
 }
 
-impl<R: Clone + Send + Sync + 'static, U, E> Clone for ResourceMirrorSignal<R, U, E> {
+impl<R: Clone + Send + Sync + 'static, U: UBounds, E> Clone for ResourceMirrorSignal<R, U, E> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<R: Clone + Send + Sync + 'static, U, E> Copy for ResourceMirrorSignal<R, U, E> {}
+impl<R: Clone + Send + Sync + 'static, U: UBounds, E> Copy for ResourceMirrorSignal<R, U, E> {}
 
-impl<R, U, E> Display for ResourceMirrorSignal<R, U, E>
+impl<R, U: UBounds, E> Display for ResourceMirrorSignal<R, U, E>
 where
     R: Clone + Send + Sync + 'static,
-    U: Display + PartialEq + 'static,
+    U: Display + 'static,
     E: Display + PartialEq + 'static,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.display.read().as_ref() {
-            Ok(u) => write!(f, "{u}"),
+            Ok(u) => write!(f, "{}", u.as_ref()),
             Err(e) => write!(f, "{e}"),
         }
     }
 }
 
-impl<R, U, E> IntoDynNode for ResourceMirrorSignal<R, U, E>
+impl<R, U: UBounds, E> IntoDynNode for ResourceMirrorSignal<R, U, E>
 where
     R: Clone + Send + Sync + 'static,
-    U: Display + PartialEq + Clone + 'static,
-    E: Display + PartialEq + Clone + 'static,
+    U: Display + 'static,
+    E: Display + PartialEq + 'static,
 {
     fn into_dyn_node(self) -> dioxus_core::DynamicNode {
         self.to_string().into_dyn_node()
     }
 }
 
-impl<R, U, E> IntoAttributeValue for ResourceMirrorSignal<R, U, E>
+impl<R, U: UBounds, E> IntoAttributeValue for ResourceMirrorSignal<R, U, E>
 where
     R: Clone + Send + Sync + 'static,
-    U: Display + PartialEq + Clone + 'static,
-    E: Display + PartialEq + Clone + 'static,
+    U: Display + 'static,
+    E: Display + PartialEq + 'static,
 {
     fn into_value(self) -> dioxus_core::AttributeValue {
         self.to_string().into_value()
     }
 }
 
-impl<R: Clone + Send + Sync + 'static, U, E> ResourceMirrorSignal<R, U, E> {
+impl<R: Clone + Send + Sync + 'static, U: UBounds, E> ResourceMirrorSignal<R, U, E> {
     /// Enqueue a relative mutation.
     pub fn mutate<F>(&self, f: F)
     where
@@ -291,13 +293,15 @@ impl<R: Clone + Send + Sync + 'static, U, E> ResourceMirrorSignal<R, U, E> {
 }
 
 /// Create or fetch a signal mirror for a bevy resource.
+///
+/// `map_fn` projects a borrowed field of the resource for display and equality.
 pub fn use_bevy_resource<T, U, E>(
-    map_fn: impl Fn(&T) -> U + Clone + 'static,
+    map_fn: impl for<'a> Fn(&'a T) -> &'a U + 'static,
     err_fn: impl Fn(ResourceNoneState) -> E + Clone + 'static,
 ) -> ResourceMirrorSignal<T, U, E>
 where
     T: ResourceDioxusSync,
-    U: PartialEq,
+    U: UBounds,
     E: PartialEq,
 {
     let ctx = use_context::<CommandQueueSender>();
@@ -309,13 +313,12 @@ where
     let display = {
         let version = version;
         let writer = writer;
-        let map_fn = map_fn.clone();
         let err_fn = err_fn.clone();
         use_memo(move || {
             let _ = version.read();
             let writer = writer.read();
             match writer.as_ref() {
-                Some(signal) => Ok(map_fn(&signal.read())),
+                Some(signal) => Ok(signal.read().project(&map_fn)),
                 None => Err(err_fn(ResourceNoneState::NotInitialized)),
             }
         })

@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::time::Duration;
 
 use bevy_app::prelude::*;
@@ -29,7 +28,7 @@ impl Plugin for ResourceDynPlugin {
 
 #[component]
 pub fn TypedCounter() -> Element {
-    let counter = use_bevy_resource::<Counter, _, _>(|n| n.value, |err| err);
+    let counter = use_bevy_resource::<Counter, _, _>(|n| &n.value, |err| err);
 
     let onclick = move |_| {
         counter.mutate(|n| n.value += 1);

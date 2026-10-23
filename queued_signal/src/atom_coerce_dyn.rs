@@ -8,13 +8,13 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
+use std::sync::Arc as StdArc;
 use std::sync::atomic::fence;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc as StdArc;
 
-use kovan::{pin, Atom, Guard};
+use kovan::{Guard, pin};
 
-use crate::atom_coerce::{Arc, ArcData, AtomCoerce, AtomCoerceHandle, CoerceShared, Value};
+use crate::atom_coerce::{Arc, ArcData, Atom, AtomCoerce, AtomCoerceHandle, CoerceShared, Value};
 
 /// Unsizes a sized pointer to a trait object view.
 ///
@@ -606,7 +606,17 @@ fn test_handle_bumps_refcount() {
     assert_eq!(AtomCoerce::strong_count(&coerce), 2);
 
     drop(holder);
-    assert_eq!(AtomCoerce::strong_count(&coerce), 1);
+    // The bound view is released through the reclaimer, so the count drops
+    // once no participant can still hold the retired node.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while AtomCoerce::strong_count(&coerce) != 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the bound view was never released"
+        );
+        kovan::flush();
+        std::thread::yield_now();
+    }
 }
 
 #[test]
@@ -680,7 +690,10 @@ fn test_try_store_boxed() {
 fn test_pointer_elevation() {
     let mut registry = TypeRegistry::new();
     registry.register::<Counter>();
-    assert_eq!(registry.type_id_of("Counter"), Some(TypeId::of::<Counter>()));
+    assert_eq!(
+        registry.type_id_of("Counter"),
+        Some(TypeId::of::<Counter>())
+    );
 
     let holder = AtomCoerceDyn::<dyn Any>::new(Counter(0));
     assert_eq!(holder.get().downcast_ref::<Counter>().unwrap().0, 0);

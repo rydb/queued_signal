@@ -9,20 +9,20 @@ pub mod path;
 pub mod query;
 pub mod resource;
 
-use std::{any::TypeId, collections::HashSet, ops::Deref, sync::Arc};
 use std::any::Any;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc as StdArc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{any::TypeId, collections::HashSet, ops::Deref, sync::Arc};
 
 use bevy_app::prelude::*;
 use bevy_ecs::reflect::{AppTypeRegistry, ReflectComponent, ReflectResource};
 use bevy_ptr::Ptr;
 use bevy_reflect::{Reflect, ReflectCloneError, ReflectFromPtr};
-use kovan::{pin, Atom, Guard};
+use kovan::{Guard, pin};
 use queued_signal::atom_coerce::{
-    Arc as QsArc, AtomCoerceHandle, CoerceShared, Value, drop_coerce_shared_alloc,
+    Arc as QsArc, Atom, AtomCoerceHandle, CoerceShared, Value, drop_coerce_shared_alloc,
 };
 use queued_signal::atom_coerce_dyn::{AtomCoerceDyn, ErasedShared};
 

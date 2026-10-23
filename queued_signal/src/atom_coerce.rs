@@ -9,7 +9,7 @@ use std::ptr::NonNull;
 use std::sync::atomic::fence;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use kovan::{pin, Atom, AtomGuard, Guard};
+use kovan::{Atomic, Guard, RetiredNode, Shared, flush, pin, retire};
 
 use crate::atom_coerce_dyn::Erase;
 
@@ -90,6 +90,156 @@ impl<T> Drop for Arc<T> {
 unsafe impl<T: Send + Sync> Send for Arc<T> {}
 unsafe impl<T: Send + Sync> Sync for Arc<T> {}
 
+/// One node published into an atom.
+///
+/// The reclamation header must stay the first field so the node can be
+/// retired through the epoch scheme.
+#[repr(C)]
+struct AtomNode<T> {
+    header: RetiredNode,
+    val: T,
+}
+
+impl<T> AtomNode<T> {
+    /// Allocates a node holding `val`.
+    fn boxed(val: T) -> *mut Self {
+        Box::into_raw(Box::new(Self {
+            header: RetiredNode::new(),
+            val,
+        }))
+    }
+
+    /// Points at the value inside a node.
+    ///
+    /// The caller must keep the node alive.
+    unsafe fn val_ptr(node: *const Self) -> *const T {
+        unsafe { std::ptr::addr_of!((*node).val) }
+    }
+}
+
+/// A borrow of the current atom value.
+///
+/// The guard pins the epoch, which keeps the node alive until it drops.
+pub struct AtomGuard<'a, T: Send + Sync + 'static> {
+    _epoch: Guard,
+    ptr: *const T,
+    marker: PhantomData<&'a T>,
+}
+
+impl<T: Send + Sync + 'static> Deref for AtomGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // SAFETY: the epoch guard keeps the node alive and ptr points into it.
+        unsafe { &*self.ptr }
+    }
+}
+
+/// Atom whose nodes are reclaimed by the epoch scheme.
+///
+/// Reads take no shared count, so a read is a pin plus one pointer load.
+/// Dropping the atom retires the current node instead of freeing it, which
+/// keeps guards that outlive the atom valid. Every node is still released
+/// once the readers pinned before its retirement have moved on.
+pub struct Atom<T: Send + Sync + 'static> {
+    root: Atomic<AtomNode<T>>,
+}
+
+impl<T: Send + Sync + 'static> Atom<T> {
+    /// Publishes a first node holding `val`.
+    pub fn new(val: T) -> Self {
+        Self {
+            root: Atomic::new(AtomNode::boxed(val)),
+        }
+    }
+
+    /// Loads the current value behind an epoch guard.
+    pub fn load(&self) -> AtomGuard<'_, T> {
+        let (epoch, ptr) = self.load_parts();
+        AtomGuard {
+            _epoch: epoch,
+            ptr,
+            marker: PhantomData,
+        }
+    }
+
+    /// Replaces the value, deferring the destruction of the old node.
+    pub fn store(&self, val: T) {
+        let epoch = pin();
+        // SAFETY: the node is a fresh allocation that is published below.
+        let new = unsafe { Shared::from_raw(AtomNode::boxed(val)) };
+        let old = self.root.swap(new, Ordering::AcqRel, &epoch);
+        Self::retire_node(old);
+    }
+
+    /// Applies a read-copy-update transformation.
+    ///
+    /// The closure may run more than once when writers contend.
+    pub fn rcu<F>(&self, mut f: F)
+    where
+        F: FnMut(&T) -> T,
+    {
+        let epoch = pin();
+        loop {
+            let current = self.root.load(Ordering::Acquire, &epoch);
+            // SAFETY: the atom always holds a live node.
+            let next_ptr = AtomNode::boxed(f(unsafe { &(*current.as_raw()).val }));
+            // SAFETY: the node is a fresh allocation that is published below.
+            let next = unsafe { Shared::from_raw(next_ptr) };
+            match self.root.compare_exchange(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                &epoch,
+            ) {
+                Ok(old) => {
+                    Self::retire_node(old);
+                    return;
+                }
+                // SAFETY: the exchange failed, so the node was never published.
+                Err(_) => unsafe { drop(Box::from_raw(next_ptr)) },
+            }
+        }
+    }
+
+    /// Pins the epoch and returns the guard with the current value pointer.
+    fn load_parts(&self) -> (Guard, *const T) {
+        let epoch = pin();
+        let node = self.root.load(Ordering::Acquire, &epoch);
+        // SAFETY: the atom always holds a published node.
+        let ptr = unsafe { AtomNode::val_ptr(node.as_raw()) };
+        (epoch, ptr)
+    }
+
+    /// Hands a replaced node to the reclaimer.
+    fn retire_node(node: Shared<'_, AtomNode<T>>) {
+        if node.is_null() {
+            return;
+        }
+        // SAFETY: the node was allocated here and is retired exactly once.
+        unsafe { retire(node.as_raw()) };
+    }
+}
+
+impl<T: Send + Sync + 'static> Drop for Atom<T> {
+    fn drop(&mut self) {
+        {
+            let epoch = pin();
+            // SAFETY: null is a valid shared pointer for an empty atom.
+            let empty = unsafe { Shared::from_raw(std::ptr::null_mut()) };
+            let old = self.root.swap(empty, Ordering::AcqRel, &epoch);
+            Self::retire_node(old);
+        }
+        // Prompt reclamation now that this thread holds no guard.
+        flush();
+    }
+}
+
+// SAFETY: nodes are shared through the epoch scheme and hold Send + Sync values.
+unsafe impl<T: Send + Sync> Send for Atom<T> {}
+unsafe impl<T: Send + Sync> Sync for Atom<T> {}
+
 /// The value stored inline in the atom node.
 pub struct Value<T: Send + Sync + 'static, D: ?Sized + 'static> {
     pub(crate) value: T,
@@ -143,25 +293,17 @@ impl<T: Send + Sync + 'static, D: ?Sized + 'static> Deref for ValueGuard<'_, T, 
 
 /// An owned read guard that dereferences to the current value.
 ///
-/// The guard pins the epoch and holds a clone of the shared allocation, so
-/// the node it points at stays valid until the guard drops.
+/// The guard pins the epoch, and the atom retires the node it points at
+/// instead of freeing it, so no shared count is taken to keep it alive.
 pub struct RcuGuard<T: Send + Sync + 'static, D: ?Sized + 'static> {
     _epoch: Guard,
     ptr: *const Value<T, D>,
-    _shared: Arc<CoerceShared<T, D>>,
 }
 
 impl<T: Send + Sync + 'static, D: ?Sized + 'static> RcuGuard<T, D> {
-    fn new(shared: Arc<CoerceShared<T, D>>) -> Self {
-        let epoch = pin();
-        let atom_guard = shared.atom.load();
-        let value: &Value<T, D> = &*atom_guard;
-        let ptr = value as *const Value<T, D>;
-        RcuGuard {
-            _epoch: epoch,
-            ptr,
-            _shared: shared,
-        }
+    fn new(shared: &Arc<CoerceShared<T, D>>) -> Self {
+        let (epoch, ptr) = shared.atom.load_parts();
+        RcuGuard { _epoch: epoch, ptr }
     }
 }
 
@@ -192,75 +334,41 @@ where
     }
 }
 
-/// Type-erased keep-alive for a typed read guard.
-pub(crate) struct TypedShared {
-    strong: NonNull<AtomicUsize>,
-    drop_alloc: unsafe fn(NonNull<()>),
-}
-
-impl TypedShared {
-    /// Adopts one strong count from a typed shared reference.
-    fn from_arc<T, D>(typed: &Arc<CoerceShared<T, D>>) -> TypedShared
-    where
-        T: Send + Sync + 'static,
-        D: ?Sized + 'static,
-    {
-        // SAFETY: the ArcData header is repr(C) with strong at offset zero.
-        let strong = unsafe { NonNull::new_unchecked(typed.as_ptr() as *mut AtomicUsize) };
-        unsafe {
-            strong.as_ref().fetch_add(1, Ordering::Relaxed);
-        }
-        TypedShared {
-            strong,
-            drop_alloc: drop_coerce_shared_alloc::<T, D>,
-        }
-    }
-}
-
-impl Clone for TypedShared {
-    fn clone(&self) -> Self {
-        // SAFETY: strong points at a live AtomicUsize for the allocation.
-        let strong = unsafe { self.strong.as_ref() };
-        if strong.fetch_add(1, Ordering::Relaxed) > usize::MAX / 2 {
-            std::process::abort();
-        }
-        TypedShared {
-            strong: self.strong,
-            drop_alloc: self.drop_alloc,
-        }
-    }
-}
-
-impl Drop for TypedShared {
-    fn drop(&mut self) {
-        // SAFETY: strong points at a live AtomicUsize for the allocation.
-        let strong = unsafe { self.strong.as_ref() };
-        if strong.fetch_sub(1, Ordering::Release) == 1 {
-            fence(Ordering::Acquire);
-            // SAFETY: this reference owns the final strong count.
-            unsafe { (self.drop_alloc)(self.strong.cast::<()>()) };
-        }
-    }
-}
-
 /// A typed read guard that dereferences directly to the value.
 pub struct RcuGuardTyped<T: Send + Sync + 'static> {
     _epoch: Guard,
     ptr: *const T,
-    _shared: TypedShared,
+}
+
+impl<T: Send + Sync + PartialEq + 'static> PartialEq for RcuGuardTyped<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.ptr == other.ptr
+    }
 }
 
 impl<T: Send + Sync + 'static> RcuGuardTyped<T> {
-    pub(crate) fn new<D: ?Sized + 'static>(shared: Arc<CoerceShared<T, D>>) -> Self {
-        let epoch = pin();
-        let atom_guard = shared.atom.load();
-        let value: &Value<T, D> = &*atom_guard;
-        let ptr = &value.value as *const T;
-        let _shared = TypedShared::from_arc(&shared);
+    pub(crate) fn new<D: ?Sized + 'static>(shared: &Arc<CoerceShared<T, D>>) -> Self {
+        let (epoch, value) = shared.atom.load_parts();
+        // SAFETY: the pin keeps the node that holds the value alive.
+        let ptr = unsafe { std::ptr::addr_of!((*value).value) };
+        RcuGuardTyped { _epoch: epoch, ptr }
+    }
+
+    /// Projects this guard onto a value inside the pinned item.
+    ///
+    /// The epoch pin moves into the projected guard, so the pointer stays valid for the guard lifetime.
+    pub(crate) fn project<U: Send + Sync + 'static>(
+        self,
+        f: impl FnOnce(&T) -> &U,
+    ) -> RcuGuardTyped<U> {
+        let RcuGuardTyped { _epoch, ptr } = self;
+        // SAFETY: the epoch guard keeps the node that holds the value alive, and
+        // the closure returns a reference derived from that pinned value.
+        let value = unsafe { &*ptr };
+        let projected: *const U = f(value);
         RcuGuardTyped {
-            _epoch: epoch,
-            ptr,
-            _shared,
+            _epoch,
+            ptr: projected,
         }
     }
 }
@@ -287,12 +395,12 @@ impl<T: Send + Sync + 'static, D: ?Sized + 'static> AtomCoerce<T, D> {
 
     /// Reads the current value through an owned guard.
     pub fn read_owned(&self) -> RcuGuard<T, D> {
-        RcuGuard::new(self.shared.clone())
+        RcuGuard::new(&self.shared)
     }
 
     /// Reads the current value through a guard that points directly at T.
     pub fn read_typed(&self) -> RcuGuardTyped<T> {
-        RcuGuardTyped::new(self.shared.clone())
+        RcuGuardTyped::new(&self.shared)
     }
 
     /// Wraps a value, using the built-in metadata for the target view.
@@ -382,12 +490,12 @@ impl<T: Send + Sync + 'static, D: ?Sized + 'static> AtomCoerceHandle<T, D> {
 
     /// Reads the current value through an owned guard.
     pub fn read_owned(&self) -> RcuGuard<T, D> {
-        RcuGuard::new(self.shared.clone())
+        RcuGuard::new(&self.shared)
     }
 
     /// Reads the current value through a guard that points directly at T.
     pub fn read_typed(&self) -> RcuGuardTyped<T> {
-        RcuGuardTyped::new(self.shared.clone())
+        RcuGuardTyped::new(&self.shared)
     }
 
     /// Views this handle under a different erased trait object.

@@ -47,17 +47,16 @@ fn spawn_asset(mut commands: Commands, mut assets: ResMut<Assets<DemoAsset>>) {
 /// Test elevating an untyped asset mirror into the typed asset mirror.
 #[component]
 pub fn AssetElevationTest() -> Element {
-    let resource =
-        use_bevy_resource::<DemoAssetHandle, _, _>(|n| n.0.id(), |err| err);
+    let resource = use_bevy_resource::<DemoAssetHandle, _, _>(|n| &n.0, |err| err);
 
     let untyped_id = use_memo(move || match resource.read() {
         Ok(guard) => Ok(guard.0.id().untyped()),
-        Err(err) => Err(AssetNoneState::Fetching),
+        Err(_err) => Err(AssetNoneState::Fetching),
     });
 
     let typed_id = use_memo(move || match resource.read() {
         Ok(guard) => Ok(guard.0.id()),
-        Err(err) => Err(AssetNoneState::Fetching),
+        Err(_err) => Err(AssetNoneState::Fetching),
     });
 
     let typed = use_bevy_asset::<DemoAsset>(typed_id);

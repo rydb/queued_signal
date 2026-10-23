@@ -1,12 +1,12 @@
 #![warn(missing_docs)]
 //! A Dioxus signal for shared, wait-free reads and queued writes across VDOMs.
 
+pub mod atom_coerce;
+pub mod atom_coerce_dyn;
+pub(crate) mod macros;
+pub mod queued_signal_dyn;
 /// High-level dioxus integration: [`QueuedSignalSender`], [`QueuedSignalHandle`],
 /// [`create_queued_signal_hub`].
 pub mod signal;
 /// Core state types: [`QueuedSignal`], [`WriterDriver`], [`HealthStatus`].
 pub mod state;
-pub mod atom_coerce;
-pub mod atom_coerce_dyn;
-pub mod queued_signal_dyn;
-pub(crate) mod macros;

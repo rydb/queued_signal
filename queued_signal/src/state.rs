@@ -1,9 +1,9 @@
-use std::any::Any;
 use dioxus::prelude::*;
 use dioxus::signals::Signal;
 use dioxus_core::Task;
 use flume::{Receiver, Sender};
 use parking_lot::Mutex;
+use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::ops::Deref;
@@ -343,38 +343,147 @@ impl<D: ?Sized + 'static> QueuedStateDyn<D> {
     }
 }
 
-/// Read guard for a QueuedSignal.
-pub struct TrackedReadGuard<T: Clone + Send + Sync + 'static> {
-    guard: RcuGuardTyped<T>,
+/// Reader registration that unregisters on drop.
+struct ReaderTicket {
     registry: Arc<ReaderRegistry>,
     reader_id: u64,
 }
 
-impl<T: Clone + Send + Sync + 'static> TrackedReadGuard<T> {
-    fn new(guard: RcuGuardTyped<T>, registry: Arc<ReaderRegistry>) -> Self {
+impl ReaderTicket {
+    fn new(registry: Arc<ReaderRegistry>) -> Self {
         let reader_id = registry.register();
         registry.heartbeat(reader_id);
         Self {
-            guard,
             registry,
             reader_id,
         }
     }
 
+    fn heartbeat(&self) {
+        self.registry.heartbeat(self.reader_id);
+    }
+}
+
+impl Drop for ReaderTicket {
+    fn drop(&mut self) {
+        self.registry.unregister(self.reader_id);
+    }
+}
+
+/// Read guard for a QueuedSignal.
+pub struct TrackedReadGuard<T: Send + Sync + 'static> {
+    guard: RcuGuardTyped<T>,
+    ticket: ReaderTicket,
+}
+
+impl<T: Send + Sync + 'static + PartialEq> PartialEq for TrackedReadGuard<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.guard == other.guard
+    }
+}
+
+impl<T: Send + Sync + 'static> TrackedReadGuard<T> {
+    fn new(guard: RcuGuardTyped<T>, registry: Arc<ReaderRegistry>) -> Self {
+        Self {
+            guard,
+            ticket: ReaderTicket::new(registry),
+        }
+    }
+
     /// Record a heartbeat, resetting this reader's stall timer.
     pub fn heartbeat(&self) {
-        self.registry.heartbeat(self.reader_id);
+        self.ticket.heartbeat();
     }
 
     /// Borrows the underlying value.
     pub fn as_ref(&self) -> &T {
         &self.guard
     }
+
+    /// Projects the guard onto a value inside the pinned item.
+    ///
+    /// The read pin moves into the projected guard, so no value is cloned and no shared count is touched.
+    pub fn project<U: Send + Sync + 'static>(
+        self,
+        f: impl FnOnce(&T) -> &U,
+    ) -> ProjectedReadGuard<U> {
+        ProjectedReadGuard {
+            source: ProjectedSource::Pinned {
+                guard: self.guard.project(f),
+                ticket: self.ticket,
+            },
+        }
+    }
 }
 
-impl<T: Clone + Send + Sync + 'static> Drop for TrackedReadGuard<T> {
-    fn drop(&mut self) {
-        self.registry.unregister(self.reader_id);
+/// Storage backing a projected read guard.
+enum ProjectedSource<U: Send + Sync + 'static> {
+    /// A projection into a pinned item.
+    Pinned {
+        guard: RcuGuardTyped<U>,
+        ticket: ReaderTicket,
+    },
+    /// An owned value with no read pin.
+    Owned(U),
+}
+
+/// Read guard projected onto a value inside the pinned item.
+///
+/// A guard may also wrap an owned value when no signal source exists yet.
+/// Equality compares the projected values, which lets consumers deduplicate updates by field.
+pub struct ProjectedReadGuard<U: Send + Sync + 'static> {
+    source: ProjectedSource<U>,
+}
+
+impl<U: Send + Sync + PartialEq + 'static> PartialEq for ProjectedReadGuard<U> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ref() == other.as_ref()
+    }
+}
+
+impl<U: Send + Sync + Eq + 'static> Eq for ProjectedReadGuard<U> {}
+
+impl<U: Send + Sync + Debug + 'static> Debug for ProjectedReadGuard<U> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ProjectedReadGuard")
+            .field(self.as_ref())
+            .finish()
+    }
+}
+
+impl<U: Send + Sync + 'static> ProjectedReadGuard<U> {
+    /// Wraps an owned value without a read pin.
+    ///
+    /// Use this when no signal source is available yet.
+    pub fn from_owned(value: U) -> Self {
+        Self {
+            source: ProjectedSource::Owned(value),
+        }
+    }
+
+    /// Record a heartbeat, resetting this reader's stall timer.
+    ///
+    /// Owned guards have no registered reader, so this does nothing.
+    pub fn heartbeat(&self) {
+        if let ProjectedSource::Pinned { ticket, .. } = &self.source {
+            ticket.heartbeat();
+        }
+    }
+
+    /// Borrows the projected value.
+    pub fn as_ref(&self) -> &U {
+        match &self.source {
+            ProjectedSource::Pinned { guard, .. } => guard,
+            ProjectedSource::Owned(value) => value,
+        }
+    }
+}
+
+impl<U: Send + Sync + 'static> Deref for ProjectedReadGuard<U> {
+    type Target = U;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
     }
 }
 
@@ -435,7 +544,10 @@ impl<T: Clone + Send + Sync + 'static> Deref for TrackedReadGuard<T> {
 /// Owns the read buffer and the channels for receiving mutations. Call
 /// [`tick`](Self::tick) regularly to drain pending operations, publish
 /// to readers, and update health.
-pub struct WriterDriver<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static = dyn Any> {
+pub struct WriterDriver<
+    T: Clone + Send + Sync + 'static + EraseMut<D>,
+    D: ?Sized + 'static = dyn Any,
+> {
     cell: AtomCoerce<T, D>,
     set_value_rx: Receiver<SetValueOp<T>>,
     set_rx: Receiver<MutationOp<T, D>>,
@@ -635,7 +747,10 @@ impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Writer
 }
 
 /// A signal providing borrow reads and queued writes.
-pub struct QueuedSignal<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static = dyn Any> {
+pub struct QueuedSignal<
+    T: Clone + Send + Sync + 'static + EraseMut<D>,
+    D: ?Sized + 'static = dyn Any,
+> {
     /// The read-side state that consumers subscribe to.
     pub state: QueuedState<T, D>,
     // keep the writer alive as long as this signal exists
@@ -954,10 +1069,7 @@ mod tests {
         let old_guard = driver.read();
         assert_eq!(*old_guard, 0);
 
-        driver
-            .set_value_tx
-            .send(SetValueOp(Arc::new(42)))
-            .unwrap();
+        driver.set_value_tx.send(SetValueOp(Arc::new(42))).unwrap();
         driver.tick(Duration::ZERO);
 
         assert_eq!(*old_guard, 0);

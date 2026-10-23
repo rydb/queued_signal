@@ -27,9 +27,9 @@ use bevy_reflect::{Reflect, ReflectFromPtr};
 use dioxus_core::{Task, use_drop};
 use dioxus_hooks::{use_context, use_future, use_memo, use_signal};
 use dioxus_signals::{Memo, ReadableExt, Signal, WritableExt};
-use kovan::{pin, Atom, Guard};
+use kovan::{Guard, pin};
 use queued_signal::atom_coerce::{
-    Arc as QsArc, AtomCoerceHandle, CoerceShared, Value, drop_coerce_shared_alloc,
+    Arc as QsArc, Atom, AtomCoerceHandle, CoerceShared, Value, drop_coerce_shared_alloc,
 };
 use queued_signal::atom_coerce_dyn::{AtomCoerceDyn, AtomCoerceDynHandle, ErasedShared};
 use queued_signal::state::{
@@ -38,8 +38,8 @@ use queued_signal::state::{
 use tokio::sync::{oneshot, watch};
 
 use crate::asset::{
-    AssetMirrorMap, AssetMirrorRequestResponse, AssetNoneState, AssetUpdateExtraInfo, DioxusAssetSync,
-    RequestBevyAssetMirror, UpdateTrackingAssets,
+    AssetMirrorMap, AssetMirrorRequestResponse, AssetNoneState, AssetUpdateExtraInfo,
+    DioxusAssetSync, RequestBevyAssetMirror, UpdateTrackingAssets,
 };
 use crate::macros::*;
 use crate::schedules::{DioxusSyncPostUpdate, DioxusSyncUpdate};
@@ -260,7 +260,8 @@ fn asset_shared_owned(value: Arc<dyn Reflect>) -> ErasedShared<dyn Reflect> {
 /// Loads an owned asset snapshot as a zero-copy reflected view.
 unsafe fn load_asset_owned(shared: &ErasedShared<dyn Reflect>) -> (*const dyn Reflect, Guard) {
     // SAFETY: data points at the live CoerceShared for the owned view.
-    let typed = unsafe { &*(shared.data().as_ptr() as *const CoerceShared<Arc<dyn Reflect>, dyn Reflect>) };
+    let typed =
+        unsafe { &*(shared.data().as_ptr() as *const CoerceShared<Arc<dyn Reflect>, dyn Reflect>) };
     let epoch = pin();
     let atom_guard = typed.atom().load();
     let value: &Value<Arc<dyn Reflect>, dyn Reflect> = &*atom_guard;
@@ -275,7 +276,8 @@ unsafe fn try_store_asset_owned(
     value: Box<dyn std::any::Any + Send + Sync>,
 ) -> Result<(), Box<dyn std::any::Any + Send + Sync>> {
     // SAFETY: data points at the live CoerceShared for the owned view.
-    let typed = unsafe { &*(shared.data().as_ptr() as *const CoerceShared<Arc<dyn Reflect>, dyn Reflect>) };
+    let typed =
+        unsafe { &*(shared.data().as_ptr() as *const CoerceShared<Arc<dyn Reflect>, dyn Reflect>) };
     match value.downcast::<Arc<dyn Reflect>>() {
         Ok(boxed) => {
             typed.atom().store(Value::new(*boxed));
@@ -315,7 +317,8 @@ unsafe fn load_asset_bound<A: DioxusAssetSync>(
 ) -> (*const dyn Reflect, Guard) {
     // SAFETY: data points at the live CoerceShared for the bound typed cell.
     let typed = unsafe {
-        &*(shared.data().as_ptr() as *const CoerceShared<Result<A, AssetNoneState>, dyn std::any::Any>)
+        &*(shared.data().as_ptr()
+            as *const CoerceShared<Result<A, AssetNoneState>, dyn std::any::Any>)
     };
     let epoch = pin();
     let atom_guard = typed.atom().load();
@@ -539,8 +542,9 @@ pub fn register_or_get_asset_dyn(
     world: &mut World,
     id: UntypedAssetId,
 ) -> Result<ReflectAssetHandles, String> {
-    let reflect_asset = reflect_asset_for(world, id.type_id())
-        .ok_or_else(|| "asset type missing ReflectAsset data, call register_asset_reflect".to_owned())?;
+    let reflect_asset = reflect_asset_for(world, id.type_id()).ok_or_else(|| {
+        "asset type missing ReflectAsset data, call register_asset_reflect".to_owned()
+    })?;
 
     let registry = world.resource::<ReflectAssetRegistry>();
     if let Some(mirror) = registry.map.get(&id) {
@@ -637,11 +641,7 @@ pub fn register_or_get_asset_dyn(
                 match reflected.read() {
                     Some(value) => {
                         if let Ok(arc) = clone_into_arc(value) {
-                            if mirror
-                                .holder
-                                .try_store_boxed(Box::new(arc))
-                                .is_ok()
-                            {
+                            if mirror.holder.try_store_boxed(Box::new(arc)).is_ok() {
                                 mirror.loaded.store(true, Ordering::Relaxed);
                                 bump_version(&mirror.version, &mirror.notify_tx);
                             }
@@ -708,12 +708,10 @@ pub fn register_typed_asset_spawner_runtime<A: DioxusAssetSync>(world: &mut Worl
             return;
         };
         let registry = registry.read();
-        registry
-            .get(TypeId::of::<A>())
-            .is_some_and(|registration| {
-                registration.data::<ReflectAsset>().is_some()
-                    && registration.data::<ReflectFromPtr>().is_some()
-            })
+        registry.get(TypeId::of::<A>()).is_some_and(|registration| {
+            registration.data::<ReflectAsset>().is_some()
+                && registration.data::<ReflectFromPtr>().is_some()
+        })
     };
     if !reflectable {
         return;
@@ -725,9 +723,11 @@ pub fn register_typed_asset_spawner_runtime<A: DioxusAssetSync>(world: &mut Worl
     }
 
     let spawner = TypedAssetSpawner {
-        spawn: Arc::new(|ctx: CommandQueueSender, id: UntypedAssetId| -> TypedSpawnFuture {
-            Box::pin(spawn_typed_asset::<A>(ctx, id))
-        }),
+        spawn: Arc::new(
+            |ctx: CommandQueueSender, id: UntypedAssetId| -> TypedSpawnFuture {
+                Box::pin(spawn_typed_asset::<A>(ctx, id))
+            },
+        ),
         despawn: Arc::new(|ctx: &CommandQueueSender, id: UntypedAssetId| {
             let mut q = CommandQueue::default();
             q.push(UpdateTrackingAssets::<A> {
@@ -867,7 +867,10 @@ impl<'w> ReflectedAsset<'w, '_> {
     /// Writes the current asset value.
     pub fn write_mut(&self) -> Option<&'w mut dyn Reflect> {
         // SAFETY: write access to Assets<A> was declared in init_access.
-        unsafe { self.reflect_asset.get_unchecked_mut(self.world, *self.asset_id) }
+        unsafe {
+            self.reflect_asset
+                .get_unchecked_mut(self.world, *self.asset_id)
+        }
     }
 }
 
@@ -1005,9 +1008,7 @@ impl ReflectAssetSignal {
 }
 
 /// Create or fetch a reflect mirror for an asset by untyped id.
-pub fn use_bevy_asset_dyn(
-    id: Memo<Result<UntypedAssetId, AssetNoneState>>,
-) -> ReflectAssetSignal {
+pub fn use_bevy_asset_dyn(id: Memo<Result<UntypedAssetId, AssetNoneState>>) -> ReflectAssetSignal {
     let ctx = use_context::<CommandQueueSender>();
 
     let version = use_signal(|| 0u64);
@@ -1016,8 +1017,7 @@ pub fn use_bevy_asset_dyn(
     let mut spawner_signal: Signal<Option<(TypedAssetSpawner, UntypedAssetId)>> =
         use_signal(|| None);
 
-    let (id_tx, id_rx) =
-        tokio::sync::mpsc::channel::<Result<UntypedAssetId, AssetNoneState>>(100);
+    let (id_tx, id_rx) = tokio::sync::mpsc::channel::<Result<UntypedAssetId, AssetNoneState>>(100);
 
     let id_tx = use_signal(|| Some(id_tx));
 

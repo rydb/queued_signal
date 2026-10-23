@@ -58,7 +58,7 @@ impl DioxusTestPlugin for ResourceTestsPlugin {
 /// Bevy resource and dioxus sync test.
 #[component]
 pub fn CounterResource() -> Element {
-    let counter = use_bevy_resource::<Counter, _, _>(|n| n.value, |err| err);
+    let counter = use_bevy_resource::<Counter, _, _>(|n| &n.value, |err| err);
 
     let onclick = move |_| {
         counter.mutate(|c| c.value += 10);

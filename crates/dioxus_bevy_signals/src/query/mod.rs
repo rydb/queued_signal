@@ -1007,13 +1007,18 @@ pub struct MirrorQuerySignalHandle<Q: MirrorQueryData + 'static, F: QueryFilter 
     _filter: PhantomData<F>,
 }
 
-impl<Q: MirrorQueryData + 'static, F: QueryFilter + 'static> Clone for MirrorQuerySignalHandle<Q, F> {
+impl<Q: MirrorQueryData + 'static, F: QueryFilter + 'static> Clone
+    for MirrorQuerySignalHandle<Q, F>
+{
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<Q: MirrorQueryData + 'static, F: QueryFilter + 'static> Copy for MirrorQuerySignalHandle<Q, F> {}
+impl<Q: MirrorQueryData + 'static, F: QueryFilter + 'static> Copy
+    for MirrorQuerySignalHandle<Q, F>
+{
+}
 
 /// Iterator over mirrored query results.
 pub struct MirrorQueryIter<Q: MirrorQueryData, F: QueryFilter> {

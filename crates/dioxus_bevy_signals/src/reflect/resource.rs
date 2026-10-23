@@ -1,7 +1,7 @@
 //! Reflect-driven resource mirroring.
 
-use std::{any::TypeId, collections::HashMap, ptr::NonNull, sync::Arc};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::{any::TypeId, collections::HashMap, ptr::NonNull, sync::Arc};
 
 use bevy_ecs::component::ComponentId;
 use bevy_ecs::prelude::*;
@@ -13,7 +13,7 @@ use bevy_ecs::system::{
 };
 use bevy_ecs::world::{CommandQueue, FilteredResources, FilteredResourcesMut};
 use bevy_reflect::{Reflect, ReflectFromPtr};
-use dioxus_core::{spawn, Task};
+use dioxus_core::{Task, spawn};
 use dioxus_hooks::{use_context, use_future, use_signal};
 use dioxus_signals::{ReadableExt, Signal, WritableExt};
 use queued_signal::atom_coerce_dyn::AtomCoerceDyn;
@@ -386,7 +386,12 @@ pub fn register_or_get_resource_dyn(
     let version = Arc::new(AtomicU64::new(0));
     let (notify_tx, notify_rx) = watch::channel(0u64);
 
-    let handle = reflect_signal_handle(holder.clone(), version.clone(), notify_tx.clone(), notify_rx);
+    let handle = reflect_signal_handle(
+        holder.clone(),
+        version.clone(),
+        notify_tx.clone(),
+        notify_rx,
+    );
     let (handle_tx, handle_rx) = watch::channel(handle.clone());
 
     let mirror = ReflectResourceMirror {
@@ -423,13 +428,10 @@ pub fn register_or_get_resource_dyn(
                 // SAFETY: ptr holds the type mirrored by reflect_from_ptr.
                 let value = unsafe { mirror.reflect_from_ptr.as_reflect(ptr) };
                 if let Ok(arc) = clone_into_arc(value)
-                    && mirror
-                        .holder
-                        .try_store_boxed(Box::new(arc))
-                        .is_ok()
-                    {
-                        bump_version(&mirror.version, &mirror.notify_tx);
-                    }
+                    && mirror.holder.try_store_boxed(Box::new(arc)).is_ok()
+                {
+                    bump_version(&mirror.version, &mirror.notify_tx);
+                }
             },
         );
 

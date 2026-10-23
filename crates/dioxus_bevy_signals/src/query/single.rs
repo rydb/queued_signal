@@ -80,13 +80,18 @@ pub struct MirrorQuerySingleHandle<Q: MirrorQueryData + 'static, F: QueryFilter 
     _filter: PhantomData<F>,
 }
 
-impl<Q: MirrorQueryData + 'static, F: QueryFilter + 'static> Clone for MirrorQuerySingleHandle<Q, F> {
+impl<Q: MirrorQueryData + 'static, F: QueryFilter + 'static> Clone
+    for MirrorQuerySingleHandle<Q, F>
+{
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<Q: MirrorQueryData + 'static, F: QueryFilter + 'static> Copy for MirrorQuerySingleHandle<Q, F> {}
+impl<Q: MirrorQueryData + 'static, F: QueryFilter + 'static> Copy
+    for MirrorQuerySingleHandle<Q, F>
+{
+}
 
 impl<Q: MirrorQueryData + 'static, F: QueryFilter + 'static> MirrorQuerySingleHandle<Q, F> {
     /// Aquires a read guard on the inner read value of the signal

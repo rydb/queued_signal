@@ -89,10 +89,8 @@ where
     let _ = ctx.add_tx.send(MutationOp::Untyped(f));
 }
 
-unsafe fn mutate_set_typed<T, D>(
-    write: &ErasedQueuedWrite<D>,
-    f: Arc<dyn Fn(&mut D) + Send + Sync>,
-) where
+unsafe fn mutate_set_typed<T, D>(write: &ErasedQueuedWrite<D>, f: Arc<dyn Fn(&mut D) + Send + Sync>)
+where
     T: Clone + Send + Sync + 'static + EraseMut<D>,
     D: ?Sized + 'static,
 {
