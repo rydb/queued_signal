@@ -598,6 +598,7 @@ pub struct ErasedTypedReadGuard {
     pub ptr: NonNull<u8>,
 }
 
+/// Query data whose items are mirrored into dioxus signals.
 pub trait MirrorQueryData: QueryData + IterQueryData {
     /// Mirrored query item type.
     ///
@@ -1097,7 +1098,7 @@ pub fn use_bevy_query<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>()
         let _ = r.tx.send(queue);
     });
 
-    let mut version: Signal<u64> = use_signal(|| 0);
+    let version: Signal<u64> = use_signal(|| 0);
     let health_signal = use_signal(|| HealthStatus::Healthy);
     let mut writer: Signal<Option<QueuedSignal<MirrorQuery<Q, F>>>> = use_signal(|| None);
 

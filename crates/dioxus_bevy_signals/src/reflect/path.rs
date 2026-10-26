@@ -139,8 +139,7 @@ pub fn collect_primitive_leaves(
         let children: Vec<(ReflectPath, &dyn Reflect)> = match current.reflect_ref() {
             ReflectRef::Struct(s) => s
                 .iter_fields()
-                .enumerate()
-                .filter_map(|(_idx, (name, field))| {
+                .filter_map(|(name, field)| {
                     let field = field.try_as_reflect()?;
                     Some((path.field(name), field))
                 })

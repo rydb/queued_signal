@@ -12,7 +12,8 @@ bevy_reflection_tests = {path = "./bevy_reflection_tests", default-features = fa
 queued_signal = {workspace = true}
 
 [dev-dependencies]
-dioxus-native = {workspace = true, features = ["system-fonts", "shell", "vello-hybrid"]}
+# dioxus-native = {workspace = true, features = ["system-fonts", "shell", "vello-hybrid"]}
+dioxus-native = {workspace = true, features = ["system-fonts", "vello-hybrid"]}
 dioxus = {workspace = true, features = ["asset", "desktop", "launch", "devtools", "document", "html"]}
 dioxus-history = {workspace = true}
 dioxus-document = {workspace = true}

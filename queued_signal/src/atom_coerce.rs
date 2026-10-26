@@ -318,6 +318,10 @@ impl<T: Send + Sync + 'static, D: ?Sized + 'static> Deref for RcuGuard<T, D> {
 }
 
 /// Drops the CoerceShared and frees its ArcData allocation.
+///
+/// # Safety
+/// The caller must own the final strong count of the allocation and `header`
+/// must point at the data of an `ArcData` produced by `Arc::new`.
 pub unsafe fn drop_coerce_shared_alloc<T, D>(header: NonNull<()>)
 where
     T: Send + Sync + 'static,

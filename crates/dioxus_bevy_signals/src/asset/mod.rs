@@ -5,7 +5,6 @@
 //! cleanup of unused mirrors.
 
 use std::{
-    any::type_name,
     collections::{HashMap, HashSet},
     marker::PhantomData,
     sync::Arc,
@@ -163,7 +162,7 @@ pub fn init_requested_asset_mirrors<A: DioxusAssetSync>(
         let Some(entry) = mirrors.assets.get_mut(&id) else {
             error!(
                 "how was an asset requested, but not have its uninitialized value exist in the assets list? {}",
-                type_name::<A>()
+                std::any::type_name::<A>()
             );
             continue;
         };
@@ -178,7 +177,7 @@ pub fn init_requested_asset_mirrors<A: DioxusAssetSync>(
                         None => {
                             error!(
                                 "how was this asset marked as loaded without Assets<A> holding the asset? {}",
-                                type_name::<A>()
+                                std::any::type_name::<A>()
                             );
                             Err(AssetNoneState::Error(
                                 "asset marked as loaded, but Assets<A> didn't have the asset"
@@ -265,7 +264,7 @@ pub fn sync_assets_to_mirrors<A: DioxusAssetSync>(
         let state = handle.state.read();
 
         if let Ok(mirror) = state.as_ref() {
-            trace!("syncing asset {:#?} to mirror", type_name::<A>());
+            trace!("syncing asset {:#?} to mirror", std::any::type_name::<A>());
             *asset = mirror.clone();
         }
     }
@@ -280,7 +279,7 @@ pub fn collect_changed_ids<A: DioxusAssetSync>(
         trace!(
             "id {} marked as changed for asset type {:#?}",
             id,
-            type_name::<A>()
+            std::any::type_name::<A>()
         );
         changed.0.insert(id);
     }
@@ -428,7 +427,10 @@ impl<A: DioxusAssetSync> Command for RequestBevyAssetMirror<A> {
             crate::reflect::asset::notify_typed_asset_mirror::<A>(world, self.asset_id);
         }
 
-        trace!("sending back signal response for {}", type_name::<A>());
+        trace!(
+            "sending back signal response for {}",
+            std::any::type_name::<A>()
+        );
         let _ = self.response_tx.send(AssetMirrorRequestResponse {
             asset_state,
             extra_info,

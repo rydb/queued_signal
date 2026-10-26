@@ -19,14 +19,14 @@ use crate::macros::warn;
 /// Health status of QueuedSignal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HealthStatus {
-    /// All readers release their snapshots within the watchdog timeout.
+    /// All registered readers accessed their snapshots within the watchdog timeout.
     Healthy,
-    /// One reader has held a snapshot beyond the watchdog timeout.
+    /// One reader stopped accessing its snapshot beyond the watchdog timeout.
     Degraded {
         /// Number of pinned snapshots.
         pinned_buffers: usize,
     },
-    /// Two or more readers have held snapshots too long.
+    /// Two or more readers stopped accessing their snapshots beyond the watchdog timeout.
     Stalled {
         /// Number of pinned snapshots.
         pinned_buffers: usize,
@@ -50,7 +50,8 @@ impl Display for HealthStatus {
 /// Registry tracking active read guards for snapshot pin detection.
 #[derive(Debug)]
 pub struct ReaderRegistry {
-    readers: Mutex<HashMap<u64, Instant>>,
+    readers: Mutex<HashMap<u64, u64>>,
+    epoch: Instant,
     next_id: AtomicU64,
 }
 
@@ -58,16 +59,23 @@ impl Default for ReaderRegistry {
     fn default() -> Self {
         Self {
             readers: Mutex::new(HashMap::new()),
+            epoch: Instant::now(),
             next_id: AtomicU64::new(1),
         }
     }
 }
 
 impl ReaderRegistry {
+    /// Nanoseconds elapsed since the registry epoch.
+    pub(crate) fn now_nanos(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+
     /// Register a new reader and return its unique ID.
     pub fn register(&self) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.readers.lock().insert(id, Instant::now());
+        let now = self.now_nanos();
+        self.readers.lock().insert(id, now);
         id
     }
 
@@ -78,19 +86,21 @@ impl ReaderRegistry {
 
     /// Record a heartbeat for the given reader, resetting its stall timer.
     pub fn heartbeat(&self, id: u64) {
+        let now = self.now_nanos();
         if let Some(last_seen) = self.readers.lock().get_mut(&id) {
-            *last_seen = Instant::now();
+            *last_seen = now;
         }
     }
 
     /// Return IDs of all readers whose last heartbeat exceeds `timeout`.
     pub fn check_stalled(&self, timeout: Duration) -> Vec<u64> {
-        let now = Instant::now();
+        let now = self.now_nanos();
+        let timeout_nanos = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
         self.readers
             .lock()
             .iter()
             .filter_map(|(&id, &last_seen)| {
-                if now.duration_since(last_seen) > timeout {
+                if now.saturating_sub(last_seen) > timeout_nanos {
                     Some(id)
                 } else {
                     None
@@ -171,6 +181,15 @@ impl<T: Clone + Send + Sync + 'static, D: ?Sized + 'static> QueuedState<T, D> {
     pub fn read(&self) -> TrackedReadGuard<T> {
         let guard = self.cell.read_typed();
         TrackedReadGuard::new(guard, self.registry.clone())
+    }
+
+    /// Projects the current value without registering a reader.
+    pub fn read_cached<U, F>(&self, f: F) -> ProjectedReadGuard<U>
+    where
+        U: Send + Sync + 'static,
+        F: FnOnce(&T) -> &U,
+    {
+        ProjectedReadGuard::from_pinned(self.cell.read_typed().project(f))
     }
 
     /// The typed cell viewed through the erased trait object.
@@ -343,24 +362,40 @@ impl<D: ?Sized + 'static> QueuedStateDyn<D> {
     }
 }
 
+/// Minimum spacing between implicit heartbeats, in nanoseconds.
+const TOUCH_INTERVAL_NANOS: u64 = 10_000_000;
+
 /// Reader registration that unregisters on drop.
 struct ReaderTicket {
     registry: Arc<ReaderRegistry>,
     reader_id: u64,
+    last_touch: AtomicU64,
 }
 
 impl ReaderTicket {
     fn new(registry: Arc<ReaderRegistry>) -> Self {
         let reader_id = registry.register();
-        registry.heartbeat(reader_id);
+        let now = registry.now_nanos();
         Self {
             registry,
             reader_id,
+            last_touch: AtomicU64::new(now),
         }
     }
 
     fn heartbeat(&self) {
+        let now = self.registry.now_nanos();
+        self.last_touch.store(now, Ordering::Relaxed);
         self.registry.heartbeat(self.reader_id);
+    }
+
+    /// Refreshes the stall timer when the reader accesses its snapshot.
+    fn touch(&self) {
+        let now = self.registry.now_nanos();
+        if now.saturating_sub(self.last_touch.load(Ordering::Relaxed)) < TOUCH_INTERVAL_NANOS {
+            return;
+        }
+        self.heartbeat();
     }
 }
 
@@ -395,11 +430,6 @@ impl<T: Send + Sync + 'static> TrackedReadGuard<T> {
         self.ticket.heartbeat();
     }
 
-    /// Borrows the underlying value.
-    pub fn as_ref(&self) -> &T {
-        &self.guard
-    }
-
     /// Projects the guard onto a value inside the pinned item.
     ///
     /// The read pin moves into the projected guard, so no value is cloned and no shared count is touched.
@@ -410,7 +440,7 @@ impl<T: Send + Sync + 'static> TrackedReadGuard<T> {
         ProjectedReadGuard {
             source: ProjectedSource::Pinned {
                 guard: self.guard.project(f),
-                ticket: self.ticket,
+                ticket: Some(self.ticket),
             },
         }
     }
@@ -418,10 +448,10 @@ impl<T: Send + Sync + 'static> TrackedReadGuard<T> {
 
 /// Storage backing a projected read guard.
 enum ProjectedSource<U: Send + Sync + 'static> {
-    /// A projection into a pinned item.
+    /// A projection into a pinned item, tracked when a reader ticket is present.
     Pinned {
         guard: RcuGuardTyped<U>,
-        ticket: ReaderTicket,
+        ticket: Option<ReaderTicket>,
     },
     /// An owned value with no read pin.
     Owned(U),
@@ -461,20 +491,24 @@ impl<U: Send + Sync + 'static> ProjectedReadGuard<U> {
         }
     }
 
-    /// Record a heartbeat, resetting this reader's stall timer.
-    ///
-    /// Owned guards have no registered reader, so this does nothing.
-    pub fn heartbeat(&self) {
-        if let ProjectedSource::Pinned { ticket, .. } = &self.source {
-            ticket.heartbeat();
+    /// Wraps a pinned projection that registers no reader.
+    pub fn from_pinned(guard: RcuGuardTyped<U>) -> Self {
+        Self {
+            source: ProjectedSource::Pinned {
+                guard,
+                ticket: None,
+            },
         }
     }
 
-    /// Borrows the projected value.
-    pub fn as_ref(&self) -> &U {
-        match &self.source {
-            ProjectedSource::Pinned { guard, .. } => guard,
-            ProjectedSource::Owned(value) => value,
+    /// Records a heartbeat for a tracked guard.
+    pub fn heartbeat(&self) {
+        if let ProjectedSource::Pinned {
+            ticket: Some(ticket),
+            ..
+        } = &self.source
+        {
+            ticket.heartbeat();
         }
     }
 }
@@ -490,36 +524,21 @@ impl<U: Send + Sync + 'static> Deref for ProjectedReadGuard<U> {
 /// Read guard for an erased view over a queued signal.
 pub struct TrackedReadGuardDyn<D: ?Sized + 'static> {
     guard: AtomCoerceDynSlotGuard<D>,
-    registry: Arc<ReaderRegistry>,
-    reader_id: u64,
+    ticket: ReaderTicket,
 }
 
 impl<D: ?Sized + 'static> TrackedReadGuardDyn<D> {
     /// Wraps an erased slot guard with reader tracking.
     pub fn new(guard: AtomCoerceDynSlotGuard<D>, registry: Arc<ReaderRegistry>) -> Self {
-        let reader_id = registry.register();
-        registry.heartbeat(reader_id);
         Self {
             guard,
-            registry,
-            reader_id,
+            ticket: ReaderTicket::new(registry),
         }
     }
 
-    /// Record a heartbeat, resetting this reader's stall timer.
+    /// Records a heartbeat for this reader.
     pub fn heartbeat(&self) {
-        self.registry.heartbeat(self.reader_id);
-    }
-
-    /// Borrows the erased value.
-    pub fn as_ref(&self) -> &D {
-        self.guard.as_dyn()
-    }
-}
-
-impl<D: ?Sized + 'static> Drop for TrackedReadGuardDyn<D> {
-    fn drop(&mut self) {
-        self.registry.unregister(self.reader_id);
+        self.ticket.heartbeat();
     }
 }
 
@@ -527,7 +546,7 @@ impl<D: ?Sized + 'static> Deref for TrackedReadGuardDyn<D> {
     type Target = D;
 
     fn deref(&self) -> &Self::Target {
-        self.guard.as_dyn()
+        self.as_ref()
     }
 }
 
@@ -535,9 +554,47 @@ impl<T: Clone + Send + Sync + 'static> Deref for TrackedReadGuard<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
+
+impl<T: Send + Sync + 'static> AsRef<T> for TrackedReadGuard<T> {
+    /// Borrows the underlying value, refreshing the stall timer.
+    fn as_ref(&self) -> &T {
+        self.ticket.touch();
         &self.guard
     }
 }
+
+impl<U: Send + Sync + 'static> AsRef<U> for ProjectedReadGuard<U> {
+    /// Borrows the projected value, refreshing the stall timer.
+    fn as_ref(&self) -> &U {
+        match &self.source {
+            ProjectedSource::Pinned { guard, ticket } => {
+                if let Some(ticket) = ticket {
+                    ticket.touch();
+                }
+                guard
+            }
+            ProjectedSource::Owned(value) => value,
+        }
+    }
+}
+
+impl<D: ?Sized + 'static> AsRef<D> for TrackedReadGuardDyn<D> {
+    /// Borrows the erased value, refreshing the stall timer.
+    fn as_ref(&self) -> &D {
+        self.ticket.touch();
+        self.guard.as_dyn()
+    }
+}
+
+/// Pending operations returned by a driver drain.
+pub type DrainedOps<T, D> = (
+    Vec<SetValueOp<T>>,
+    Vec<MutationOp<T, D>>,
+    Vec<MutationOp<T, D>>,
+);
 
 /// Driver for managing reads and writes for a QueuedSignal.
 ///
@@ -637,13 +694,7 @@ impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Writer
     }
 
     /// Drains all channels and returns the pending operations.
-    pub fn drain_ops(
-        &mut self,
-    ) -> (
-        Vec<SetValueOp<T>>,
-        Vec<MutationOp<T, D>>,
-        Vec<MutationOp<T, D>>,
-    ) {
+    pub fn drain_ops(&mut self) -> DrainedOps<T, D> {
         let set_values = self.set_value_rx.drain().collect();
         let sets = self.set_rx.drain().collect();
         let adds = self.add_rx.drain().collect();
@@ -818,6 +869,15 @@ impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Queued
     /// Acquire a tracked read guard for the current value.
     pub fn read(&self) -> TrackedReadGuard<T> {
         self.state.read()
+    }
+
+    /// Projects the current value without registering a reader.
+    pub fn read_cached<U, F>(&self, f: F) -> ProjectedReadGuard<U>
+    where
+        U: Send + Sync + 'static,
+        F: FnOnce(&T) -> &U,
+    {
+        self.state.read_cached(f)
     }
 
     /// Clone of the relative mutation sender.
@@ -1000,7 +1060,7 @@ mod tests {
 
         driver.tick(Duration::ZERO);
 
-        let val = driver.queued_state.read().clone();
+        let val = *driver.queued_state.read();
         assert_eq!(val, 53i32);
     }
 
@@ -1012,7 +1072,7 @@ mod tests {
 
         driver.tick(Duration::ZERO);
 
-        let val = driver.queued_state.read().clone();
+        let val = *driver.queued_state.read();
         assert_eq!(val, 99i32);
     }
 
@@ -1031,7 +1091,7 @@ mod tests {
 
         driver.tick(Duration::ZERO);
 
-        let val = driver.queued_state.read().clone();
+        let val = *driver.queued_state.read();
         assert_eq!(val, 11i32);
     }
 
@@ -1073,7 +1133,7 @@ mod tests {
         driver.tick(Duration::ZERO);
 
         assert_eq!(*old_guard, 0);
-        let val = driver.queued_state.read().clone();
+        let val = *driver.queued_state.read();
         assert_eq!(val, 42);
     }
 

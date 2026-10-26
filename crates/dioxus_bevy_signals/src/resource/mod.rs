@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 use queued_signal::state::{
     HealthStatus, ProjectedReadGuard, QueuedSignal, TrackedReadGuard, WriterDriver,
 };
-use std::any::{TypeId, type_name};
+use std::any::TypeId;
 use std::collections::HashSet;
 use std::fmt::Display;
 use std::sync::Arc;
@@ -81,7 +81,7 @@ impl<T: ResourceDioxusSync> Command for RequestBevyResource<T> {
                 let Some(resource) = world.get_resource::<T>().cloned() else {
                     warn!(
                         "Cannot initialize dioxus-bevy sync for {} as this resource does not exist at the time of this sync request.",
-                        type_name::<T>()
+                        std::any::type_name::<T>()
                     );
                     return;
                 };
@@ -163,6 +163,7 @@ fn sync_resource<T: ResourceDioxusSync>(
 }
 
 trait_set! {
+    /// Bounds required for mirrored resource values.
     pub trait UBounds = Send + Sync + PartialEq + 'static
 }
 
@@ -311,14 +312,13 @@ where
     let mut writer: Signal<Option<QueuedSignal<T>>> = use_signal(|| None);
 
     let display = {
-        let version = version;
-        let writer = writer;
         let err_fn = err_fn.clone();
         use_memo(move || {
             let _ = version.read();
             let writer = writer.read();
             match writer.as_ref() {
-                Some(signal) => Ok(signal.read().project(&map_fn)),
+                // The memo value outlives the read, so it pins without registering a reader.
+                Some(signal) => Ok(signal.read_cached(&map_fn)),
                 None => Err(err_fn(ResourceNoneState::NotInitialized)),
             }
         })

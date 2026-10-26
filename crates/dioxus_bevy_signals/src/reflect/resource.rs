@@ -3,15 +3,18 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{any::TypeId, collections::HashMap, ptr::NonNull, sync::Arc};
 
+use bevy_ecs::change_detection::{MutUntyped, Tick};
 use bevy_ecs::component::ComponentId;
 use bevy_ecs::prelude::*;
 use bevy_ecs::ptr::{Ptr, PtrMut};
+use bevy_ecs::query::FilteredAccess;
 use bevy_ecs::reflect::AppTypeRegistry;
 use bevy_ecs::system::{
-    FilteredResourcesMutParamBuilder, FilteredResourcesParamBuilder, ParamBuilder,
-    SystemParamBuilder,
+    ParamBuilder, SystemAccess, SystemMeta, SystemParam, SystemParamBuilder,
+    SystemParamValidationError,
 };
-use bevy_ecs::world::{CommandQueue, FilteredResources, FilteredResourcesMut};
+use bevy_ecs::world::CommandQueue;
+use bevy_ecs::world::unsafe_world_cell::UnsafeWorldCell;
 use bevy_reflect::{Reflect, ReflectFromPtr};
 use dioxus_core::{Task, spawn};
 use dioxus_hooks::{use_context, use_future, use_signal};
@@ -41,6 +44,13 @@ pub enum ReflectResourceNoneState {
     CloneError(String),
 }
 
+/// Forwards a reflected value and health into dioxus signals.
+pub type ReflectForwardToFn = Arc<
+    dyn Fn(Signal<Result<Arc<dyn Reflect>, ReflectResourceNoneState>>, Signal<HealthStatus>) -> Task
+        + Send
+        + Sync,
+>;
+
 /// Type-erased handle to the currently active resource signal.
 #[derive(Clone)]
 pub struct ResourceSignalHandle {
@@ -53,14 +63,7 @@ pub struct ResourceSignalHandle {
     /// Read the current value as a reflected value.
     read_reflect: Arc<dyn Fn() -> Option<Arc<dyn Reflect>> + Send + Sync>,
     /// Forward value and health into dioxus signals, returning the forward task.
-    forward_to: Arc<
-        dyn Fn(
-                Signal<Result<Arc<dyn Reflect>, ReflectResourceNoneState>>,
-                Signal<HealthStatus>,
-            ) -> Task
-            + Send
-            + Sync,
-    >,
+    forward_to: ReflectForwardToFn,
 }
 
 impl ResourceSignalHandle {
@@ -239,10 +242,10 @@ fn typed_signal_handle<T: ResourceDioxusSync>(
     let mutate = Arc::new(move |f: ErasedMutation| {
         let rfp = rfp.clone();
         s.mutate(move |value: &mut T| {
-            let raw = std::ptr::from_mut(value).cast::<u8>() as *mut u8;
+            let raw = std::ptr::from_mut(value).cast::<u8>();
             // SAFETY: value is a live T and rfp mirrors T.
             let ptr = unsafe { PtrMut::new(NonNull::new_unchecked(raw)) };
-            let reflect = unsafe { rfp.as_reflect_mut(ptr) };
+            let reflect = unsafe { rfp.ptr_as_reflect_mut(ptr) };
             f(reflect);
         });
     });
@@ -252,10 +255,10 @@ fn typed_signal_handle<T: ResourceDioxusSync>(
     let mutate_set = Arc::new(move |f: ErasedMutation| {
         let rfp = rfp.clone();
         s.mutate_set(move |value: &mut T| {
-            let raw = std::ptr::from_mut(value).cast::<u8>() as *mut u8;
+            let raw = std::ptr::from_mut(value).cast::<u8>();
             // SAFETY: value is a live T and rfp mirrors T.
             let ptr = unsafe { PtrMut::new(NonNull::new_unchecked(raw)) };
-            let reflect = unsafe { rfp.as_reflect_mut(ptr) };
+            let reflect = unsafe { rfp.ptr_as_reflect_mut(ptr) };
             f(reflect);
         });
     });
@@ -265,12 +268,12 @@ fn typed_signal_handle<T: ResourceDioxusSync>(
     let set_value = Arc::new(move |value: Arc<dyn Reflect>| {
         let rfp = rfp.clone();
         s.mutate_set(move |typed: &mut T| {
-            let raw = std::ptr::from_mut(typed).cast::<u8>() as *mut u8;
+            let raw = std::ptr::from_mut(typed).cast::<u8>();
             // SAFETY: typed is a live T and rfp mirrors T.
             let ptr = unsafe { PtrMut::new(NonNull::new_unchecked(raw)) };
-            let reflect = unsafe { rfp.as_reflect_mut(ptr) };
-            if let Err(err) = reflect.try_apply(value.as_ref()) {
-                error!("reflect apply failed: {}", err);
+            let reflect = unsafe { rfp.ptr_as_reflect_mut(ptr) };
+            if let Err(_err) = reflect.try_apply(value.as_ref()) {
+                error!("reflect apply failed: {}", _err);
             }
         });
     });
@@ -283,7 +286,7 @@ fn typed_signal_handle<T: ResourceDioxusSync>(
         let raw = std::ptr::from_ref(value).cast::<u8>() as *mut u8;
         // SAFETY: value is a live T and rfp mirrors T.
         let ptr = unsafe { Ptr::new(NonNull::new_unchecked(raw)) };
-        let reflect = unsafe { rfp.as_reflect(ptr) };
+        let reflect = unsafe { rfp.ptr_as_reflect(ptr) };
         clone_into_arc(reflect).ok()
     });
 
@@ -295,7 +298,7 @@ fn typed_signal_handle<T: ResourceDioxusSync>(
             let raw = std::ptr::from_ref(arc_t.as_ref()).cast::<u8>() as *mut u8;
             // SAFETY: arc_t is live and rfp mirrors T.
             let ptr = unsafe { Ptr::new(NonNull::new_unchecked(raw)) };
-            let reflect = unsafe { rfp.as_reflect(ptr) };
+            let reflect = unsafe { rfp.ptr_as_reflect(ptr) };
             match clone_into_arc(reflect) {
                 Ok(arc) => Ok(arc),
                 Err(err) => Err(ReflectResourceNoneState::CloneError(err.to_string())),
@@ -309,6 +312,152 @@ fn typed_signal_handle<T: ResourceDioxusSync>(
         set_value,
         read_reflect,
         forward_to,
+    }
+}
+
+/// System parameter granting read access to one reflected resource.
+pub struct ReflectedResourceRead<'w, 's> {
+    world: UnsafeWorldCell<'w>,
+    component_id: &'s ComponentId,
+}
+
+impl<'w> ReflectedResourceRead<'w, '_> {
+    /// Reads the resource pointer when the resource currently exists.
+    pub fn get_by_id(&self) -> Option<Ptr<'w>> {
+        // SAFETY: read access to component_id was declared in init_access.
+        unsafe { self.world.get_resource_by_id(*self.component_id) }
+    }
+}
+
+// SAFETY: init_access declares read access to exactly the stored ComponentId, and
+// get_param only reads that resource through UnsafeWorldCell.
+unsafe impl SystemParam for ReflectedResourceRead<'_, '_> {
+    type State = Option<ComponentId>;
+    type Item<'w, 's> = ReflectedResourceRead<'w, 's>;
+
+    fn init_state(_world: &mut World) -> Self::State {
+        None
+    }
+
+    fn init_access(
+        component_id: &Self::State,
+        system_meta: &mut SystemMeta,
+        system_access: &mut SystemAccess,
+        _world: &mut World,
+    ) {
+        let Some(component_id) = *component_id else {
+            return;
+        };
+        let mut filtered = FilteredAccess::default();
+        filtered.add_read(component_id);
+        system_access
+            .require_shared_access::<Self>(system_meta)
+            .add(filtered);
+    }
+
+    unsafe fn get_param<'w, 's>(
+        component_id: &'s mut Self::State,
+        _system_meta: &SystemMeta,
+        world: UnsafeWorldCell<'w>,
+        _change_tick: Tick,
+    ) -> Result<Self::Item<'w, 's>, SystemParamValidationError> {
+        let Some(component_id) = component_id.as_ref() else {
+            return Err(SystemParamValidationError::skipped::<Self>(
+                "missing resource ComponentId",
+            ));
+        };
+        Ok(ReflectedResourceRead {
+            world,
+            component_id,
+        })
+    }
+}
+
+/// Builder producing [`ReflectedResourceRead`] state for one resource.
+pub struct ReflectedResourceReadBuilder {
+    /// ComponentId of the resource to read.
+    pub component_id: ComponentId,
+}
+
+// SAFETY: build produces a state that matches the access declared in init_access.
+unsafe impl<'w, 's> SystemParamBuilder<ReflectedResourceRead<'w, 's>>
+    for ReflectedResourceReadBuilder
+{
+    fn build(self, _world: &mut World) -> Option<ComponentId> {
+        Some(self.component_id)
+    }
+}
+
+/// System parameter granting write access to one reflected resource.
+pub struct ReflectedResourceWrite<'w, 's> {
+    world: UnsafeWorldCell<'w>,
+    component_id: &'s ComponentId,
+}
+
+impl ReflectedResourceWrite<'_, '_> {
+    /// Writes the resource pointer when the resource currently exists.
+    pub fn get_mut_by_id(&mut self) -> Option<MutUntyped<'_>> {
+        // SAFETY: write access to component_id was declared in init_access.
+        unsafe { self.world.get_resource_mut_by_id(*self.component_id) }
+    }
+}
+
+// SAFETY: init_access declares write access to exactly the stored ComponentId, and
+// get_param only writes that resource through UnsafeWorldCell.
+unsafe impl SystemParam for ReflectedResourceWrite<'_, '_> {
+    type State = Option<ComponentId>;
+    type Item<'w, 's> = ReflectedResourceWrite<'w, 's>;
+
+    fn init_state(_world: &mut World) -> Self::State {
+        None
+    }
+
+    fn init_access(
+        component_id: &Self::State,
+        system_meta: &mut SystemMeta,
+        system_access: &mut SystemAccess,
+        _world: &mut World,
+    ) {
+        let Some(component_id) = *component_id else {
+            return;
+        };
+        let mut filtered = FilteredAccess::default();
+        filtered.add_write(component_id);
+        system_access
+            .require_shared_access::<Self>(system_meta)
+            .add(filtered);
+    }
+
+    unsafe fn get_param<'w, 's>(
+        component_id: &'s mut Self::State,
+        _system_meta: &SystemMeta,
+        world: UnsafeWorldCell<'w>,
+        _change_tick: Tick,
+    ) -> Result<Self::Item<'w, 's>, SystemParamValidationError> {
+        let Some(component_id) = component_id.as_ref() else {
+            return Err(SystemParamValidationError::skipped::<Self>(
+                "missing resource ComponentId",
+            ));
+        };
+        Ok(ReflectedResourceWrite {
+            world,
+            component_id,
+        })
+    }
+}
+
+/// Builder producing [`ReflectedResourceWrite`] state for one resource.
+pub struct ReflectedResourceWriteBuilder {
+    /// ComponentId of the resource to write.
+    pub component_id: ComponentId,
+}
+
+// SAFETY: build produces a state that matches the access declared in init_access.
+unsafe impl<'w, 's> SystemParamBuilder<ReflectedResourceWrite<'w, 's>>
+    for ReflectedResourceWriteBuilder
+{
+    fn build(self, _world: &mut World) -> Option<ComponentId> {
+        Some(self.component_id)
     }
 }
 
@@ -375,7 +524,7 @@ pub fn register_or_get_resource_dyn(
             .get_resource_by_id(component_id)
             .ok_or("resource does not exist")?;
         // SAFETY: ptr holds the type mirrored by reflect_from_ptr.
-        let value = unsafe { reflect_from_ptr.as_reflect(ptr) };
+        let value = unsafe { reflect_from_ptr.ptr_as_reflect(ptr) };
         match clone_into_arc(value) {
             Ok(arc) => arc,
             Err(err) => return Err(err.to_string()),
@@ -408,25 +557,24 @@ pub fn register_or_get_resource_dyn(
     };
 
     let read_system = (
-        FilteredResourcesParamBuilder::new(move |b| {
-            b.add_read_by_id(component_id);
-        }),
+        ReflectedResourceReadBuilder { component_id },
         ParamBuilder::resource_mut::<ReflectResourceRegistry>(),
     )
         .build_state(world)
         .build_system(
-            move |resources: FilteredResources, mut registry: ResMut<ReflectResourceRegistry>| {
+            move |resources: ReflectedResourceRead,
+                  mut registry: ResMut<ReflectResourceRegistry>| {
                 let Some(mirror) = registry.map.get_mut(&type_id) else {
                     return;
                 };
                 if mirror.elevated || mirror.active_count <= 0 {
                     return;
                 }
-                let Ok(ptr) = resources.get_by_id(mirror.component_id) else {
+                let Some(ptr) = resources.get_by_id() else {
                     return;
                 };
                 // SAFETY: ptr holds the type mirrored by reflect_from_ptr.
-                let value = unsafe { mirror.reflect_from_ptr.as_reflect(ptr) };
+                let value = unsafe { mirror.reflect_from_ptr.ptr_as_reflect(ptr) };
                 if let Ok(arc) = clone_into_arc(value)
                     && mirror.holder.try_store_boxed(Box::new(arc)).is_ok()
                 {
@@ -436,14 +584,12 @@ pub fn register_or_get_resource_dyn(
         );
 
     let write_system = (
-        FilteredResourcesMutParamBuilder::new(move |b| {
-            b.add_write_by_id(component_id);
-        }),
+        ReflectedResourceWriteBuilder { component_id },
         ParamBuilder::resource_mut::<ReflectResourceRegistry>(),
     )
         .build_state(world)
         .build_system(
-            move |mut resources: FilteredResourcesMut,
+            move |mut resources: ReflectedResourceWrite,
                   mut registry: ResMut<ReflectResourceRegistry>| {
                 let Some(mirror) = registry.map.get_mut(&type_id) else {
                     return;
@@ -458,13 +604,16 @@ pub fn register_or_get_resource_dyn(
                 let Some(arc) = read_holder_arc(&mirror.holder) else {
                     return;
                 };
-                let Ok(untyped) = resources.get_mut_by_id(mirror.component_id) else {
+                let Some(untyped) = resources.get_mut_by_id() else {
                     return;
                 };
                 // SAFETY: untyped holds the type mirrored by reflect_from_ptr.
-                let mut reflect = untyped
-                    .map_unchanged(|ptr| unsafe { mirror.reflect_from_ptr.as_reflect_mut(ptr) });
-                reflect.apply(arc.as_ref());
+                let mut reflect = untyped.map_unchanged(|ptr| unsafe {
+                    mirror.reflect_from_ptr.ptr_as_reflect_mut(ptr)
+                });
+                if let Err(_err) = reflect.try_apply(arc.as_ref()) {
+                    error!("reflect apply failed: {}", _err);
+                }
                 reflect.set_changed();
                 mirror.last_written_version = version;
             },

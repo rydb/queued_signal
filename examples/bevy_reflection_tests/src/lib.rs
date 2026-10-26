@@ -20,17 +20,9 @@ pub mod query;
 pub mod resource;
 
 /// Plugin wiring bevy and dioxus for the reflect tests.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct ReflectionTestsPlugin {
     cmd_channels: BevyCommandChannels,
-}
-
-impl Default for ReflectionTestsPlugin {
-    fn default() -> Self {
-        Self {
-            cmd_channels: BevyCommandChannels::default(),
-        }
-    }
 }
 
 impl bevy_app::Plugin for ReflectionTestsPlugin {

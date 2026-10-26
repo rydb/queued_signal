@@ -71,7 +71,7 @@ impl Command for AddTenNames {
             .commands()
             .spawn((Name::new("Name9"), Greets::default()));
         world.commands().spawn((
-            Name::new("Name10_toogle_test"),
+            Name::new("Name10_toggle_test"),
             Greets::default(),
             ToggleTestMarker,
         ));

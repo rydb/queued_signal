@@ -10,7 +10,6 @@ pub mod query;
 pub mod resource;
 
 use std::any::Any;
-use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::sync::Arc as StdArc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -266,7 +265,7 @@ where
     let typed = unsafe { &*(shared.data().as_ptr() as *const CoerceShared<T, dyn Reflect>) };
     let epoch = pin();
     let atom_guard = typed.atom().load();
-    let value: &Value<T, dyn Reflect> = &*atom_guard;
+    let value: &Value<T, dyn Reflect> = &atom_guard;
     let ptr = value.value() as *const T;
     (ptr as *const dyn Reflect, epoch)
 }
@@ -298,7 +297,7 @@ unsafe fn load_reflect_bound<T: Send + Sync + 'static>(
     let typed = unsafe { &*(shared.data().as_ptr() as *const CoerceShared<T, dyn Any>) };
     let epoch = pin();
     let atom_guard = typed.atom().load();
-    let value: &Value<T, dyn Any> = &*atom_guard;
+    let value: &Value<T, dyn Any> = &atom_guard;
     let raw = (value.value() as *const T).cast::<u8>() as *mut u8;
     // SAFETY: raw points at the live T value and the pointer mirrors T.
     let ptr = unsafe { Ptr::new(NonNull::new_unchecked(raw)) };
@@ -307,7 +306,7 @@ unsafe fn load_reflect_bound<T: Send + Sync + 'static>(
         .downcast_ref::<ReflectFromPtr>()
         .expect("reflect bind missing ReflectFromPtr");
     // SAFETY: ptr holds the type mirrored by reflect_from_ptr.
-    let reflect = unsafe { reflect.as_reflect(ptr) };
+    let reflect = unsafe { reflect.ptr_as_reflect(ptr) };
     (reflect as *const dyn Reflect, epoch)
 }
 

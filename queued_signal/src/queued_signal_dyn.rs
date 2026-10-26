@@ -13,14 +13,20 @@ use crate::state::{
     HealthStatus, MutationOp, QueuedSignal, QueuedStateDyn, ReaderRegistry, TrackedReadGuardDyn,
 };
 
+/// Routes a relative mutation through an erased view.
+type MutateFn<D> = unsafe fn(&ErasedQueuedWrite<D>, Arc<dyn Fn(&mut D) + Send + Sync>);
+
+/// Routes a full-value replacement through an erased view.
+type SetValueFn<D> = unsafe fn(
+    &ErasedQueuedWrite<D>,
+    Box<dyn Any + Send + Sync>,
+) -> Result<(), Box<dyn Any + Send + Sync>>;
+
 /// Type-erased write routing for an erased queued signal view.
 pub struct ErasedQueuedWrite<D: ?Sized + 'static> {
-    mutate: unsafe fn(&ErasedQueuedWrite<D>, Arc<dyn Fn(&mut D) + Send + Sync>),
-    mutate_set: unsafe fn(&ErasedQueuedWrite<D>, Arc<dyn Fn(&mut D) + Send + Sync>),
-    set_value: unsafe fn(
-        &ErasedQueuedWrite<D>,
-        Box<dyn Any + Send + Sync>,
-    ) -> Result<(), Box<dyn Any + Send + Sync>>,
+    mutate: MutateFn<D>,
+    mutate_set: MutateFn<D>,
+    set_value: SetValueFn<D>,
     context: Arc<dyn Any + Send + Sync>,
     marker: PhantomData<fn() -> D>,
 }
@@ -35,12 +41,9 @@ struct TypedWrite<T: Clone + Send + Sync + 'static, D: ?Sized + 'static> {
 impl<D: ?Sized + 'static> ErasedQueuedWrite<D> {
     /// Assembles erased write routing from raw parts.
     pub fn from_raw_parts(
-        mutate: unsafe fn(&ErasedQueuedWrite<D>, Arc<dyn Fn(&mut D) + Send + Sync>),
-        mutate_set: unsafe fn(&ErasedQueuedWrite<D>, Arc<dyn Fn(&mut D) + Send + Sync>),
-        set_value: unsafe fn(
-            &ErasedQueuedWrite<D>,
-            Box<dyn Any + Send + Sync>,
-        ) -> Result<(), Box<dyn Any + Send + Sync>>,
+        mutate: MutateFn<D>,
+        mutate_set: MutateFn<D>,
+        set_value: SetValueFn<D>,
         context: Arc<dyn Any + Send + Sync>,
     ) -> ErasedQueuedWrite<D> {
         ErasedQueuedWrite {
@@ -185,7 +188,7 @@ impl<D: ?Sized + 'static> QueuedSignalDyn<D> {
     /// Enqueue a relative mutation through the erased view.
     pub fn mutate(&self, f: Arc<dyn Fn(&mut D) + Send + Sync>) {
         let slot = self.write.load();
-        let write: &ErasedQueuedWrite<D> = &*slot;
+        let write: &ErasedQueuedWrite<D> = &slot;
         // SAFETY: the write functions match the context in the slot.
         unsafe { (write.mutate)(write, f) };
     }
@@ -193,7 +196,7 @@ impl<D: ?Sized + 'static> QueuedSignalDyn<D> {
     /// Enqueue an authoritative mutation through the erased view.
     pub fn mutate_set(&self, f: Arc<dyn Fn(&mut D) + Send + Sync>) {
         let slot = self.write.load();
-        let write: &ErasedQueuedWrite<D> = &*slot;
+        let write: &ErasedQueuedWrite<D> = &slot;
         // SAFETY: the write functions match the context in the slot.
         unsafe { (write.mutate_set)(write, f) };
     }
@@ -204,7 +207,7 @@ impl<D: ?Sized + 'static> QueuedSignalDyn<D> {
         value: Box<dyn Any + Send + Sync>,
     ) -> Result<(), Box<dyn Any + Send + Sync>> {
         let slot = self.write.load();
-        let write: &ErasedQueuedWrite<D> = &*slot;
+        let write: &ErasedQueuedWrite<D> = &slot;
         // SAFETY: the write functions match the context in the slot.
         unsafe { (write.set_value)(write, value) }
     }

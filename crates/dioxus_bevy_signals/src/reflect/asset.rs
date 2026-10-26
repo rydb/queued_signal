@@ -15,10 +15,11 @@ use bevy_asset::{AssetId, ReflectAsset, UntypedAssetId};
 use bevy_ecs::change_detection::Tick;
 use bevy_ecs::component::ComponentId;
 use bevy_ecs::prelude::*;
-use bevy_ecs::query::{FilteredAccess, FilteredAccessSet};
+use bevy_ecs::query::FilteredAccess;
 use bevy_ecs::reflect::AppTypeRegistry;
 use bevy_ecs::system::{
-    ParamBuilder, SystemMeta, SystemParam, SystemParamBuilder, SystemParamValidationError,
+    ParamBuilder, SystemAccess, SystemMeta, SystemParam, SystemParamBuilder,
+    SystemParamValidationError,
 };
 use bevy_ecs::world::CommandQueue;
 use bevy_ecs::world::unsafe_world_cell::UnsafeWorldCell;
@@ -153,13 +154,20 @@ pub struct ReflectAssetHandles {
 /// Future returned by a typed asset spawner.
 pub type TypedSpawnFuture = Pin<Box<dyn Future<Output = Result<(), String>>>>;
 
+/// Type-erased spawn callback for a typed asset.
+pub type TypedSpawnFn =
+    Arc<dyn Fn(CommandQueueSender, UntypedAssetId) -> TypedSpawnFuture + Send + Sync>;
+
+/// Type-erased despawn callback for a typed asset.
+pub type TypedDespawnFn = Arc<dyn Fn(&CommandQueueSender, UntypedAssetId) + Send + Sync>;
+
 /// Type-erased handle for spinning up a typed asset and sharing its count.
 #[derive(Clone)]
 pub struct TypedAssetSpawner {
     /// Spins up the typed asset, adopts the reflect mirror, and increments the count.
-    pub spawn: Arc<dyn Fn(CommandQueueSender, UntypedAssetId) -> TypedSpawnFuture + Send + Sync>,
+    pub spawn: TypedSpawnFn,
     /// Decrements the shared count when the untyped asset unmounts.
-    pub despawn: Arc<dyn Fn(&CommandQueueSender, UntypedAssetId) + Send + Sync>,
+    pub despawn: TypedDespawnFn,
 }
 
 impl TypedAssetSpawner {
@@ -264,7 +272,7 @@ unsafe fn load_asset_owned(shared: &ErasedShared<dyn Reflect>) -> (*const dyn Re
         unsafe { &*(shared.data().as_ptr() as *const CoerceShared<Arc<dyn Reflect>, dyn Reflect>) };
     let epoch = pin();
     let atom_guard = typed.atom().load();
-    let value: &Value<Arc<dyn Reflect>, dyn Reflect> = &*atom_guard;
+    let value: &Value<Arc<dyn Reflect>, dyn Reflect> = &atom_guard;
     let arc: &Arc<dyn Reflect> = value.value();
     let ptr = arc.as_ref() as *const dyn Reflect;
     (ptr, epoch)
@@ -322,7 +330,7 @@ unsafe fn load_asset_bound<A: DioxusAssetSync>(
     };
     let epoch = pin();
     let atom_guard = typed.atom().load();
-    let value: &Value<Result<A, AssetNoneState>, dyn std::any::Any> = &*atom_guard;
+    let value: &Value<Result<A, AssetNoneState>, dyn std::any::Any> = &atom_guard;
     match value.value() {
         Ok(a) => {
             let reflect_from_ptr = shared
@@ -332,7 +340,7 @@ unsafe fn load_asset_bound<A: DioxusAssetSync>(
             let raw = std::ptr::from_ref(a).cast::<u8>() as *mut u8;
             // SAFETY: raw points at the live A and the pointer mirrors A.
             let ptr = unsafe { Ptr::new(NonNull::new_unchecked(raw)) };
-            let reflect = unsafe { reflect_from_ptr.as_reflect(ptr) };
+            let reflect = unsafe { reflect_from_ptr.ptr_as_reflect(ptr) };
             (reflect as *const dyn Reflect, epoch)
         }
         Err(_) => {
@@ -449,10 +457,10 @@ fn typed_asset_handle<A: DioxusAssetSync>(
         let rfp = rfp.clone();
         s.mutate(move |value: &mut Result<A, AssetNoneState>| {
             if let Ok(a) = value {
-                let raw = std::ptr::from_mut(a).cast::<u8>() as *mut u8;
+                let raw = std::ptr::from_mut(a).cast::<u8>();
                 // SAFETY: a is a live A and rfp mirrors A.
                 let ptr = unsafe { PtrMut::new(NonNull::new_unchecked(raw)) };
-                let reflect = unsafe { rfp.as_reflect_mut(ptr) };
+                let reflect = unsafe { rfp.ptr_as_reflect_mut(ptr) };
                 f(reflect);
             }
         });
@@ -466,10 +474,10 @@ fn typed_asset_handle<A: DioxusAssetSync>(
         let rfp = rfp.clone();
         s.mutate_set(move |value: &mut Result<A, AssetNoneState>| {
             if let Ok(a) = value {
-                let raw = std::ptr::from_mut(a).cast::<u8>() as *mut u8;
+                let raw = std::ptr::from_mut(a).cast::<u8>();
                 // SAFETY: a is a live A and rfp mirrors A.
                 let ptr = unsafe { PtrMut::new(NonNull::new_unchecked(raw)) };
-                let reflect = unsafe { rfp.as_reflect_mut(ptr) };
+                let reflect = unsafe { rfp.ptr_as_reflect_mut(ptr) };
                 f(reflect);
             }
         });
@@ -483,12 +491,12 @@ fn typed_asset_handle<A: DioxusAssetSync>(
         let rfp = rfp.clone();
         s.mutate_set(move |typed: &mut Result<A, AssetNoneState>| {
             if let Ok(a) = typed {
-                let raw = std::ptr::from_mut(a).cast::<u8>() as *mut u8;
+                let raw = std::ptr::from_mut(a).cast::<u8>();
                 // SAFETY: a is a live A and rfp mirrors A.
                 let ptr = unsafe { PtrMut::new(NonNull::new_unchecked(raw)) };
-                let reflect = unsafe { rfp.as_reflect_mut(ptr) };
-                if let Err(err) = reflect.try_apply(value.as_ref()) {
-                    error!("reflect apply failed: {}", err);
+                let reflect = unsafe { rfp.ptr_as_reflect_mut(ptr) };
+                if let Err(_err) = reflect.try_apply(value.as_ref()) {
+                    error!("reflect apply failed: {}", _err);
                 }
             }
         });
@@ -504,7 +512,7 @@ fn typed_asset_handle<A: DioxusAssetSync>(
     };
 
     let s = state.clone();
-    let is_loaded = Arc::new(move || matches!(s.read().as_ref(), Ok(_)));
+    let is_loaded = Arc::new(move || s.read().as_ref().is_ok());
 
     let state_fwd = state.clone();
     let forward_to = Arc::new(
@@ -640,11 +648,11 @@ pub fn register_or_get_asset_dyn(
 
                 match reflected.read() {
                     Some(value) => {
-                        if let Ok(arc) = clone_into_arc(value) {
-                            if mirror.holder.try_store_boxed(Box::new(arc)).is_ok() {
-                                mirror.loaded.store(true, Ordering::Relaxed);
-                                bump_version(&mirror.version, &mirror.notify_tx);
-                            }
+                        if let Ok(arc) = clone_into_arc(value)
+                            && mirror.holder.try_store_boxed(Box::new(arc)).is_ok()
+                        {
+                            mirror.loaded.store(true, Ordering::Relaxed);
+                            bump_version(&mirror.version, &mirror.notify_tx);
                         }
                     }
                     None => {
@@ -683,8 +691,8 @@ pub fn register_or_get_asset_dyn(
                     return;
                 };
                 let snapshot = mirror.holder.get();
-                if let Err(err) = target.try_apply(snapshot.as_dyn()) {
-                    error!("reflect apply failed: {}", err);
+                if let Err(_err) = target.try_apply(snapshot.as_dyn()) {
+                    error!("reflect apply failed: {}", _err);
                 }
                 mirror.last_written_version = version;
             },
@@ -822,6 +830,7 @@ pub fn notify_typed_asset_mirror<A: DioxusAssetSync>(world: &mut World, asset_id
 }
 
 /// State for the [`ReflectedAsset`] parameter.
+#[derive(Default)]
 pub struct ReflectedAssetState {
     /// Untyped asset access type data.
     pub reflect_asset: Option<ReflectAsset>,
@@ -831,17 +840,6 @@ pub struct ReflectedAssetState {
     pub assets_component_id: Option<ComponentId>,
     /// Whether access is write.
     pub write: bool,
-}
-
-impl Default for ReflectedAssetState {
-    fn default() -> Self {
-        Self {
-            reflect_asset: None,
-            asset_id: None,
-            assets_component_id: None,
-            write: false,
-        }
-    }
 }
 
 /// System parameter granting data-driven access to one untyped asset.
@@ -886,8 +884,8 @@ unsafe impl SystemParam for ReflectedAsset<'_, '_> {
 
     fn init_access(
         state: &Self::State,
-        _system_meta: &mut SystemMeta,
-        component_access_set: &mut FilteredAccessSet,
+        system_meta: &mut SystemMeta,
+        system_access: &mut SystemAccess,
         _world: &mut World,
     ) {
         let Some(assets_component_id) = state.assets_component_id else {
@@ -899,7 +897,9 @@ unsafe impl SystemParam for ReflectedAsset<'_, '_> {
         } else {
             filtered.add_read(assets_component_id);
         }
-        component_access_set.add(filtered);
+        system_access
+            .require_shared_access::<Self>(system_meta)
+            .add(filtered);
     }
 
     unsafe fn get_param<'w, 's>(
@@ -1064,8 +1064,8 @@ pub fn use_bevy_asset_dyn(id: Memo<Result<UntypedAssetId, AssetNoneState>>) -> R
 
                         let id = match next {
                             Ok(id) => id,
-                            Err(state) => {
-                                debug!("asset id unavailable: {}", state);
+                            Err(_state) => {
+                                debug!("asset id unavailable: {}", _state);
                                 continue;
                             }
                         };
@@ -1082,12 +1082,12 @@ pub fn use_bevy_asset_dyn(id: Memo<Result<UntypedAssetId, AssetNoneState>>) -> R
                             .await
                         {
                             Ok(Ok(handles)) => handles,
-                            Ok(Err(e)) => {
-                                error!("reflect asset request failed: {}", e);
+                            Ok(Err(_e)) => {
+                                error!("reflect asset request failed: {}", _e);
                                 continue;
                             }
-                            Err(e) => {
-                                warn!("send_command_async failed: {}", e);
+                            Err(_e) => {
+                                warn!("send_command_async failed: {}", _e);
                                 continue;
                             }
                         };
@@ -1106,8 +1106,8 @@ pub fn use_bevy_asset_dyn(id: Memo<Result<UntypedAssetId, AssetNoneState>>) -> R
                             .ok()
                             .flatten();
                         if let Some(spawner) = spawner {
-                            if let Err(err) = spawner.spawn(ctx.clone(), id).await {
-                                warn!("typed asset spawn failed: {}", err);
+                            if let Err(_err) = spawner.spawn(ctx.clone(), id).await {
+                                warn!("typed asset spawn failed: {}", _err);
                             } else {
                                 spawner_signal.set(Some((spawner, id)));
                             }

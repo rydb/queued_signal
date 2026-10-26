@@ -320,7 +320,7 @@ pub fn create_queued_signal_hub() -> QueuedSignalSender {
 pub fn use_queued_signal<T: Clone + Send + Sync + 'static>() -> QueuedSignalHandle<T> {
     let sender = use_context::<QueuedSignalSender>();
 
-    let mut version: Signal<u64> = use_signal(|| 0);
+    let version: Signal<u64> = use_signal(|| 0);
     let health: Signal<HealthStatus> = use_signal(|| HealthStatus::Healthy);
     let mut writer: Signal<Option<QueuedSignal<T>>> = use_signal(|| None);
 
@@ -329,12 +329,9 @@ pub fn use_queued_signal<T: Clone + Send + Sync + 'static>() -> QueuedSignalHand
         let sender = sender.clone();
         async move {
             let rx = sender.request::<T>();
-            match rx.await {
-                Ok(signal) => {
-                    let _ = signal.state.forward_to(version, health);
-                    writer.set(Some(signal));
-                }
-                Err(_) => {}
+            if let Ok(signal) = rx.await {
+                let _ = signal.state.forward_to(version, health);
+                writer.set(Some(signal));
             }
         }
     });

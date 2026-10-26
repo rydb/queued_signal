@@ -70,7 +70,7 @@ impl<T: Send + Sync + 'static + Erase<D>, D: ?Sized + 'static> CoerceSharedDyn<D
     fn load(&self) -> AtomCoerceDynGuard<'_, D> {
         let guard = pin();
         let atom_guard = self.atom.load();
-        let value: &Value<T, D> = &*atom_guard;
+        let value: &Value<T, D> = &atom_guard;
         let ptr = <T as Erase<D>>::erase((&value.value as *const T) as *const ());
         AtomCoerceDynGuard {
             _guard: guard,
@@ -155,6 +155,12 @@ impl AtomCoerceDynSlotGuard<dyn Any> {
 /// Marker for erased views that carry no extra runtime data.
 struct NoContext;
 
+/// Stores a type-erased owned value when the view supports it.
+type TryStoreFn<D> = unsafe fn(
+    &ErasedShared<D>,
+    Box<dyn Any + Send + Sync>,
+) -> Result<(), Box<dyn Any + Send + Sync>>;
+
 /// A type-erased counted reference to a CoerceShared allocation.
 pub struct ErasedShared<D: ?Sized + 'static> {
     /// Points at the CoerceShared value, past the ArcData header.
@@ -166,10 +172,7 @@ pub struct ErasedShared<D: ?Sized + 'static> {
     /// Pins the epoch and loads the erased view pointer.
     load: unsafe fn(&ErasedShared<D>) -> (*const D, Guard),
     /// Stores a type-erased owned value when the view supports it.
-    try_store: unsafe fn(
-        &ErasedShared<D>,
-        Box<dyn Any + Send + Sync>,
-    ) -> Result<(), Box<dyn Any + Send + Sync>>,
+    try_store: TryStoreFn<D>,
     /// Runtime data used by the load and store functions.
     context: StdArc<dyn Any + Send + Sync>,
     marker: PhantomData<fn() -> D>,
@@ -186,10 +189,7 @@ impl<D: ?Sized + 'static> ErasedShared<D> {
         strong: NonNull<AtomicUsize>,
         drop_alloc: unsafe fn(NonNull<()>),
         load: unsafe fn(&ErasedShared<D>) -> (*const D, Guard),
-        try_store: unsafe fn(
-            &ErasedShared<D>,
-            Box<dyn Any + Send + Sync>,
-        ) -> Result<(), Box<dyn Any + Send + Sync>>,
+        try_store: TryStoreFn<D>,
         context: StdArc<dyn Any + Send + Sync>,
     ) -> ErasedShared<D> {
         ErasedShared {
@@ -307,7 +307,7 @@ where
     let typed = unsafe { &*(shared.data.as_ptr() as *const CoerceShared<T, D>) };
     let epoch = pin();
     let atom_guard = typed.atom.load();
-    let value: &Value<T, D> = &*atom_guard;
+    let value: &Value<T, D> = &atom_guard;
     let ptr = <T as Erase<D>>::erase((&value.value as *const T) as *const ());
     (ptr, epoch)
 }
@@ -380,7 +380,7 @@ impl<D: ?Sized + 'static> AtomCoerceDynHandle<D> {
     /// The erased view of the currently bound value.
     pub fn get(&self) -> AtomCoerceDynSlotGuard<D> {
         let slot_guard = self.slot.load();
-        let shared: &ErasedShared<D> = &*slot_guard;
+        let shared: &ErasedShared<D> = &slot_guard;
         // SAFETY: data points at the live CoerceShared and the load function matches.
         let (ptr, epoch) = unsafe { (shared.load)(shared) };
         // Keep the bound shared allocation alive for the guard's lifetime. The
@@ -399,7 +399,7 @@ impl<D: ?Sized + 'static> AtomCoerceDynHandle<D> {
         value: Box<dyn Any + Send + Sync>,
     ) -> Result<(), Box<dyn Any + Send + Sync>> {
         let slot_guard = self.slot.load();
-        let shared: &ErasedShared<D> = &*slot_guard;
+        let shared: &ErasedShared<D> = &slot_guard;
         // SAFETY: data points at the live CoerceShared and the store function matches.
         unsafe { (shared.try_store)(shared, value) }
     }
@@ -486,7 +486,7 @@ impl<D: ?Sized + 'static> AtomCoerceDyn<D> {
     /// The erased view of the currently bound value.
     pub fn get(&self) -> AtomCoerceDynSlotGuard<D> {
         let slot_guard = self.slot.load();
-        let shared: &ErasedShared<D> = &*slot_guard;
+        let shared: &ErasedShared<D> = &slot_guard;
         // SAFETY: data points at the live CoerceShared and the load function matches.
         let (ptr, epoch) = unsafe { (shared.load)(shared) };
         // Keep the bound shared allocation alive for the guard's lifetime. The
@@ -505,7 +505,7 @@ impl<D: ?Sized + 'static> AtomCoerceDyn<D> {
         value: Box<dyn Any + Send + Sync>,
     ) -> Result<(), Box<dyn Any + Send + Sync>> {
         let slot_guard = self.slot.load();
-        let shared: &ErasedShared<D> = &*slot_guard;
+        let shared: &ErasedShared<D> = &slot_guard;
         // SAFETY: data points at the live CoerceShared and the store function matches.
         unsafe { (shared.try_store)(shared, value) }
     }
@@ -522,6 +522,12 @@ impl<D: ?Sized + 'static> Clone for AtomCoerceDyn<D> {
 /// A registry mapping type names to typed identifiers.
 pub struct TypeRegistry {
     entries: HashMap<String, TypeId>,
+}
+
+impl Default for TypeRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TypeRegistry {
@@ -557,7 +563,8 @@ fn short_type_name<T: ?Sized>() -> String {
 }
 
 /// A demo value registered by its short type name.
-pub struct Counter(u32);
+#[cfg(test)]
+pub struct Counter(pub u32);
 
 #[test]
 fn test_atom_coerce() {

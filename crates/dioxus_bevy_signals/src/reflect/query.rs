@@ -14,10 +14,11 @@ use bevy_ecs::change_detection::Tick;
 use bevy_ecs::component::ComponentId;
 use bevy_ecs::entity::Entity;
 use bevy_ecs::prelude::*;
-use bevy_ecs::query::{FilteredAccess, FilteredAccessSet, QueryFilter};
+use bevy_ecs::query::{FilteredAccess, QueryFilter};
 use bevy_ecs::reflect::AppTypeRegistry;
 use bevy_ecs::system::{
-    ParamBuilder, SystemMeta, SystemParam, SystemParamBuilder, SystemParamValidationError,
+    ParamBuilder, SystemAccess, SystemMeta, SystemParam, SystemParamBuilder,
+    SystemParamValidationError,
 };
 use bevy_ecs::world::CommandQueue;
 use bevy_ecs::world::unsafe_world_cell::UnsafeWorldCell;
@@ -373,11 +374,9 @@ impl<Q: MirrorQueryData> ReflectRuntimeOps for Q {
         else {
             return Some(Err(ComponentReflectError::NoReflectData));
         };
-        let Some(guard) = Q::read_component_erased(handles, idx) else {
-            return None;
-        };
+        let guard = Q::read_component_erased(handles, idx)?;
         // SAFETY: guard.ptr points at the live component mirrored by rfp.
-        let value = unsafe { rfp.as_reflect(Ptr::new(guard.ptr)) };
+        let value = unsafe { rfp.ptr_as_reflect(Ptr::new(guard.ptr)) };
         Some(Ok(ReflectReadGuard::from_raw(guard.owner, value)))
     }
 
@@ -399,7 +398,7 @@ impl<Q: MirrorQueryData> ReflectRuntimeOps for Q {
             idx,
             Box::new(move |ptr| {
                 // SAFETY: ptr points at the live component mirrored by rfp.
-                let value = unsafe { rfp.as_reflect_mut(PtrMut::new(ptr)) };
+                let value = unsafe { rfp.ptr_as_reflect_mut(PtrMut::new(ptr)) };
                 f(value);
             }),
         );
@@ -423,9 +422,9 @@ impl<Q: MirrorQueryData> ReflectRuntimeOps for Q {
             idx,
             Box::new(move |ptr| {
                 // SAFETY: ptr points at the live component mirrored by rfp.
-                let target = unsafe { rfp.as_reflect_mut(PtrMut::new(ptr)) };
-                if let Err(err) = target.try_apply(value.as_ref()) {
-                    error!("reflect apply failed: {}", err);
+                let target = unsafe { rfp.ptr_as_reflect_mut(PtrMut::new(ptr)) };
+                if let Err(_err) = target.try_apply(value.as_ref()) {
+                    error!("reflect apply failed: {}", _err);
                 }
             }),
         );
@@ -732,8 +731,8 @@ unsafe impl SystemParam for ReflectedComponents<'_, '_> {
 
     fn init_access(
         state: &Self::State,
-        _system_meta: &mut SystemMeta,
-        component_access_set: &mut FilteredAccessSet,
+        system_meta: &mut SystemMeta,
+        system_access: &mut SystemAccess,
         _world: &mut World,
     ) {
         let mut filtered = FilteredAccess::default();
@@ -744,7 +743,9 @@ unsafe impl SystemParam for ReflectedComponents<'_, '_> {
                 filtered.add_read(*cid);
             }
         }
-        component_access_set.add(filtered);
+        system_access
+            .require_shared_access::<Self>(system_meta)
+            .add(filtered);
     }
 
     unsafe fn get_param<'w, 's>(
@@ -997,7 +998,7 @@ pub fn register_or_get_query_dyn(
     names: &[String],
 ) -> Result<ReflectQueryHandles, Vec<ComponentReflectError>> {
     let type_registry = world.resource::<AppTypeRegistry>();
-    let infos = enumerate_reflect_types(&type_registry);
+    let infos = enumerate_reflect_types(type_registry);
 
     let registry = type_registry.read();
     let mut type_ids = Vec::with_capacity(names.len());
@@ -1025,13 +1026,16 @@ pub fn register_or_get_query_dyn(
 
         // A component registered with the world that lacks reflection data
         // becomes a non-reflectable slot instead of a hard failure.
-        let found = world.components().iter_registered().find(|info| {
-            let debug_name = info.name();
-            let full_str: &str = &debug_name;
-            full_str == name.as_str() || debug_name.shortname().to_string() == *name
-        });
+        let found = world
+            .components()
+            .iter_registered()
+            .find(|(_component_id, info)| {
+                let debug_name = info.name();
+                let full_str: &str = &debug_name;
+                full_str == name.as_str() || debug_name.shortname().to_string() == *name
+            });
         match found {
-            Some(info) => {
+            Some((component_id, info)) => {
                 let Some(type_id) = info.type_id() else {
                     errors.push(ComponentReflectError::NameError(
                         NameResolutionError::NotFound(name.to_owned()),
@@ -1039,7 +1043,7 @@ pub fn register_or_get_query_dyn(
                     continue;
                 };
                 type_ids.push(type_id);
-                component_ids.push(info.id());
+                component_ids.push(component_id);
                 reflect_from_ptrs.push(None);
             }
             None => {
@@ -1165,7 +1169,7 @@ pub fn register_or_get_query_dyn(
                 let guard = signal.read();
                 let current: &OwnedQuerySnapshot = guard.as_ref();
 
-                let mut changes: Vec<(Entity, Vec<Option<Arc<dyn Reflect>>>)> = Vec::new();
+                let mut changes = Vec::new();
                 let mut removals: Vec<Entity> = Vec::new();
                 let mut matched: HashSet<Entity> = HashSet::new();
                 let mut any_changed = false;
@@ -1206,11 +1210,11 @@ pub fn register_or_get_query_dyn(
                                 changed = true;
                             }
                             // SAFETY: ptr holds the type mirrored by reflect_from_ptr.
-                            let value = unsafe { reflect_from_ptr.as_reflect(ptr) };
+                            let value = unsafe { reflect_from_ptr.ptr_as_reflect(ptr) };
                             match clone_into_arc(value) {
                                 Ok(arc) => values.push(Some(arc)),
-                                Err(err) => {
-                                    error!("reflect clone failed: {}", err);
+                                Err(_err) => {
+                                    error!("reflect clone failed: {}", _err);
                                     complete = false;
                                     break;
                                 }
@@ -1298,10 +1302,10 @@ pub fn register_or_get_query_dyn(
                             };
                             // SAFETY: untyped holds the type mirrored by reflect_from_ptr.
                             let mut reflect = untyped.map_unchanged(|ptr| unsafe {
-                                reflect_from_ptr.as_reflect_mut(ptr)
+                                reflect_from_ptr.ptr_as_reflect_mut(ptr)
                             });
-                            if let Err(err) = reflect.try_apply(value.as_ref()) {
-                                error!("reflect apply failed: {}", err);
+                            if let Err(_err) = reflect.try_apply(value.as_ref()) {
+                                error!("reflect apply failed: {}", _err);
                                 entity_written = false;
                                 break;
                             }
@@ -1599,8 +1603,8 @@ pub fn use_bevy_query_dyn_vec(names: Vec<String>) -> ReflectQuerySignal {
                 .ok()
                 .flatten();
             if let Some(spawner) = spawner {
-                if let Err(err) = spawner.spawn(ctx.clone()).await {
-                    warn!("typed query spawn failed: {}", err);
+                if let Err(_err) = spawner.spawn(ctx.clone()).await {
+                    warn!("typed query spawn failed: {}", _err);
                 } else {
                     spawner_signal.set(Some(spawner.clone()));
                 }
