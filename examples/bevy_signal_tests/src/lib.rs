@@ -1,9 +1,7 @@
-use std::{io, rc::Rc, thread, time::Duration};
+use std::{io, rc::Rc, thread};
 
 use bevy_app::{App, Plugin, ScheduleRunnerPlugin};
-use bevy_ecs::prelude::*;
 use bevy_log::debug;
-use bevy_time::{Timer, TimerMode};
 use dioxus::prelude::*;
 use dioxus::{LaunchBuilder, prelude::rsx};
 use dioxus_bevy_signals::{BevyCommandChannels, CommandQueueSender, DioxusBevyMirrorPlugin};
@@ -39,16 +37,6 @@ pub trait DioxusTestPlugin: Plugin + 'static {
     fn included_element(&self) -> Element;
 
     fn register_plugin(&self, app: &mut App);
-}
-
-/// Shared tick timer resource driven by time delta.
-#[derive(Resource)]
-pub struct TickTimer(pub Timer);
-
-impl Default for TickTimer {
-    fn default() -> Self {
-        Self(Timer::new(Duration::from_secs(1), TimerMode::Repeating))
-    }
 }
 
 /// Plugin that sets up the infrastructure for running all tests.
@@ -95,7 +83,6 @@ impl Default for SignalTestsPlugin {
 impl Plugin for SignalTestsPlugin {
     fn build(&self, app: &mut bevy_app::App) {
         app.add_plugins(bevy_time::TimePlugin);
-        app.insert_resource(TickTimer::default());
         app.add_plugins(DioxusBevyMirrorPlugin {
             bevy_command_txrx: self.cmd_channels.clone(),
             ..Default::default()

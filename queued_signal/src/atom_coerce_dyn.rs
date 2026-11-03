@@ -85,10 +85,13 @@ impl<T: Send + Sync + 'static + Erase<D>, D: ?Sized + 'static> CoerceSharedDyn<D
     ) -> Result<(), Box<dyn Any + Send + Sync>> {
         match value.downcast::<T>() {
             Ok(boxed) => {
-                self.atom.store(Value {
-                    value: *boxed,
-                    marker: PhantomData,
-                });
+                self.atom.store(
+                    Value {
+                        value: *boxed,
+                        marker: PhantomData,
+                    },
+                    0,
+                );
                 Ok(())
             }
             Err(boxed) => Err(boxed),
@@ -128,7 +131,7 @@ impl AtomCoerceDynGuard<'_, dyn Any> {
 pub struct AtomCoerceDynSlotGuard<D: ?Sized + 'static> {
     _guard: Guard,
     ptr: *const D,
-    _shared: ErasedShared<D>,
+    version: u64,
     marker: PhantomData<fn() -> D>,
 }
 
@@ -137,6 +140,11 @@ impl<D: ?Sized + 'static> AtomCoerceDynSlotGuard<D> {
     pub fn as_dyn(&self) -> &D {
         // SAFETY: the guard keeps the shared allocation alive and the epoch guard keeps the node alive.
         unsafe { &*self.ptr }
+    }
+
+    /// Publication version of the node this guard pinned.
+    pub fn version(&self) -> u64 {
+        self.version
     }
 }
 
@@ -169,8 +177,8 @@ pub struct ErasedShared<D: ?Sized + 'static> {
     strong: NonNull<AtomicUsize>,
     /// Drops the CoerceShared and frees the ArcData allocation.
     drop_alloc: unsafe fn(NonNull<()>),
-    /// Pins the epoch and loads the erased view pointer.
-    load: unsafe fn(&ErasedShared<D>) -> (*const D, Guard),
+    /// Pins the epoch and loads the erased view pointer and version.
+    load: unsafe fn(&ErasedShared<D>) -> (*const D, u64, Guard),
     /// Stores a type-erased owned value when the view supports it.
     try_store: TryStoreFn<D>,
     /// Runtime data used by the load and store functions.
@@ -188,7 +196,7 @@ impl<D: ?Sized + 'static> ErasedShared<D> {
         data: NonNull<()>,
         strong: NonNull<AtomicUsize>,
         drop_alloc: unsafe fn(NonNull<()>),
-        load: unsafe fn(&ErasedShared<D>) -> (*const D, Guard),
+        load: unsafe fn(&ErasedShared<D>) -> (*const D, u64, Guard),
         try_store: TryStoreFn<D>,
         context: StdArc<dyn Any + Send + Sync>,
     ) -> ErasedShared<D> {
@@ -298,18 +306,18 @@ where
 }
 
 /// Loads the erased view through the compile-time Erase coercion.
-unsafe fn load_erased<T, D>(shared: &ErasedShared<D>) -> (*const D, Guard)
+unsafe fn load_erased<T, D>(shared: &ErasedShared<D>) -> (*const D, u64, Guard)
 where
     T: Send + Sync + 'static + Erase<D>,
     D: ?Sized + 'static,
 {
     // SAFETY: data points at the live CoerceShared for the erased view.
     let typed = unsafe { &*(shared.data.as_ptr() as *const CoerceShared<T, D>) };
-    let epoch = pin();
-    let atom_guard = typed.atom.load();
-    let value: &Value<T, D> = &atom_guard;
+    let (epoch, value, version) = typed.atom.load_parts();
+    // SAFETY: the pin keeps the node that holds the value alive.
+    let value: &Value<T, D> = unsafe { &*value };
     let ptr = <T as Erase<D>>::erase((&value.value as *const T) as *const ());
-    (ptr, epoch)
+    (ptr, version, epoch)
 }
 
 /// Stores a type-erased owned value when it matches the typed T.
@@ -325,10 +333,13 @@ where
     let typed = unsafe { &*(shared.data.as_ptr() as *const CoerceShared<T, D>) };
     match value.downcast::<T>() {
         Ok(boxed) => {
-            typed.atom.store(Value {
-                value: *boxed,
-                marker: PhantomData,
-            });
+            typed.atom.store(
+                Value {
+                    value: *boxed,
+                    marker: PhantomData,
+                },
+                0,
+            );
             Ok(())
         }
         Err(boxed) => Err(boxed),
@@ -382,13 +393,13 @@ impl<D: ?Sized + 'static> AtomCoerceDynHandle<D> {
         let slot_guard = self.slot.load();
         let shared: &ErasedShared<D> = &slot_guard;
         // SAFETY: data points at the live CoerceShared and the load function matches.
-        let (ptr, epoch) = unsafe { (shared.load)(shared) };
-        // Keep the bound shared allocation alive for the guard's lifetime. The
-        // epoch guard defers reclamation of the value node inside it.
+        let (ptr, version, epoch) = unsafe { (shared.load)(shared) };
+        drop(slot_guard);
+        // The value pin keeps the node the pointer points into alive.
         AtomCoerceDynSlotGuard {
             _guard: epoch,
             ptr,
-            _shared: shared.clone(),
+            version,
             marker: PhantomData,
         }
     }
@@ -460,7 +471,7 @@ impl<D: ?Sized + 'static> AtomCoerceDyn<D> {
     where
         T: Send + Sync + 'static + Erase<D>,
     {
-        self.slot.store(typed.shared_erased());
+        self.slot.store(typed.shared_erased(), 0);
     }
 
     /// Binds every handle to a typed read handle's untyped view.
@@ -468,12 +479,12 @@ impl<D: ?Sized + 'static> AtomCoerceDyn<D> {
     where
         T: Send + Sync + 'static + Erase<D>,
     {
-        self.slot.store(typed.shared_erased());
+        self.slot.store(typed.shared_erased(), 0);
     }
 
     /// Replaces the bound source with a custom erased shared reference.
     pub fn bind_shared(&self, shared: ErasedShared<D>) {
-        self.slot.store(shared);
+        self.slot.store(shared, 0);
     }
 
     /// A rebindable erased handle.
@@ -488,13 +499,13 @@ impl<D: ?Sized + 'static> AtomCoerceDyn<D> {
         let slot_guard = self.slot.load();
         let shared: &ErasedShared<D> = &slot_guard;
         // SAFETY: data points at the live CoerceShared and the load function matches.
-        let (ptr, epoch) = unsafe { (shared.load)(shared) };
-        // Keep the bound shared allocation alive for the guard's lifetime. The
-        // epoch guard defers reclamation of the value node inside it.
+        let (ptr, version, epoch) = unsafe { (shared.load)(shared) };
+        drop(slot_guard);
+        // The value pin keeps the node the pointer points into alive.
         AtomCoerceDynSlotGuard {
             _guard: epoch,
             ptr,
-            _shared: shared.clone(),
+            version,
             marker: PhantomData,
         }
     }

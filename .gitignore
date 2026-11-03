@@ -30,3 +30,4 @@ target
 # Added by nix direnv
 /.direnv
 
+/plans

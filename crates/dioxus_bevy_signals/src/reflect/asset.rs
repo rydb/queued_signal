@@ -34,8 +34,9 @@ use queued_signal::atom_coerce::{
 };
 use queued_signal::atom_coerce_dyn::{AtomCoerceDyn, AtomCoerceDynHandle, ErasedShared};
 use queued_signal::state::{
-    HealthStatus, QueuedSignal, QueuedStateDyn, ReaderRegistry, TrackedReadGuardDyn,
+    HealthStatus, QueuedSignal, QueuedStateDyn, ReadAtomics, TrackedReadGuardDyn,
 };
+use queued_signal::subscriber_slots::{PassEpoch, SubscriberSlots};
 use tokio::sync::{oneshot, watch};
 
 use crate::asset::{
@@ -117,6 +118,8 @@ pub struct ReflectAssetMirror {
     pub loaded: Arc<AtomicBool>,
     /// Monotonic version, bumped on every value change.
     pub version: Arc<AtomicU64>,
+    /// Lock free version and health words shared with the handle view.
+    pub atomics: Arc<ReadAtomics>,
     /// Notification channel for value changes.
     pub notify_tx: watch::Sender<u64>,
     /// Health notification channel.
@@ -242,8 +245,9 @@ impl<A: DioxusAssetSync> Command for AdoptTypedAsset<A> {
 }
 
 /// Bumps the mirror version and notifies watchers.
-fn bump_version(version: &Arc<AtomicU64>, notify_tx: &watch::Sender<u64>) {
+fn bump_version(version: &Arc<AtomicU64>, notify_tx: &watch::Sender<u64>, atomics: &ReadAtomics) {
     let next = version.fetch_add(1, Ordering::Relaxed) + 1;
+    atomics.store_version(next);
     let _ = notify_tx.send(next);
 }
 
@@ -266,16 +270,17 @@ fn asset_shared_owned(value: Arc<dyn Reflect>) -> ErasedShared<dyn Reflect> {
 }
 
 /// Loads an owned asset snapshot as a zero-copy reflected view.
-unsafe fn load_asset_owned(shared: &ErasedShared<dyn Reflect>) -> (*const dyn Reflect, Guard) {
+unsafe fn load_asset_owned(shared: &ErasedShared<dyn Reflect>) -> (*const dyn Reflect, u64, Guard) {
     // SAFETY: data points at the live CoerceShared for the owned view.
     let typed =
         unsafe { &*(shared.data().as_ptr() as *const CoerceShared<Arc<dyn Reflect>, dyn Reflect>) };
     let epoch = pin();
     let atom_guard = typed.atom().load();
+    let version = atom_guard.version();
     let value: &Value<Arc<dyn Reflect>, dyn Reflect> = &atom_guard;
     let arc: &Arc<dyn Reflect> = value.value();
     let ptr = arc.as_ref() as *const dyn Reflect;
-    (ptr, epoch)
+    (ptr, version, epoch)
 }
 
 /// Stores a new owned asset snapshot.
@@ -288,7 +293,7 @@ unsafe fn try_store_asset_owned(
         unsafe { &*(shared.data().as_ptr() as *const CoerceShared<Arc<dyn Reflect>, dyn Reflect>) };
     match value.downcast::<Arc<dyn Reflect>>() {
         Ok(boxed) => {
-            typed.atom().store(Value::new(*boxed));
+            typed.atom().store(Value::new(*boxed), 0);
             Ok(())
         }
         Err(boxed) => Err(boxed),
@@ -322,7 +327,7 @@ fn asset_bound_shared<A: DioxusAssetSync>(
 /// Loads a typed asset cell's Ok value as a runtime reflect view.
 unsafe fn load_asset_bound<A: DioxusAssetSync>(
     shared: &ErasedShared<dyn Reflect>,
-) -> (*const dyn Reflect, Guard) {
+) -> (*const dyn Reflect, u64, Guard) {
     // SAFETY: data points at the live CoerceShared for the bound typed cell.
     let typed = unsafe {
         &*(shared.data().as_ptr()
@@ -330,6 +335,7 @@ unsafe fn load_asset_bound<A: DioxusAssetSync>(
     };
     let epoch = pin();
     let atom_guard = typed.atom().load();
+    let version = atom_guard.version();
     let value: &Value<Result<A, AssetNoneState>, dyn std::any::Any> = &atom_guard;
     match value.value() {
         Ok(a) => {
@@ -341,11 +347,11 @@ unsafe fn load_asset_bound<A: DioxusAssetSync>(
             // SAFETY: raw points at the live A and the pointer mirrors A.
             let ptr = unsafe { Ptr::new(NonNull::new_unchecked(raw)) };
             let reflect = unsafe { reflect_from_ptr.ptr_as_reflect(ptr) };
-            (reflect as *const dyn Reflect, epoch)
+            (reflect as *const dyn Reflect, version, epoch)
         }
         Err(_) => {
             let sentinel: &dyn Reflect = &EMPTY_ASSET;
-            (sentinel as *const dyn Reflect, epoch)
+            (sentinel as *const dyn Reflect, version, epoch)
         }
     }
 }
@@ -366,18 +372,20 @@ fn reflect_asset_handle(
     notify_tx: watch::Sender<u64>,
     notify_rx: watch::Receiver<u64>,
     health_rx: watch::Receiver<HealthStatus>,
-    registry: Arc<ReaderRegistry>,
+    atomics: Arc<ReadAtomics>,
 ) -> AssetSignalHandle {
     let view = QueuedStateDyn {
         view: holder.handle_dyn(),
         notify_rx,
         health_rx,
-        registry,
+        slots: SubscriberSlots::new(PassEpoch::new()),
+        atomics: atomics.clone(),
     };
 
     let h = holder.clone();
     let v = version.clone();
     let nt = notify_tx.clone();
+    let a = atomics.clone();
     let mutate = Arc::new(move |f: ErasedMutation| {
         let guard = h.get();
         let Ok(mut cloned) = guard.as_dyn().reflect_clone() else {
@@ -388,13 +396,14 @@ fn reflect_asset_handle(
         if h.try_store_boxed(Box::new(Arc::<dyn Reflect>::from(cloned)))
             .is_ok()
         {
-            bump_version(&v, &nt);
+            bump_version(&v, &nt, &a);
         }
     });
 
     let h = holder.clone();
     let v = version.clone();
     let nt = notify_tx.clone();
+    let a = atomics.clone();
     let mutate_set = Arc::new(move |f: ErasedMutation| {
         let guard = h.get();
         let Ok(mut cloned) = guard.as_dyn().reflect_clone() else {
@@ -405,16 +414,17 @@ fn reflect_asset_handle(
         if h.try_store_boxed(Box::new(Arc::<dyn Reflect>::from(cloned)))
             .is_ok()
         {
-            bump_version(&v, &nt);
+            bump_version(&v, &nt, &a);
         }
     });
 
     let h = holder.clone();
     let v = version.clone();
     let nt = notify_tx.clone();
+    let a = atomics.clone();
     let set_value = Arc::new(move |value: Arc<dyn Reflect>| {
         if h.try_store_boxed(Box::new(value)).is_ok() {
-            bump_version(&v, &nt);
+            bump_version(&v, &nt, &a);
         }
     });
 
@@ -508,7 +518,8 @@ fn typed_asset_handle<A: DioxusAssetSync>(
         view,
         notify_rx: state_view.state.notify_rx(),
         health_rx: state_view.state.health_rx.clone(),
-        registry: state_view.state.registry.clone(),
+        slots: state_view.state.slots.clone(),
+        atomics: state_view.state.atomics.clone(),
     };
 
     let s = state.clone();
@@ -581,6 +592,7 @@ pub fn register_or_get_asset_dyn(
     };
 
     let version = Arc::new(AtomicU64::new(0));
+    let atomics = Arc::new(ReadAtomics::new());
     let (notify_tx, notify_rx) = watch::channel(0u64);
     let (health_tx, health_rx) = watch::channel(HealthStatus::Healthy);
 
@@ -591,7 +603,7 @@ pub fn register_or_get_asset_dyn(
         notify_tx.clone(),
         notify_rx,
         health_rx,
-        Arc::new(ReaderRegistry::default()),
+        atomics.clone(),
     );
     let (handle_tx, handle_rx) = watch::channel(handle.clone());
 
@@ -602,6 +614,7 @@ pub fn register_or_get_asset_dyn(
         holder: holder.clone(),
         loaded: loaded.clone(),
         version: version.clone(),
+        atomics,
         notify_tx: notify_tx.clone(),
         health_tx,
         active_count: 1,
@@ -652,12 +665,12 @@ pub fn register_or_get_asset_dyn(
                             && mirror.holder.try_store_boxed(Box::new(arc)).is_ok()
                         {
                             mirror.loaded.store(true, Ordering::Relaxed);
-                            bump_version(&mirror.version, &mirror.notify_tx);
+                            bump_version(&mirror.version, &mirror.notify_tx, &mirror.atomics);
                         }
                     }
                     None => {
                         if mirror.loaded.swap(false, Ordering::Relaxed) {
-                            bump_version(&mirror.version, &mirror.notify_tx);
+                            bump_version(&mirror.version, &mirror.notify_tx, &mirror.atomics);
                         }
                     }
                 }

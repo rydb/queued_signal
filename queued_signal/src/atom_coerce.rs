@@ -5,11 +5,13 @@ use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::ops::Deref;
+use std::ptr;
 use std::ptr::NonNull;
-use std::sync::atomic::fence;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering, fence};
 
-use kovan::{Atomic, Guard, RetiredNode, Shared, flush, pin, retire};
+use kovan::{
+    Atomic, Guard, Reclaimable, RetiredNode, Shared, flush, flush_pending, pin, retire_reclaimable,
+};
 
 use crate::atom_coerce_dyn::Erase;
 
@@ -90,30 +92,228 @@ impl<T> Drop for Arc<T> {
 unsafe impl<T: Send + Sync> Send for Arc<T> {}
 unsafe impl<T: Send + Sync> Sync for Arc<T> {}
 
+/// Outstanding node count for one atom.
+///
+/// The count lives in one word, shifted left by one, with the low bit set once the atom is dropped.
+/// Publishing a node is one add and releasing one is one subtract, and the value a release observes
+/// tells it whether it is the last node of a dropped atom and must also release the counters. The
+/// counters are owned outright rather than shared through a refcount, which the writer would
+/// otherwise touch on every publish.
+#[derive(Debug)]
+pub struct ReclaimHealth {
+    pending: AtomicU64,
+    /// Nodes freed by the reclaimer and ready for reuse, so neither side reaches the allocator.
+    ///
+    /// Only the receiver pushes and only the writing thread pops, so the list needs no tag: a node
+    /// can only be pushed after it was popped, and a popped node is not on the list.
+    pool: AtomicPtr<()>,
+    /// Nodes the writing thread took from the pool and has not used yet.
+    ///
+    /// The receiver never touches this list, so a publication normally takes a node with one
+    /// exchange that no other thread ever contends for.
+    cache: AtomicPtr<()>,
+}
+
+impl ReclaimHealth {
+    /// One node, shifted left by one so the low bit can mark a dropped atom.
+    const ONE: u64 = 2;
+    /// Low bit, set once the owning atom is dropped.
+    const DROPPED: u64 = 1;
+
+    /// Starts the counters for an atom that owns one published node.
+    pub fn new() -> Self {
+        Self {
+            pending: AtomicU64::new(Self::ONE),
+            pool: AtomicPtr::new(ptr::null_mut()),
+            cache: AtomicPtr::new(ptr::null_mut()),
+        }
+    }
+
+    /// Nodes returned by the reclaimer.
+    fn pool(&self) -> &AtomicPtr<()> {
+        &self.pool
+    }
+
+    /// Nodes the writing thread has already taken for itself.
+    fn cache(&self) -> &AtomicPtr<()> {
+        &self.cache
+    }
+
+    /// Published nodes awaiting reclamation, excluding the live node.
+    pub fn retained(&self) -> u64 {
+        (self.pending.load(Ordering::Acquire) >> 1).saturating_sub(1)
+    }
+
+    /// Records one more published node.
+    fn publish(&self) {
+        self.pending.fetch_add(Self::ONE, Ordering::AcqRel);
+    }
+
+    /// Records one released node and reports whether the counters can be freed with it.
+    ///
+    /// That is the case for the final node of an atom that has already been dropped.
+    fn release(&self) -> bool {
+        self.pending.fetch_sub(Self::ONE, Ordering::AcqRel) == Self::ONE | Self::DROPPED
+    }
+
+    /// Marks the atom dropped and reports whether nothing is left to report into the counters.
+    fn drop_atom(&self) -> bool {
+        self.pending.fetch_or(Self::DROPPED, Ordering::AcqRel) == 0
+    }
+}
+
 /// One node published into an atom.
 ///
 /// The reclamation header must stay the first field so the node can be
 /// retired through the epoch scheme.
+///
+/// The counters are reached through a plain pointer rather than a shared count, so publishing a node
+/// does not touch an atomic the drainer also touches on every free.
 #[repr(C)]
 struct AtomNode<T> {
     header: RetiredNode,
-    val: T,
+    deferred: crate::deferred::DeferredHeader,
+    version: u64,
+    health: *const ReclaimHealth,
+    val: ManuallyDrop<T>,
 }
 
-impl<T> AtomNode<T> {
-    /// Allocates a node holding `val`.
-    fn boxed(val: T) -> *mut Self {
-        Box::into_raw(Box::new(Self {
-            header: RetiredNode::new(),
-            val,
-        }))
+impl<T: Send + Sync + 'static> AtomNode<T> {
+    /// Takes a node for `val` at the given publication version, reusing a pooled one when there is.
+    fn boxed(val: T, version: u64, counters: &ReclaimHealth) -> *mut Self {
+        let pooled = take_pooled(counters);
+        if pooled.is_null() {
+            return Box::into_raw(Box::new(Self {
+                header: RetiredNode::new(),
+                deferred: crate::deferred::DeferredHeader::new(),
+                version,
+                health: counters as *const ReclaimHealth,
+                val: ManuallyDrop::new(val),
+            }));
+        }
+        let node = pooled as *mut Self;
+        // SAFETY: the node came from this pool, so it is an allocation of this type whose value was
+        // dropped before it was pooled.
+        unsafe {
+            (*node).header = RetiredNode::new();
+            (*node).deferred = crate::deferred::DeferredHeader::new();
+            (*node).version = version;
+            (*node).health = counters;
+            (*node).val = ManuallyDrop::new(val);
+        }
+        node
     }
 
     /// Points at the value inside a node.
     ///
     /// The caller must keep the node alive.
     unsafe fn val_ptr(node: *const Self) -> *const T {
-        unsafe { std::ptr::addr_of!((*node).val) }
+        unsafe { std::ptr::addr_of!((*node).val) as *const T }
+    }
+}
+
+/// Pops one node from a list, or null when it is empty.
+fn pop_node<T: Send + Sync + 'static>(head: &AtomicPtr<()>) -> *mut AtomNode<T> {
+    let mut current = head.load(Ordering::Acquire);
+    while !current.is_null() {
+        let node = current as *mut AtomNode<T>;
+        // SAFETY: a pooled pointer is this node type, and its link holds the next pooled node.
+        let next = unsafe { (*node).deferred.link() };
+        match head.compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return node,
+            Err(seen) => current = seen,
+        }
+    }
+    ptr::null_mut()
+}
+
+/// Takes one node for reuse, or null when there is none and the caller must allocate.
+///
+/// The private cache is tried first, so a publication normally exchanges a line no other thread
+/// writes. Only an empty cache reaches the shared pool, and it takes the whole pool in one exchange
+/// so the receiver is not contended with for every node in its next burst.
+fn take_pooled<T: Send + Sync + 'static>(counters: &ReclaimHealth) -> *mut AtomNode<T> {
+    let cached = pop_node::<T>(counters.cache());
+    if !cached.is_null() {
+        return cached;
+    }
+    let chain = counters.pool().swap(ptr::null_mut(), Ordering::AcqRel);
+    if chain.is_null() {
+        return ptr::null_mut();
+    }
+    // Only the writing thread uses the cache, and it is empty here.
+    counters.cache().store(chain, Ordering::Release);
+    pop_node::<T>(counters.cache())
+}
+
+/// Returns one node to the pool so the next publication can reuse it.
+fn give_pooled<T: Send + Sync + 'static>(node: *mut AtomNode<T>, counters: &ReclaimHealth) {
+    let pool = counters.pool();
+    let mut head = pool.load(Ordering::Relaxed);
+    loop {
+        // SAFETY: the node was just freed and nothing else reads its link.
+        unsafe { (*node).deferred.set_link(head) };
+        match pool.compare_exchange_weak(
+            head,
+            node as *mut (),
+            Ordering::Release,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(seen) => head = seen,
+        }
+    }
+}
+
+/// Frees every pooled node, using the type only `Atom<T>` and its destructor know.
+unsafe fn free_pooled<T: Send + Sync + 'static>(counters: &ReclaimHealth) {
+    for list in [counters.cache(), counters.pool()] {
+        let mut head = list.swap(ptr::null_mut(), Ordering::AcqRel);
+        while !head.is_null() {
+            let node = head as *mut AtomNode<T>;
+            // SAFETY: every pooled node is an allocation of this type, never published again.
+            head = unsafe { (*node).deferred.link() };
+            drop(unsafe { Box::from_raw(node) });
+        }
+    }
+}
+
+/// Drops the value on the drainer and returns the node to the atom's pool.
+unsafe fn free_node<T: Send + Sync + 'static>(ptr: *mut ()) {
+    let node = ptr as *mut AtomNode<T>;
+    unsafe {
+        ManuallyDrop::drop(&mut (*node).val);
+        // SAFETY: the counters outlive every node, see `Atom::drop`.
+        let counters_ptr = (*node).health;
+        let counters = &*counters_ptr;
+        if counters.release() {
+            // The atom is gone and this was its last node, so the pool and the counters go with it.
+            free_pooled::<T>(counters);
+            drop(Box::from_raw(node));
+            drop(Box::from_raw(counters_ptr as *mut ReclaimHealth));
+        } else {
+            give_pooled(node, counters);
+        }
+    }
+}
+
+// SAFETY: RetiredNode is the first field of a repr(C) node, and dealloc hands
+// the whole allocation to the drainer without dropping the value.
+unsafe impl<T: Send + Sync + 'static> Reclaimable for AtomNode<T> {
+    fn retired_node(&self) -> &RetiredNode {
+        &self.header
+    }
+
+    fn retired_node_mut(&mut self) -> &mut RetiredNode {
+        &mut self.header
+    }
+
+    unsafe fn dealloc(ptr: *mut Self) {
+        // Kovan owns the node until this call and never touches it again, so the embedded header
+        // can be linked into the queue.
+        let header = unsafe { &mut (*ptr).deferred };
+        header.prepare(ptr as *mut (), free_node::<T>);
+        crate::deferred::defer(header);
     }
 }
 
@@ -123,7 +323,15 @@ impl<T> AtomNode<T> {
 pub struct AtomGuard<'a, T: Send + Sync + 'static> {
     _epoch: Guard,
     ptr: *const T,
+    version: u64,
     marker: PhantomData<&'a T>,
+}
+
+impl<T: Send + Sync + 'static> AtomGuard<'_, T> {
+    /// Publication version of the node this guard pinned.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
 }
 
 impl<T: Send + Sync + 'static> Deref for AtomGuard<'_, T> {
@@ -143,47 +351,70 @@ impl<T: Send + Sync + 'static> Deref for AtomGuard<'_, T> {
 /// once the readers pinned before its retirement have moved on.
 pub struct Atom<T: Send + Sync + 'static> {
     root: Atomic<AtomNode<T>>,
+    /// Counters owned by this atom, reached by every node through a pointer.
+    counters: NonNull<ReclaimHealth>,
 }
 
 impl<T: Send + Sync + 'static> Atom<T> {
     /// Publishes a first node holding `val`.
     pub fn new(val: T) -> Self {
+        let counters = Box::into_raw(Box::new(ReclaimHealth::new()));
         Self {
-            root: Atomic::new(AtomNode::boxed(val)),
+            // The first published version is the driver's, so the initial node is version zero.
+            // SAFETY: the allocation above is owned by this atom.
+            root: Atomic::new(AtomNode::boxed(val, 0, unsafe { &*counters })),
+            // SAFETY: the allocation above is owned by this atom.
+            counters: unsafe { NonNull::new_unchecked(counters) },
         }
+    }
+
+    /// Reclamation counters for this atom.
+    pub fn reclaim_health(&self) -> &ReclaimHealth {
+        // SAFETY: the counters outlive this atom.
+        unsafe { self.counters.as_ref() }
     }
 
     /// Loads the current value behind an epoch guard.
     pub fn load(&self) -> AtomGuard<'_, T> {
-        let (epoch, ptr) = self.load_parts();
+        let (epoch, ptr, version) = self.load_parts();
         AtomGuard {
             _epoch: epoch,
             ptr,
+            version,
             marker: PhantomData,
         }
     }
 
-    /// Replaces the value, deferring the destruction of the old node.
-    pub fn store(&self, val: T) {
+    /// Replaces the value at the caller's version, deferring the destruction of the old node.
+    ///
+    /// The caller supplies the version, so publishing takes no counter of its own. A caller without
+    /// a version of its own passes zero.
+    pub fn store(&self, val: T, version: u64) {
         let epoch = pin();
         // SAFETY: the node is a fresh allocation that is published below.
-        let new = unsafe { Shared::from_raw(AtomNode::boxed(val)) };
+        // SAFETY: the counters outlive this atom.
+        let new =
+            unsafe { Shared::from_raw(AtomNode::boxed(val, version, self.counters.as_ref())) };
         let old = self.root.swap(new, Ordering::AcqRel, &epoch);
-        Self::retire_node(old);
+        // SAFETY: the counters outlive this atom.
+        unsafe { self.counters.as_ref() }.publish();
+        self.retire_node(old);
     }
 
-    /// Applies a read-copy-update transformation.
-    ///
-    /// The closure may run more than once when writers contend.
-    pub fn rcu<F>(&self, mut f: F)
+    /// Applies a read-copy-update transformation at the caller's version.
+    pub fn rcu<F>(&self, version: u64, mut f: F)
     where
         F: FnMut(&T) -> T,
     {
         let epoch = pin();
+        // SAFETY: the counters outlive this atom.
+        let counters = unsafe { self.counters.as_ref() };
         loop {
             let current = self.root.load(Ordering::Acquire, &epoch);
+            let node = current.as_raw();
             // SAFETY: the atom always holds a live node.
-            let next_ptr = AtomNode::boxed(f(unsafe { &(*current.as_raw()).val }));
+            let old_value: &T = Deref::deref(unsafe { &(*node).val });
+            let next_ptr = AtomNode::boxed(f(old_value), version, counters);
             // SAFETY: the node is a fresh allocation that is published below.
             let next = unsafe { Shared::from_raw(next_ptr) };
             match self.root.compare_exchange(
@@ -194,31 +425,41 @@ impl<T: Send + Sync + 'static> Atom<T> {
                 &epoch,
             ) {
                 Ok(old) => {
-                    Self::retire_node(old);
+                    // SAFETY: the counters outlive this atom.
+                    unsafe { self.counters.as_ref() }.publish();
+                    self.retire_node(old);
                     return;
                 }
-                // SAFETY: the exchange failed, so the node was never published.
-                Err(_) => unsafe { drop(Box::from_raw(next_ptr)) },
+                // The exchange failed, so the node was never published and goes back to the pool.
+                Err(_) => unsafe {
+                    ManuallyDrop::drop(&mut (*next_ptr).val);
+                    give_pooled(next_ptr, counters);
+                },
             }
         }
     }
 
     /// Pins the epoch and returns the guard with the current value pointer.
-    fn load_parts(&self) -> (Guard, *const T) {
+    pub(crate) fn load_parts(&self) -> (Guard, *const T, u64) {
         let epoch = pin();
         let node = self.root.load(Ordering::Acquire, &epoch);
+        let raw = node.as_raw();
         // SAFETY: the atom always holds a published node.
-        let ptr = unsafe { AtomNode::val_ptr(node.as_raw()) };
-        (epoch, ptr)
+        let ptr = unsafe { AtomNode::val_ptr(raw) };
+        // SAFETY: the node stays alive under the pin.
+        let version = unsafe { (*raw).version };
+        (epoch, ptr, version)
     }
 
-    /// Hands a replaced node to the reclaimer.
-    fn retire_node(node: Shared<'_, AtomNode<T>>) {
+    /// Hands a replaced node to the reclaimer and records when that happened.
+    fn retire_node(&self, node: Shared<'_, AtomNode<T>>) {
         if node.is_null() {
             return;
         }
         // SAFETY: the node was allocated here and is retired exactly once.
-        unsafe { retire(node.as_raw()) };
+        unsafe { retire_reclaimable(node.as_raw()) };
+        // The receiver collects it even when the calling thread holds a guard.
+        crate::deferred::wake();
     }
 }
 
@@ -229,10 +470,21 @@ impl<T: Send + Sync + 'static> Drop for Atom<T> {
             // SAFETY: null is a valid shared pointer for an empty atom.
             let empty = unsafe { Shared::from_raw(std::ptr::null_mut()) };
             let old = self.root.swap(empty, Ordering::AcqRel, &epoch);
-            Self::retire_node(old);
+            self.retire_node(old);
         }
         // Prompt reclamation now that this thread holds no guard.
         flush();
+        drain_deferred_frees();
+
+        // The counters outlive this atom while a node can still report into them. Whichever side
+        // finds the count at zero releases them, and the other side leaves them alone.
+        // SAFETY: the counters are only released once, by the side that observes the last node.
+        let counters = unsafe { self.counters.as_ref() };
+        if counters.drop_atom() {
+            // Nothing can reach the pool any more, so it and the counters are released here.
+            unsafe { free_pooled::<T>(counters) };
+            drop(unsafe { Box::from_raw(self.counters.as_ptr()) });
+        }
     }
 }
 
@@ -302,7 +554,7 @@ pub struct RcuGuard<T: Send + Sync + 'static, D: ?Sized + 'static> {
 
 impl<T: Send + Sync + 'static, D: ?Sized + 'static> RcuGuard<T, D> {
     fn new(shared: &Arc<CoerceShared<T, D>>) -> Self {
-        let (epoch, ptr) = shared.atom.load_parts();
+        let (epoch, ptr, _version) = shared.atom.load_parts();
         RcuGuard { _epoch: epoch, ptr }
     }
 }
@@ -342,6 +594,7 @@ where
 pub struct RcuGuardTyped<T: Send + Sync + 'static> {
     _epoch: Guard,
     ptr: *const T,
+    version: u64,
 }
 
 impl<T: Send + Sync + PartialEq + 'static> PartialEq for RcuGuardTyped<T> {
@@ -352,10 +605,19 @@ impl<T: Send + Sync + PartialEq + 'static> PartialEq for RcuGuardTyped<T> {
 
 impl<T: Send + Sync + 'static> RcuGuardTyped<T> {
     pub(crate) fn new<D: ?Sized + 'static>(shared: &Arc<CoerceShared<T, D>>) -> Self {
-        let (epoch, value) = shared.atom.load_parts();
+        let (epoch, value, version) = shared.atom.load_parts();
         // SAFETY: the pin keeps the node that holds the value alive.
         let ptr = unsafe { std::ptr::addr_of!((*value).value) };
-        RcuGuardTyped { _epoch: epoch, ptr }
+        RcuGuardTyped {
+            _epoch: epoch,
+            ptr,
+            version,
+        }
+    }
+
+    /// Publication version of the node this guard pinned.
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
     /// Projects this guard onto a value inside the pinned item.
@@ -365,7 +627,11 @@ impl<T: Send + Sync + 'static> RcuGuardTyped<T> {
         self,
         f: impl FnOnce(&T) -> &U,
     ) -> RcuGuardTyped<U> {
-        let RcuGuardTyped { _epoch, ptr } = self;
+        let RcuGuardTyped {
+            _epoch,
+            ptr,
+            version,
+        } = self;
         // SAFETY: the epoch guard keeps the node that holds the value alive, and
         // the closure returns a reference derived from that pinned value.
         let value = unsafe { &*ptr };
@@ -373,6 +639,7 @@ impl<T: Send + Sync + 'static> RcuGuardTyped<T> {
         RcuGuardTyped {
             _epoch,
             ptr: projected,
+            version,
         }
     }
 }
@@ -405,6 +672,11 @@ impl<T: Send + Sync + 'static, D: ?Sized + 'static> AtomCoerce<T, D> {
     /// Reads the current value through a guard that points directly at T.
     pub fn read_typed(&self) -> RcuGuardTyped<T> {
         RcuGuardTyped::new(&self.shared)
+    }
+
+    /// Reclamation counters for this cell.
+    pub fn reclaim_health(&self) -> &ReclaimHealth {
+        self.shared.atom.reclaim_health()
     }
 
     /// Wraps a value, using the built-in metadata for the target view.
@@ -451,10 +723,13 @@ impl<T: Send + Sync + 'static, D: ?Sized + 'static> AtomCoerce<T, D> {
 
     /// Atomically replaces the value.
     pub fn store(&self, val: T) {
-        self.shared.atom.store(Value {
-            value: val,
-            marker: PhantomData,
-        });
+        self.shared.atom.store(
+            Value {
+                value: val,
+                marker: PhantomData,
+            },
+            0,
+        );
     }
 
     /// Applies a read-copy-update transformation to the value.
@@ -462,7 +737,29 @@ impl<T: Send + Sync + 'static, D: ?Sized + 'static> AtomCoerce<T, D> {
     where
         F: FnMut(&T) -> T,
     {
-        self.shared.atom.rcu(|value: &Value<T, D>| Value {
+        self.shared.atom.rcu(0, |value: &Value<T, D>| Value {
+            value: f(&value.value),
+            marker: PhantomData,
+        });
+    }
+
+    /// Atomically replaces the value at the caller's version.
+    pub fn store_versioned(&self, val: T, version: u64) {
+        self.shared.atom.store(
+            Value {
+                value: val,
+                marker: PhantomData,
+            },
+            version,
+        );
+    }
+
+    /// Applies a read-copy-update transformation at the caller's version.
+    pub fn rcu_versioned<F>(&self, version: u64, mut f: F)
+    where
+        F: FnMut(&T) -> T,
+    {
+        self.shared.atom.rcu(version, |value: &Value<T, D>| Value {
             value: f(&value.value),
             marker: PhantomData,
         });
@@ -502,6 +799,11 @@ impl<T: Send + Sync + 'static, D: ?Sized + 'static> AtomCoerceHandle<T, D> {
         RcuGuardTyped::new(&self.shared)
     }
 
+    /// Reclamation counters for this cell.
+    pub fn reclaim_health(&self) -> &ReclaimHealth {
+        self.shared.atom.reclaim_health()
+    }
+
     /// Views this handle under a different erased trait object.
     ///
     /// The concrete value layout is independent of the erased view, so the
@@ -530,10 +832,13 @@ impl<T: Send + Sync + 'static, D: ?Sized + 'static> AtomCoerceHandle<T, D> {
 
     /// Atomically replaces the value.
     pub fn store(&self, val: T) {
-        self.shared.atom.store(Value {
-            value: val,
-            marker: PhantomData,
-        });
+        self.shared.atom.store(
+            Value {
+                value: val,
+                marker: PhantomData,
+            },
+            0,
+        );
     }
 
     /// Applies a read-copy-update transformation to the value.
@@ -541,7 +846,7 @@ impl<T: Send + Sync + 'static, D: ?Sized + 'static> AtomCoerceHandle<T, D> {
     where
         F: FnMut(&T) -> T,
     {
-        self.shared.atom.rcu(|value: &Value<T, D>| Value {
+        self.shared.atom.rcu(0, |value: &Value<T, D>| Value {
             value: f(&value.value),
             marker: PhantomData,
         });
@@ -554,6 +859,44 @@ impl<T: Send + Sync + 'static, D: ?Sized + 'static> Clone for AtomCoerceHandle<T
             shared: self.shared.clone(),
         }
     }
+}
+
+/// Runs every deferred destructor that reclamation has queued.
+pub fn drain_deferred_frees() -> usize {
+    crate::deferred::drain()
+}
+
+/// Submits this thread's retired batch when it holds one.
+///
+/// A batch only leaves the thread that retired it, so the write path submits before it returns
+/// rather than on a timer. Kovan already tracks whether the batch is empty, so no flag of ours is
+/// needed on the retire path.
+pub(crate) fn submit_if_pending() {
+    flush_pending();
+}
+
+/// Runs one reclamation step on the calling thread.
+///
+/// The era is global while retired batches are per thread, so one call drains every signal this
+/// thread retired and lets generations retired elsewhere become eligible. It costs tens of
+/// nanoseconds, so an embedder runs it once per frame on each thread that reads.
+// TODO: ask the reclamation backend to keep every retirement in the retiring thread's slot, then
+// remove this and the per frame call from the embedder.
+pub fn flush_thread_reclamation() {
+    let guard = pin();
+    drop(guard);
+    flush();
+}
+
+/// Runs a full reclamation cycle on the calling thread and wakes the receiver.
+pub fn flush_reclamation() {
+    for _ in 0..2 {
+        let guard = pin();
+        drop(guard);
+        flush();
+    }
+    crate::deferred::wake();
+    drain_deferred_frees();
 }
 
 #[cfg(test)]

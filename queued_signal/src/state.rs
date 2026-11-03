@@ -1,36 +1,65 @@
+//! Read and write state for a queued signal.
+//!
+//! A read pins the current generation and loads it, so it never waits on the writer.
+//! The writer driver applies queued mutations, publishes a new generation, and wakes the
+//! reactive contexts recorded in the subscriber slots.
+//!
+//! The driver begins one subscriber pass per frame and publishes inside that pass. A slot is
+//! pruned after more than [`PRUNE_AFTER_PASSES`](crate::subscriber_slots::PRUNE_AFTER_PASSES)
+//! passes without a read, so a component that stops reading stops rendering.
+//!
+//! Retained generations drive [`HealthStatus`](crate::state::HealthStatus). `Healthy` means every
+//! replaced generation was dropped. `Degraded` means one is still retained while reclamation is
+//! still making progress, and `Stalled` means a whole window of publishes released nothing, which
+//! points at a reader starving reclamation.
+
 use dioxus::prelude::*;
 use dioxus::signals::Signal;
 use dioxus_core::Task;
 use flume::{Receiver, Sender};
 use parking_lot::Mutex;
 use std::any::Any;
-use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::ops::Deref;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
+
+use dioxus_core::ReactiveContext;
 
 use crate::atom_coerce::{AtomCoerce, AtomCoerceHandle, RcuGuard, RcuGuardTyped};
 use crate::atom_coerce_dyn::{AtomCoerceDynHandle, AtomCoerceDynSlotGuard, EraseMut};
 use crate::macros::warn;
+use crate::subscriber_slots::{PassEpoch, SubscriberSlots};
 
 /// Health status of QueuedSignal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HealthStatus {
-    /// All registered readers accessed their snapshots within the watchdog timeout.
+    /// Every replaced generation has been reclaimed.
     Healthy,
-    /// One reader stopped accessing its snapshot beyond the watchdog timeout.
+    /// Generations are still retained while reclamation is making progress.
     Degraded {
-        /// Number of pinned snapshots.
+        /// Number of retained generations.
         pinned_buffers: usize,
     },
-    /// Two or more readers stopped accessing their snapshots beyond the watchdog timeout.
+    /// A window of publishes released nothing and the backlog outgrew that window.
     Stalled {
-        /// Number of pinned snapshots.
+        /// Number of retained generations.
         pinned_buffers: usize,
     },
+}
+
+impl HealthStatus {
+    /// Maps a retained generation count onto its status, with no progress information.
+    pub fn from_pinned(pinned: usize) -> Self {
+        match pinned {
+            0 => HealthStatus::Healthy,
+            _ => HealthStatus::Degraded {
+                pinned_buffers: pinned,
+            },
+        }
+    }
 }
 
 impl Display for HealthStatus {
@@ -47,66 +76,84 @@ impl Display for HealthStatus {
     }
 }
 
-/// Registry tracking active read guards for snapshot pin detection.
-#[derive(Debug)]
-pub struct ReaderRegistry {
-    readers: Mutex<HashMap<u64, u64>>,
-    epoch: Instant,
-    next_id: AtomicU64,
+/// Version and health words shared by the writer and every reader.
+///
+/// The writer stores both words with `Release` and readers load them with `Acquire`.
+/// Watch channels remain for async forwarders, and the value read path never touches them.
+pub struct ReadAtomics {
+    version: AtomicU64,
+    pinned: AtomicUsize,
+    status: AtomicU64,
 }
 
-impl Default for ReaderRegistry {
-    fn default() -> Self {
+/// Bits reserved for the status tag, with the retained count above them.
+const STATUS_TAG_BITS: u32 = 2;
+
+const fn encode_health(status: HealthStatus) -> u64 {
+    match status {
+        HealthStatus::Healthy => 0,
+        HealthStatus::Degraded { pinned_buffers } => {
+            1 | ((pinned_buffers as u64) << STATUS_TAG_BITS)
+        }
+        HealthStatus::Stalled { pinned_buffers } => {
+            2 | ((pinned_buffers as u64) << STATUS_TAG_BITS)
+        }
+    }
+}
+
+const fn decode_health(word: u64) -> HealthStatus {
+    let pinned_buffers = (word >> STATUS_TAG_BITS) as usize;
+    match word & 0b11 {
+        0 => HealthStatus::Healthy,
+        1 => HealthStatus::Degraded { pinned_buffers },
+        _ => HealthStatus::Stalled { pinned_buffers },
+    }
+}
+
+impl ReadAtomics {
+    /// Creates the words at version zero with no retained generation.
+    pub fn new() -> Self {
         Self {
-            readers: Mutex::new(HashMap::new()),
-            epoch: Instant::now(),
-            next_id: AtomicU64::new(1),
+            version: AtomicU64::new(0),
+            pinned: AtomicUsize::new(0),
+            status: AtomicU64::new(0),
         }
+    }
+
+    /// Publishes a version to readers.
+    pub fn store_version(&self, version: u64) {
+        self.version.store(version, Ordering::Release);
+    }
+
+    /// Publishes the number of retained generations to readers.
+    pub fn store_pinned(&self, pinned: usize) {
+        self.pinned.store(pinned, Ordering::Release);
+    }
+
+    /// Publishes a health status to readers.
+    pub fn store_health(&self, status: HealthStatus) {
+        self.status.store(encode_health(status), Ordering::Release);
+    }
+
+    /// Reads the latest published version.
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
+    }
+
+    /// Reads the latest retained generation count.
+    pub fn pinned(&self) -> usize {
+        self.pinned.load(Ordering::Acquire)
+    }
+
+    /// Reads the latest health status.
+    pub fn health(&self) -> HealthStatus {
+        decode_health(self.status.load(Ordering::Acquire))
     }
 }
 
-impl ReaderRegistry {
-    /// Nanoseconds elapsed since the registry epoch.
-    pub(crate) fn now_nanos(&self) -> u64 {
-        u64::try_from(self.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
-    }
-
-    /// Register a new reader and return its unique ID.
-    pub fn register(&self) -> u64 {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let now = self.now_nanos();
-        self.readers.lock().insert(id, now);
-        id
-    }
-
-    /// Remove a reader from the registry.
-    pub fn unregister(&self, id: u64) {
-        self.readers.lock().remove(&id);
-    }
-
-    /// Record a heartbeat for the given reader, resetting its stall timer.
-    pub fn heartbeat(&self, id: u64) {
-        let now = self.now_nanos();
-        if let Some(last_seen) = self.readers.lock().get_mut(&id) {
-            *last_seen = now;
-        }
-    }
-
-    /// Return IDs of all readers whose last heartbeat exceeds `timeout`.
-    pub fn check_stalled(&self, timeout: Duration) -> Vec<u64> {
-        let now = self.now_nanos();
-        let timeout_nanos = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
-        self.readers
-            .lock()
-            .iter()
-            .filter_map(|(&id, &last_seen)| {
-                if now.saturating_sub(last_seen) > timeout_nanos {
-                    Some(id)
-                } else {
-                    None
-                }
-            })
-            .collect()
+impl Default for ReadAtomics {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -151,8 +198,10 @@ pub struct QueuedState<T: Clone + Send + Sync + 'static, D: ?Sized + 'static = d
     pub notify_rx: watch::Receiver<u64>,
     /// Health status notification channel.
     pub health_rx: watch::Receiver<HealthStatus>,
-    /// Shared reader registry for stall detection.
-    pub registry: Arc<ReaderRegistry>,
+    /// Subscriber slots used to wake reactive contexts.
+    pub slots: SubscriberSlots<ReactiveContext>,
+    /// Lock free version and health words.
+    pub atomics: Arc<ReadAtomics>,
 }
 
 impl<T: Clone + Send + Sync + 'static, D: ?Sized + 'static> Debug for QueuedState<T, D> {
@@ -160,7 +209,6 @@ impl<T: Clone + Send + Sync + 'static, D: ?Sized + 'static> Debug for QueuedStat
         f.debug_struct("QueuedState")
             .field("notify_rx", &self.notify_rx)
             .field("health_rx", &self.health_rx)
-            .field("registry", &self.registry)
             .finish()
     }
 }
@@ -171,7 +219,8 @@ impl<T: Clone + Send + Sync + 'static, D: ?Sized + 'static> Clone for QueuedStat
             cell: self.cell.clone(),
             notify_rx: self.notify_rx.clone(),
             health_rx: self.health_rx.clone(),
-            registry: self.registry.clone(),
+            slots: self.slots.clone(),
+            atomics: self.atomics.clone(),
         }
     }
 }
@@ -180,7 +229,10 @@ impl<T: Clone + Send + Sync + 'static, D: ?Sized + 'static> QueuedState<T, D> {
     /// Returns a tracked read guard over the current read buffer.
     pub fn read(&self) -> TrackedReadGuard<T> {
         let guard = self.cell.read_typed();
-        TrackedReadGuard::new(guard, self.registry.clone())
+        if let Some(context) = ReactiveContext::current() {
+            self.slots.join(context, guard.version());
+        }
+        TrackedReadGuard::new(guard)
     }
 
     /// Projects the current value without registering a reader.
@@ -199,7 +251,15 @@ impl<T: Clone + Send + Sync + 'static, D: ?Sized + 'static> QueuedState<T, D> {
 
     /// Current health status of the underlying signal.
     pub fn health(&self) -> HealthStatus {
-        *self.health_rx.borrow()
+        self.atomics.health()
+    }
+
+    /// Starts a new subscriber pass and returns its number.
+    ///
+    /// The built in driver calls this once per [`tick`](WriterDriver::tick). A custom driver
+    /// must call it once per frame, and readers stay subscribed while their pass gap is small.
+    pub fn begin_pass(&self) -> u64 {
+        self.slots.begin_pass()
     }
 
     /// Clone of the version notification receiver.
@@ -209,7 +269,7 @@ impl<T: Clone + Send + Sync + 'static, D: ?Sized + 'static> QueuedState<T, D> {
 
     /// Peek the current version without entering the read side.
     pub fn peek_version(&self) -> u64 {
-        *self.notify_rx.borrow()
+        self.atomics.version()
     }
 }
 
@@ -288,8 +348,10 @@ pub struct QueuedStateDyn<D: ?Sized + 'static> {
     pub notify_rx: watch::Receiver<u64>,
     /// Health status notification channel.
     pub health_rx: watch::Receiver<HealthStatus>,
-    /// Shared reader registry for stall detection.
-    pub registry: Arc<ReaderRegistry>,
+    /// Subscriber slots used to wake reactive contexts.
+    pub slots: SubscriberSlots<ReactiveContext>,
+    /// Lock free version and health words.
+    pub atomics: Arc<ReadAtomics>,
 }
 
 impl<D: ?Sized + 'static> Debug for QueuedStateDyn<D> {
@@ -297,7 +359,6 @@ impl<D: ?Sized + 'static> Debug for QueuedStateDyn<D> {
         f.debug_struct("QueuedStateDyn")
             .field("notify_rx", &self.notify_rx)
             .field("health_rx", &self.health_rx)
-            .field("registry", &self.registry)
             .finish()
     }
 }
@@ -308,7 +369,8 @@ impl<D: ?Sized + 'static> Clone for QueuedStateDyn<D> {
             view: self.view.clone(),
             notify_rx: self.notify_rx.clone(),
             health_rx: self.health_rx.clone(),
-            registry: self.registry.clone(),
+            slots: self.slots.clone(),
+            atomics: self.atomics.clone(),
         }
     }
 }
@@ -316,12 +378,23 @@ impl<D: ?Sized + 'static> Clone for QueuedStateDyn<D> {
 impl<D: ?Sized + 'static> QueuedStateDyn<D> {
     /// Returns a tracked read guard over the erased view.
     pub fn read(&self) -> TrackedReadGuardDyn<D> {
-        TrackedReadGuardDyn::new(self.view.get(), self.registry.clone())
+        let guard = self.view.get();
+        if let Some(context) = ReactiveContext::current() {
+            self.slots.join(context, guard.version());
+        }
+        TrackedReadGuardDyn::new(guard)
     }
 
     /// Current health status of the underlying signal.
     pub fn health(&self) -> HealthStatus {
-        *self.health_rx.borrow()
+        self.atomics.health()
+    }
+
+    /// Starts a new subscriber pass and returns its number.
+    ///
+    /// Call this once per frame from the driver that publishes this signal.
+    pub fn begin_pass(&self) -> u64 {
+        self.slots.begin_pass()
     }
 
     /// Clone of the version notification receiver.
@@ -331,7 +404,7 @@ impl<D: ?Sized + 'static> QueuedStateDyn<D> {
 
     /// Peek the current version without entering the read side.
     pub fn peek_version(&self) -> u64 {
-        *self.notify_rx.borrow()
+        self.atomics.version()
     }
 
     /// Spawn a background task forwarding the version into a dioxus signal.
@@ -362,53 +435,9 @@ impl<D: ?Sized + 'static> QueuedStateDyn<D> {
     }
 }
 
-/// Minimum spacing between implicit heartbeats, in nanoseconds.
-const TOUCH_INTERVAL_NANOS: u64 = 10_000_000;
-
-/// Reader registration that unregisters on drop.
-struct ReaderTicket {
-    registry: Arc<ReaderRegistry>,
-    reader_id: u64,
-    last_touch: AtomicU64,
-}
-
-impl ReaderTicket {
-    fn new(registry: Arc<ReaderRegistry>) -> Self {
-        let reader_id = registry.register();
-        let now = registry.now_nanos();
-        Self {
-            registry,
-            reader_id,
-            last_touch: AtomicU64::new(now),
-        }
-    }
-
-    fn heartbeat(&self) {
-        let now = self.registry.now_nanos();
-        self.last_touch.store(now, Ordering::Relaxed);
-        self.registry.heartbeat(self.reader_id);
-    }
-
-    /// Refreshes the stall timer when the reader accesses its snapshot.
-    fn touch(&self) {
-        let now = self.registry.now_nanos();
-        if now.saturating_sub(self.last_touch.load(Ordering::Relaxed)) < TOUCH_INTERVAL_NANOS {
-            return;
-        }
-        self.heartbeat();
-    }
-}
-
-impl Drop for ReaderTicket {
-    fn drop(&mut self) {
-        self.registry.unregister(self.reader_id);
-    }
-}
-
 /// Read guard for a QueuedSignal.
 pub struct TrackedReadGuard<T: Send + Sync + 'static> {
     guard: RcuGuardTyped<T>,
-    ticket: ReaderTicket,
 }
 
 impl<T: Send + Sync + 'static + PartialEq> PartialEq for TrackedReadGuard<T> {
@@ -418,17 +447,12 @@ impl<T: Send + Sync + 'static + PartialEq> PartialEq for TrackedReadGuard<T> {
 }
 
 impl<T: Send + Sync + 'static> TrackedReadGuard<T> {
-    fn new(guard: RcuGuardTyped<T>, registry: Arc<ReaderRegistry>) -> Self {
-        Self {
-            guard,
-            ticket: ReaderTicket::new(registry),
-        }
+    fn new(guard: RcuGuardTyped<T>) -> Self {
+        Self { guard }
     }
 
-    /// Record a heartbeat, resetting this reader's stall timer.
-    pub fn heartbeat(&self) {
-        self.ticket.heartbeat();
-    }
+    /// Kept for API compatibility. Retention is tracked per generation.
+    pub fn heartbeat(&self) {}
 
     /// Projects the guard onto a value inside the pinned item.
     ///
@@ -440,7 +464,6 @@ impl<T: Send + Sync + 'static> TrackedReadGuard<T> {
         ProjectedReadGuard {
             source: ProjectedSource::Pinned {
                 guard: self.guard.project(f),
-                ticket: Some(self.ticket),
             },
         }
     }
@@ -448,11 +471,8 @@ impl<T: Send + Sync + 'static> TrackedReadGuard<T> {
 
 /// Storage backing a projected read guard.
 enum ProjectedSource<U: Send + Sync + 'static> {
-    /// A projection into a pinned item, tracked when a reader ticket is present.
-    Pinned {
-        guard: RcuGuardTyped<U>,
-        ticket: Option<ReaderTicket>,
-    },
+    /// A projection into a pinned item.
+    Pinned { guard: RcuGuardTyped<U> },
     /// An owned value with no read pin.
     Owned(U),
 }
@@ -494,23 +514,12 @@ impl<U: Send + Sync + 'static> ProjectedReadGuard<U> {
     /// Wraps a pinned projection that registers no reader.
     pub fn from_pinned(guard: RcuGuardTyped<U>) -> Self {
         Self {
-            source: ProjectedSource::Pinned {
-                guard,
-                ticket: None,
-            },
+            source: ProjectedSource::Pinned { guard },
         }
     }
 
-    /// Records a heartbeat for a tracked guard.
-    pub fn heartbeat(&self) {
-        if let ProjectedSource::Pinned {
-            ticket: Some(ticket),
-            ..
-        } = &self.source
-        {
-            ticket.heartbeat();
-        }
-    }
+    /// Kept for API compatibility. Retention is tracked per generation.
+    pub fn heartbeat(&self) {}
 }
 
 impl<U: Send + Sync + 'static> Deref for ProjectedReadGuard<U> {
@@ -524,22 +533,16 @@ impl<U: Send + Sync + 'static> Deref for ProjectedReadGuard<U> {
 /// Read guard for an erased view over a queued signal.
 pub struct TrackedReadGuardDyn<D: ?Sized + 'static> {
     guard: AtomCoerceDynSlotGuard<D>,
-    ticket: ReaderTicket,
 }
 
 impl<D: ?Sized + 'static> TrackedReadGuardDyn<D> {
-    /// Wraps an erased slot guard with reader tracking.
-    pub fn new(guard: AtomCoerceDynSlotGuard<D>, registry: Arc<ReaderRegistry>) -> Self {
-        Self {
-            guard,
-            ticket: ReaderTicket::new(registry),
-        }
+    /// Wraps an erased slot guard.
+    pub fn new(guard: AtomCoerceDynSlotGuard<D>) -> Self {
+        Self { guard }
     }
 
-    /// Records a heartbeat for this reader.
-    pub fn heartbeat(&self) {
-        self.ticket.heartbeat();
-    }
+    /// Kept for API compatibility. Retention is tracked per generation.
+    pub fn heartbeat(&self) {}
 }
 
 impl<D: ?Sized + 'static> Deref for TrackedReadGuardDyn<D> {
@@ -559,32 +562,25 @@ impl<T: Clone + Send + Sync + 'static> Deref for TrackedReadGuard<T> {
 }
 
 impl<T: Send + Sync + 'static> AsRef<T> for TrackedReadGuard<T> {
-    /// Borrows the underlying value, refreshing the stall timer.
+    /// Borrows the underlying value.
     fn as_ref(&self) -> &T {
-        self.ticket.touch();
         &self.guard
     }
 }
 
 impl<U: Send + Sync + 'static> AsRef<U> for ProjectedReadGuard<U> {
-    /// Borrows the projected value, refreshing the stall timer.
+    /// Borrows the projected value.
     fn as_ref(&self) -> &U {
         match &self.source {
-            ProjectedSource::Pinned { guard, ticket } => {
-                if let Some(ticket) = ticket {
-                    ticket.touch();
-                }
-                guard
-            }
+            ProjectedSource::Pinned { guard } => guard,
             ProjectedSource::Owned(value) => value,
         }
     }
 }
 
 impl<D: ?Sized + 'static> AsRef<D> for TrackedReadGuardDyn<D> {
-    /// Borrows the erased value, refreshing the stall timer.
+    /// Borrows the erased value.
     fn as_ref(&self) -> &D {
-        self.ticket.touch();
         self.guard.as_dyn()
     }
 }
@@ -595,6 +591,12 @@ pub type DrainedOps<T, D> = (
     Vec<MutationOp<T, D>>,
     Vec<MutationOp<T, D>>,
 );
+
+/// Publishes with no reclamation progress that report a stall.
+///
+/// A replaced generation is released by a later retire, so a couple of publishes with nothing freed
+/// is the normal lag. A whole window with nothing freed means a reader is starving the reclaimer.
+const STALL_WINDOW_PUBLISHES: u64 = 4;
 
 /// Driver for managing reads and writes for a QueuedSignal.
 ///
@@ -612,12 +614,14 @@ pub struct WriterDriver<
     abs_slot: Arc<Mutex<Option<T>>>,
     notify_tx: watch::Sender<u64>,
     version: u64,
+    current_version: u64,
     health_tx: watch::Sender<HealthStatus>,
     last_health: HealthStatus,
-    registry: Arc<ReaderRegistry>,
-    /// Timeout for how long signal health updates will be waited for until marking a signal as stalled.
-    pub watchdog_timeout: Duration,
     last_publish: Instant,
+    /// Reclaimed count recorded at each of the last publishes, newest last.
+    reclaim_history: std::collections::VecDeque<u64>,
+    /// Whether the last window of publishes saw no reclamation progress.
+    starved: bool,
     /// Sender for authoritative full-value replacements.
     pub set_value_tx: Sender<SetValueOp<T>>,
     /// Sender for authoritative closure mutations.
@@ -636,8 +640,6 @@ impl<T: Debug + Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static
         f.debug_struct("WriterDriver")
             .field("version", &self.version)
             .field("last_health", &self.last_health)
-            .field("registry", &self.registry)
-            .field("watchdog_timeout", &self.watchdog_timeout)
             .field("last_publish", &self.last_publish)
             .field("queued_state", &self.queued_state)
             .finish()
@@ -653,13 +655,16 @@ impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Writer
         let (set_tx, set_rx) = flume::unbounded();
         let (add_tx, add_rx) = flume::unbounded();
 
-        let registry = Arc::new(ReaderRegistry::default());
+        let pass = PassEpoch::new();
+        let slots = SubscriberSlots::new(pass);
+        let atomics = Arc::new(ReadAtomics::new());
 
         let state: QueuedState<T, D> = QueuedState {
             cell: cell.handle(),
             notify_rx,
             health_rx,
-            registry: registry.clone(),
+            slots,
+            atomics,
         };
 
         Self {
@@ -670,11 +675,16 @@ impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Writer
             abs_slot: Arc::new(Mutex::new(None)),
             notify_tx,
             health_tx,
-            registry,
-            watchdog_timeout: Duration::from_millis(500),
+            // Above two publish intervals, which is the lag a replaced generation has before a
+            // later retire releases it.
             last_publish: Instant::now(),
+            reclaim_history: std::collections::VecDeque::with_capacity(
+                STALL_WINDOW_PUBLISHES as usize + 1,
+            ),
+            starved: false,
             publish_counter: None,
             version: 0,
+            current_version: 0,
             last_health: HealthStatus::Healthy,
             set_value_tx,
             set_tx,
@@ -707,18 +717,65 @@ impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Writer
     }
 
     /// Publishes the current version to readers.
+    ///
+    /// Call this in the same pass as [`begin_pass`](QueuedState::begin_pass), so a reader that
+    /// read during the previous pass still receives the mark.
     pub fn publish(&mut self) {
         self.version += 1;
+        self.publish_current();
+    }
+
+    /// Publishes the version and the snapshot the caller already stored.
+    fn publish_current(&mut self) {
+        self.queued_state.atomics.store_version(self.version);
         let _ = self.notify_tx.send(self.version);
         if let Some(ref counter) = self.publish_counter {
             counter.fetch_add(1, Ordering::Relaxed);
         }
+        self.queued_state
+            .slots
+            .visit(self.current_version, |context| context.mark_dirty());
+        // A retired batch only leaves the thread that retired it, and the receiver does the
+        // collecting and the destructor work. A publish that retired nothing pays one read.
+        crate::atom_coerce::submit_if_pending();
+        self.record_reclaim_progress();
+    }
+
+    /// Records reclamation progress for the publish that just happened.
+    ///
+    /// Kovan releases a replaced generation from a later retire, so a publish that frees nothing is
+    /// normal for a couple of publishes. A whole window of publishes with nothing freed is what
+    /// reports a stall, which needs no clock.
+    fn record_reclaim_progress(&mut self) {
+        let retained = self.cell.reclaim_health().retained();
+        self.reclaim_history.push_back(retained);
+        if self.reclaim_history.len() > STALL_WINDOW_PUBLISHES as usize + 1 {
+            self.reclaim_history.pop_front();
+        }
+        let window_full = self.reclaim_history.len() > STALL_WINDOW_PUBLISHES as usize;
+        // Progress means the backlog shrank since the oldest publish in the window.
+        self.starved = window_full
+            && self
+                .reclaim_history
+                .front()
+                .is_some_and(|oldest| retained >= *oldest);
     }
 
     /// Stores a value into the read buffer and publishes a new version.
     pub fn publish_value(&mut self, value: T) {
-        self.cell.store(value);
-        self.publish();
+        self.version += 1;
+        self.current_version = self.version;
+        self.cell.store_versioned(value, self.version);
+        self.publish_current();
+    }
+
+    /// Submits whatever this thread has retired, so the next health read is not counting it.
+    ///
+    /// A retire lands in kovan's accumulating batch, which the health count treats as retained
+    /// until the batch is placed. A write path that publishes without submitting therefore reports
+    /// a backlog of its own unplaced retires.
+    pub fn submit_pending(&self) {
+        crate::atom_coerce::submit_if_pending();
     }
 
     /// Drains all buffers and replaces with the given value.
@@ -735,13 +792,19 @@ impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Writer
 
     /// Drain pending operations, publish if the interval has elapsed,
     /// and update the health status.
+    ///
+    /// Call this once per frame. Each call begins a subscriber pass, so a reader that does not
+    /// read again before the next call is pruned from the slot array.
     pub fn tick(&mut self, publish_interval: Duration) {
+        self.queued_state.begin_pass();
         let abs_taken = { self.abs_slot.lock().take() };
 
         let did_work;
 
         if let Some(abs_val) = abs_taken {
-            self.cell.store(abs_val);
+            self.version += 1;
+            self.current_version = self.version;
+            self.cell.store_versioned(abs_val, self.version);
             self.set_value_rx.drain();
             self.set_rx.drain();
             self.add_rx.drain();
@@ -753,7 +816,9 @@ impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Writer
                 self.update_health();
                 return;
             }
-            self.cell.rcu(|old| {
+            self.version += 1;
+            self.current_version = self.version;
+            self.cell.rcu_versioned(self.version, |old| {
                 let mut working = old.clone();
                 for op in &set_values {
                     working = (*op.0).clone();
@@ -770,27 +835,44 @@ impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Writer
         }
 
         if did_work && self.last_publish.elapsed() >= publish_interval {
-            self.publish();
+            self.publish_current();
             self.last_publish = Instant::now();
         }
 
+        // An op applied without a publish still retires a generation.
+        crate::atom_coerce::submit_if_pending();
         self.update_health();
     }
 
     /// Recomputes and publishes the current health status.
+    ///
+    /// `Stalled` means a whole window of publishes released nothing and the backlog also outgrew
+    /// that window, which is a reader starving the reclaimer. `Degraded` means generations are
+    /// retained while progress is still happening, and `Healthy` means nothing is retained.
     pub fn update_health(&mut self) {
-        let stalled = self.registry.check_stalled(self.watchdog_timeout);
-        let pinned = stalled.len();
-        let status = match pinned {
-            0 => HealthStatus::Healthy,
-            1 => HealthStatus::Degraded {
+        // Submitting belongs to the write path and the destructors belong to the receiver, so a
+        // scan only reads the counters and publishes the status.
+        let retained = self.cell.reclaim_health().retained();
+        let pinned = usize::try_from(retained).unwrap_or(usize::MAX);
+        let status = if retained == 0 {
+            HealthStatus::Healthy
+        } else if self.starved && retained > STALL_WINDOW_PUBLISHES {
+            // A backlog on its own is not a stall, because a burst of publishes holds a few
+            // generations until the next era advance. Stalled needs a window that released
+            // nothing and a backlog that outgrew that window.
+            HealthStatus::Stalled {
                 pinned_buffers: pinned,
-            },
-            _ => HealthStatus::Stalled {
+            }
+        } else {
+            HealthStatus::Degraded {
                 pinned_buffers: pinned,
-            },
+            }
         };
-        if status != self.last_health {
+        self.queued_state.atomics.store_pinned(pinned);
+        self.queued_state.atomics.store_health(status);
+        // The count is readable from the atomics, so notify only when the severity changes.
+        // A count only change would repaint every reader for no visible reason.
+        if core::mem::discriminant(&status) != core::mem::discriminant(&self.last_health) {
             self.last_health = status;
             let _ = self.health_tx.send(status);
         }
@@ -1014,37 +1096,6 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn reader_registry_stall_detection() {
-        let registry = ReaderRegistry::default();
-        let id = registry.register();
-        registry.heartbeat(id);
-        assert!(
-            registry
-                .check_stalled(Duration::from_millis(100))
-                .is_empty()
-        );
-
-        let id2 = registry.register();
-        std::thread::sleep(Duration::from_millis(50));
-        let stalled = registry.check_stalled(Duration::from_millis(10));
-        assert!(stalled.contains(&id2));
-
-        registry.heartbeat(id);
-        let stalled = registry.check_stalled(Duration::from_millis(100));
-        assert!(stalled.is_empty() || stalled == vec![id2]);
-    }
-
-    #[test]
-    fn reader_registry_unregister() {
-        let registry = ReaderRegistry::default();
-        let id = registry.register();
-        assert!(!registry.check_stalled(Duration::from_millis(0)).is_empty());
-
-        registry.unregister(id);
-        assert!(registry.check_stalled(Duration::ZERO).is_empty());
-    }
-
-    #[test]
     fn writer_driver_tick_ordering() {
         let mut driver = WriterDriver::new(0i32);
 
@@ -1098,28 +1149,60 @@ mod tests {
     #[test]
     fn health_status_transitions() {
         let mut driver = WriterDriver::new(0i32);
+        let state = driver.queued_state.clone();
+        assert_eq!(state.health(), HealthStatus::Healthy);
+        assert_eq!(state.peek_version(), 0);
 
-        assert_eq!(driver.queued_state.health(), HealthStatus::Healthy);
-
-        let _id = driver.registry.register();
-        driver.watchdog_timeout = Duration::from_millis(1);
-        std::thread::sleep(Duration::from_millis(10));
-
+        let held = driver.queued_state.read();
+        driver.publish_value(1);
         driver.update_health();
+        assert_eq!(state.peek_version(), 1);
+        assert_eq!(state.health(), HealthStatus::Degraded { pinned_buffers: 1 });
+
+        let held_two = driver.queued_state.read();
+        driver.publish_value(2);
+        driver.update_health();
+        assert_eq!(state.peek_version(), 2);
         assert_eq!(
-            driver.queued_state.health(),
-            HealthStatus::Degraded { pinned_buffers: 1 }
+            state.health(),
+            HealthStatus::Degraded { pinned_buffers: 2 },
+            "young retained generations are degraded, not stalled"
         );
 
-        let _id2 = driver.registry.register();
-        let _id3 = driver.registry.register();
-        std::thread::sleep(Duration::from_millis(10));
-
-        driver.update_health();
-        assert_eq!(
-            driver.queued_state.health(),
-            HealthStatus::Stalled { pinned_buffers: 3 }
+        // A window of publishes with nothing reclaimed is what reports a stall, so every
+        // generation is pinned by a guard taken before it is replaced.
+        let mut pinned = Vec::new();
+        for value in 3..=7 {
+            pinned.push(driver.queued_state.read());
+            driver.publish_value(value);
+            driver.update_health();
+        }
+        assert!(
+            matches!(state.health(), HealthStatus::Stalled { .. }),
+            "publishes with no reclaim must report a stall, got {:?}",
+            state.health()
         );
+
+        drop(held);
+        drop(held_two);
+        drop(pinned);
+        assert_eq!(settled_health(&mut driver), HealthStatus::Healthy);
+    }
+
+    /// Reports health after reclamation settles.
+    ///
+    /// Drives a reclamation cycle on this thread and gives the receiver time to collect.
+    fn settled_health(driver: &mut WriterDriver<i32>) -> HealthStatus {
+        for _ in 0..2_000 {
+            crate::atom_coerce::flush_reclamation();
+            driver.update_health();
+            let status = driver.queued_state.health();
+            if status == HealthStatus::Healthy {
+                return status;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        driver.queued_state.health()
     }
 
     #[test]

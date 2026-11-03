@@ -1,118 +1,126 @@
-//! Health watchdog semantics for snapshot pinning.
+//! Health semantics for retained snapshot generations.
 //!
-//! Values cached across frames must not register a reader, and readers that
-//! keep accessing their snapshot must not be reported as stalled.
+//! A guard keeps the generation it read alive. Health reports the retained count while publishes
+//! keep releasing older generations, and reports a stall once a whole window of publishes released
+//! nothing. Reclamation runs on the receiver thread, so every check settles first.
+
+use std::time::Duration;
 
 use queued_signal::state::{HealthStatus, WriterDriver};
-use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, PartialEq)]
 struct Counter {
     value: i32,
 }
 
-#[test]
-fn cached_projection_keeps_health_healthy_between_publishes() {
-    let mut driver = WriterDriver::new(Counter { value: 0 });
-    driver.watchdog_timeout = Duration::from_millis(50);
-    let state = driver.queued_state.clone();
-
-    let publish_every = Duration::from_millis(100);
-    let mut value = 0;
-    let mut cached = state.read_cached(|counter| &counter.value);
-    assert_eq!(*cached, 0);
-
-    let start = Instant::now();
-    let mut last_publish = Instant::now();
-    while start.elapsed() < Duration::from_millis(350) {
-        if last_publish.elapsed() >= publish_every {
-            value += 1;
-            driver.publish_value(Counter { value });
-            last_publish = Instant::now();
-            cached = state.read_cached(|counter| &counter.value);
-        }
+/// Drives a reclamation cycle and health scans until the status reports healthy.
+fn settle(driver: &mut WriterDriver<Counter>) -> HealthStatus {
+    for _ in 0..2_000 {
+        queued_signal::atom_coerce::flush_reclamation();
         driver.update_health();
-        assert_eq!(
-            driver.queued_state.health(),
-            HealthStatus::Healthy,
-            "a cached projection must not be counted as a reader"
-        );
-        std::thread::sleep(Duration::from_millis(16));
+        let status = driver.queued_state.health();
+        if status == HealthStatus::Healthy {
+            return status;
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
-    assert_eq!(*cached, value);
+    driver.queued_state.health()
 }
 
 #[test]
-fn cached_projection_pins_without_registering() {
+fn health_suite() {
+    released_cached_projection_returns_health_to_healthy();
+    cached_projection_reports_the_generation_it_pins();
+    held_guard_reports_degraded_after_a_publish();
+    publishes_without_a_reclaim_report_stalled();
+}
+
+fn released_cached_projection_returns_health_to_healthy() {
     let mut driver = WriterDriver::new(Counter { value: 0 });
-    // Any registered reader would be reported immediately with a zero timeout.
-    driver.watchdog_timeout = Duration::ZERO;
+    let state = driver.queued_state.clone();
+
+    let cached = state.read_cached(|counter| &counter.value);
+    driver.publish_value(Counter { value: 1 });
+    drop(cached);
+
+    assert_eq!(settle(&mut driver), HealthStatus::Healthy);
+
+    let refreshed = state.read_cached(|counter| &counter.value);
+    assert_eq!(*refreshed, 1);
+}
+
+fn cached_projection_reports_the_generation_it_pins() {
+    let mut driver = WriterDriver::new(Counter { value: 0 });
     let state = driver.queued_state.clone();
 
     let cached = state.read_cached(|counter| &counter.value);
     driver.publish_value(Counter { value: 7 });
 
-    // The cached guard still pins the generation it was taken from.
     assert_eq!(*cached, 0);
-    driver.update_health();
-    assert_eq!(driver.queued_state.health(), HealthStatus::Healthy);
-
-    drop(cached);
-    let refreshed = state.read_cached(|counter| &counter.value);
-    assert_eq!(*refreshed, 7);
-}
-
-#[test]
-fn tracked_reader_without_access_reports_degraded() {
-    let mut driver = WriterDriver::new(Counter { value: 0 });
-    driver.watchdog_timeout = Duration::from_millis(20);
-    let state = driver.queued_state.clone();
-
-    let _held = state.read();
-    std::thread::sleep(Duration::from_millis(80));
-
     driver.update_health();
     assert_eq!(
         driver.queued_state.health(),
         HealthStatus::Degraded { pinned_buffers: 1 }
     );
+
+    drop(cached);
+    assert_eq!(settle(&mut driver), HealthStatus::Healthy);
+
+    let refreshed = state.read_cached(|counter| &counter.value);
+    assert_eq!(*refreshed, 7);
 }
 
-#[test]
-fn tracked_reader_access_refreshes_the_stall_timer() {
+fn held_guard_reports_degraded_after_a_publish() {
     let mut driver = WriterDriver::new(Counter { value: 0 });
-    driver.watchdog_timeout = Duration::from_millis(40);
     let state = driver.queued_state.clone();
 
     let held = state.read();
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_millis(260) {
-        assert_eq!(held.value, 0);
-        driver.update_health();
-        assert_eq!(
-            driver.queued_state.health(),
-            HealthStatus::Healthy,
-            "a reader that keeps accessing its snapshot is making progress"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
+    driver.publish_value(Counter { value: 1 });
 
-#[test]
-fn stalled_readers_are_counted_after_access_stops() {
-    let mut driver = WriterDriver::new(Counter { value: 0 });
-    driver.watchdog_timeout = Duration::from_millis(20);
-    let state = driver.queued_state.clone();
-
-    let first = state.read();
-    let second = state.read();
-    assert_eq!(first.value, 0);
-    assert_eq!(second.value, 0);
-    std::thread::sleep(Duration::from_millis(80));
-
+    assert_eq!(held.value, 0);
     driver.update_health();
     assert_eq!(
         driver.queued_state.health(),
-        HealthStatus::Stalled { pinned_buffers: 2 }
+        HealthStatus::Degraded { pinned_buffers: 1 }
     );
+
+    drop(held);
+    assert_eq!(settle(&mut driver), HealthStatus::Healthy);
+}
+
+fn publishes_without_a_reclaim_report_stalled() {
+    let mut driver = WriterDriver::new(Counter { value: 0 });
+    let state = driver.queued_state.clone();
+
+    let first = state.read();
+    driver.publish_value(Counter { value: 1 });
+    let second = state.read();
+    driver.publish_value(Counter { value: 2 });
+
+    assert_eq!(first.value, 0);
+    assert_eq!(second.value, 1);
+    driver.update_health();
+    assert_eq!(
+        driver.queued_state.health(),
+        HealthStatus::Degraded { pinned_buffers: 2 },
+        "retained generations with progress still happening are degraded"
+    );
+
+    // A guard taken before each publish keeps that generation, so the window reports a stall.
+    let mut pinned = Vec::new();
+    for value in 3..=7 {
+        pinned.push(state.read());
+        driver.publish_value(Counter { value });
+        driver.update_health();
+    }
+    assert!(
+        matches!(driver.queued_state.health(), HealthStatus::Stalled { .. }),
+        "publishes with no reclaim must report a stall, got {:?}",
+        driver.queued_state.health()
+    );
+
+    drop(first);
+    drop(second);
+    drop(pinned);
+    assert_eq!(settle(&mut driver), HealthStatus::Healthy);
 }

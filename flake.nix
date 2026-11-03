@@ -62,8 +62,13 @@
           targets = [ "wasm32-unknown-unknown" ];
         };
 
-        commonBuildInputs = with pkgs; [
-          rustStable
+        # Miri for testing unsafe
+        rustMiri = pkgs.rust-bin.nightly.latest.default.override {
+          extensions = [ "miri" "rust-src" ];
+          targets = [ "wasm32-unknown-unknown" ];
+        };
+
+        commonPackages = with pkgs; [
           gcc
           systemd
           alsa-lib
@@ -90,6 +95,8 @@
           dioxus-cli
         ];
 
+        commonBuildInputs = [ rustStable ] ++ commonPackages;
+
         commonRpath = lib.makeLibraryPath (with pkgs; [
           libxkbcommon
           vulkan-loader
@@ -107,6 +114,21 @@
           shellHook = ''
             export PATH="$HOME/.cargo/bin:$PATH"
           '';
+        };
+
+        devShells.miri = mkShellWild {
+          buildInputs = [ rustMiri ] ++ commonPackages;
+          env.RUST_BACKTRACE = "1";
+          env.CARGO_TARGET_DIR = "target/miri";
+          # Enables 128 bit atomics which Kovan requires to not fallback to locks,
+          env.RUSTFLAGS = "-C target-feature=+cmpxchg16b";
+          # The reclamation list word carries a node pointer as a u64, because the slot is an
+          # integer compare and exchange, and the cast back is the same address with no
+          # arithmetic. Permissive provenance accepts that round trip, which is the only one here.
+          
+          # The leak check and the thread-at-exit check share a switch, and the reclaimer thread
+          # outlives the harness, so that check waits until the receiver can be joined on drop.
+          env.MIRIFLAGS = "-Zmiri-permissive-provenance -Zmiri-ignore-leaks";
         };
       }
     );

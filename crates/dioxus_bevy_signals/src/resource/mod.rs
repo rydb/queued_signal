@@ -11,9 +11,7 @@ use dioxus_core::{IntoAttributeValue, IntoDynNode};
 use dioxus_hooks::{use_context, use_future, use_memo, use_signal};
 use dioxus_signals::{Memo, ReadableExt, Signal, WritableExt};
 use parking_lot::Mutex;
-use queued_signal::state::{
-    HealthStatus, ProjectedReadGuard, QueuedSignal, TrackedReadGuard, WriterDriver,
-};
+use queued_signal::state::{HealthStatus, QueuedSignal, TrackedReadGuard, WriterDriver};
 use std::any::TypeId;
 use std::collections::HashSet;
 use std::fmt::Display;
@@ -134,6 +132,10 @@ fn sync_resource<T: ResourceDioxusSync>(
         return;
     }
 
+    // One subscriber pass per publish, so a scope that stops reading is pruned after
+    // PRUNE_AFTER_PASSES publishes instead of on every frame.
+    guard.queued_state.begin_pass();
+
     if bevy_changed {
         // Bevy wins authoritative ops; only relative adds compose.
         set_values.clear();
@@ -159,6 +161,9 @@ fn sync_resource<T: ResourceDioxusSync>(
         guard.publish_value(resource.clone());
     }
 
+    // Submit what the publish retired, so the count read below is the deferral window and not
+    // this frame's unplaced retires.
+    guard.submit_pending();
     guard.update_health();
 }
 
@@ -166,6 +171,9 @@ trait_set! {
     /// Bounds required for mirrored resource values.
     pub trait UBounds = Send + Sync + PartialEq + 'static
 }
+
+/// Borrowing projection used to display one field of a resource.
+type Projection<R, U> = Arc<dyn for<'a> Fn(&'a R) -> &'a U>;
 
 /// Dioxus signal for managing bevy resource synchronization.
 pub struct ResourceMirrorSignal<R, U, E>
@@ -179,8 +187,10 @@ where
     /// None until the bevy round-trip completes.
     /// Writes are silently ignored while pending.
     writer: Signal<Option<QueuedSignal<R>>>,
-    /// Memoized projected value for reactive display in RSX.
-    display: Memo<Result<ProjectedReadGuard<U>, E>>,
+    /// Projection applied on each read, allocated once when the hook runs.
+    map_fn: Signal<Projection<R, U>>,
+    /// Latest version and error state, which holds no read pin.
+    display: Memo<Result<(), E>>,
 }
 
 impl<R: Clone + Send + Sync + 'static, U: UBounds, E> Clone for ResourceMirrorSignal<R, U, E> {
@@ -198,10 +208,23 @@ where
     E: Display + PartialEq + 'static,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.display.read().as_ref() {
-            Ok(u) => write!(f, "{}", u.as_ref()),
-            Err(e) => write!(f, "{e}"),
+        // Reading the state subscribes this scope. The guard below is transient.
+        // The version changes on every publish, so it is what re-renders this scope.
+        let _ = self.version.read();
+        let display = self.display.read();
+        if let Err(err) = display.as_ref() {
+            return write!(f, "{err}");
         }
+        let writer = self.writer.peek();
+        let Some(signal) = writer.as_ref() else {
+            return Ok(());
+        };
+        let map = self.map_fn.peek();
+        let projection: &Projection<R, U> = &map;
+        // A tracked read joins the slot array, so a publish marks this scope directly while the
+        // guard stays transient and drops before the render returns.
+        let value = signal.read().project(|resource| projection(resource));
+        write!(f, "{}", *value)
     }
 }
 
@@ -269,7 +292,12 @@ impl<R: Clone + Send + Sync + 'static, U: UBounds, E> ResourceMirrorSignal<R, U,
 
     /// Current health status of the underlying signal.
     pub fn health(&self) -> HealthStatus {
-        *self.health.read()
+        let _ = self.health.read();
+        let writer = self.writer.peek();
+        match writer.as_ref() {
+            Some(signal) => signal.health(),
+            None => *self.health.peek(),
+        }
     }
 
     /// Read resource, subscribing to version updates.
@@ -310,15 +338,16 @@ where
     let version: Signal<u64> = use_signal(|| 0);
     let health_signal = use_signal(|| HealthStatus::Healthy);
     let mut writer: Signal<Option<QueuedSignal<T>>> = use_signal(|| None);
+    // The projection is allocated once and borrowed on every read.
+    let map_fn: Signal<Projection<T, U>> = use_signal(move || Arc::new(map_fn) as Projection<T, U>);
 
-    let display = {
+    let display: Memo<Result<(), E>> = {
         let err_fn = err_fn.clone();
         use_memo(move || {
             let _ = version.read();
             let writer = writer.read();
             match writer.as_ref() {
-                // The memo value outlives the read, so it pins without registering a reader.
-                Some(signal) => Ok(signal.read_cached(&map_fn)),
+                Some(_) => Ok(()),
                 None => Err(err_fn(ResourceNoneState::NotInitialized)),
             }
         })
@@ -349,6 +378,7 @@ where
         version,
         health: health_signal,
         writer,
+        map_fn,
         display,
     }
 }

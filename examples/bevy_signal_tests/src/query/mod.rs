@@ -1,18 +1,21 @@
-use std::{fmt::Display, time::Instant};
+use std::{
+    fmt::Display,
+    time::Duration,
+};
 
 use bevy_app::prelude::*;
 use bevy_ecs::{prelude::*, world::CommandQueue};
-use bevy_time::{Real, Time};
+use bevy_time::{Real, Time, Timer, TimerMode};
 use dioxus::prelude::*;
 use dioxus_bevy_signals::{
     push_and_send,
-    query::{DioxusMirror, single::use_bevy_single, use_bevy_query},
+    query::{single::use_bevy_single, use_bevy_query},
     use_bevy_command_queue,
 };
 use dioxus_hooks::{use_memo, use_signal};
 use dioxus_signals::{ReadableExt, WritableExt};
 
-use crate::{DioxusTestPlugin, TickTimer};
+use crate::DioxusTestPlugin;
 
 #[derive(Component, Clone, Default, PartialEq, PartialOrd, Eq, Ord, Debug)]
 pub struct Greets {
@@ -23,11 +26,6 @@ impl Display for Greets {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.value)
     }
-}
-
-#[derive(Resource)]
-pub struct DebugPrintTimer {
-    last_tick: Instant,
 }
 
 #[derive(Component)]
@@ -104,31 +102,11 @@ pub fn remove_names(mut commands: Commands, names: Query<(Entity, &Name, &Greets
     }
 }
 
-pub fn print_mirrors(
-    mut timer: ResMut<DebugPrintTimer>,
-
-    query: Query<(&DioxusMirror<Name>, &DioxusMirror<Greets>), With<Examined>>,
-) {
-    if timer.last_tick.elapsed() >= core::time::Duration::from_millis(1000) {
-        timer.last_tick = Instant::now();
-
-        let Some((a, _b)) = query.iter().next() else {
-            return;
-        };
-        let debug_state = format!("{:#?}", a);
-
-        std::fs::write("./target/ten_names_first_debug.txt", debug_state).unwrap();
-    }
-}
 pub struct TenNamesTestPlugin;
 
 impl Plugin for TenNamesTestPlugin {
     fn build(&self, app: &mut App) {
         app.world_mut().commands().queue(AddTenNames {});
-        app.insert_resource(DebugPrintTimer {
-            last_tick: Instant::now(),
-        })
-        .add_systems(PostUpdate, print_mirrors);
     }
 }
 
@@ -266,8 +244,40 @@ pub fn TenNamesQuery() -> Element {
 
     }
 }
+
+#[derive(Resource)]
+pub struct QuerySingleTimer(pub Timer);
+
+impl Default for QuerySingleTimer {
+    fn default() -> Self {
+        Self(Timer::new(
+            Duration::from_millis(1000),
+            TimerMode::Repeating,
+        ))
+    }
+}
+
 #[derive(Component, Clone)]
-pub struct SingleCounter(u32);
+pub struct QuerySingleCounter {
+    pub value: i32,
+}
+
+pub fn tick_query_single_timer(mut timer: ResMut<QuerySingleTimer>, time: Res<Time<Real>>) {
+    timer.0.tick(time.delta());
+}
+
+pub fn tick_query_single_counter(
+    timer: Res<QuerySingleTimer>,
+    mut counter: Query<&mut QuerySingleCounter>,
+) {
+    let Ok(mut counter) = counter.single_mut() else {
+        return;
+    };
+
+    if timer.0.just_finished() {
+        counter.value += 1;
+    }
+}
 
 #[derive(Component, Clone)]
 pub struct NoMatch;
@@ -277,7 +287,7 @@ pub struct MoreThenOneMatch;
 
 pub fn setup_singleton_test(mut commands: Commands) {
     // single match
-    commands.spawn((SingleCounter(0), MoreThenOneMatch));
+    commands.spawn((QuerySingleCounter { value: 0 }, MoreThenOneMatch));
 
     // no matches (due to filter)
     commands.spawn(NoMatch);
@@ -287,37 +297,22 @@ pub fn setup_singleton_test(mut commands: Commands) {
     commands.spawn(MoreThenOneMatch);
 }
 
-/// Ticks the shared [`TickTimer`] and increments [`SingleCounter`] on each
-/// elapsed interval.
-pub fn tick_single_counter(
-    mut query: Query<&mut SingleCounter>,
-    mut timer: ResMut<TickTimer>,
-    time: Res<Time<Real>>,
-) {
-    timer.0.tick(time.delta());
-    if timer.0.just_finished() {
-        for mut counter in &mut query {
-            println!("counter value: {}", counter.0);
-            counter.0 += 1;
-        }
-    }
-}
-
 pub struct SingleQuerySetup;
 
 impl Plugin for SingleQuerySetup {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, setup_singleton_test)
-            .add_systems(Update, tick_single_counter);
+        app.insert_resource(QuerySingleTimer::default())
+            .add_systems(Startup, setup_singleton_test)
+            .add_systems(Update, (tick_query_single_timer, tick_query_single_counter));
     }
 }
 
 /// Test for the use_bevy_single mirror.
 #[component]
 pub fn SingleQuery() -> Element {
-    let (_, counter) = use_bevy_single::<(Entity, &mut SingleCounter), ()>();
+    let (_, counter) = use_bevy_single::<(Entity, &mut QuerySingleCounter), ()>();
     let increment_counter = move |_evt| {
-        counter.mutate(|n| n.0 += 10);
+        counter.mutate(|n| n.value += 10);
     };
 
     let (_, no_match) = use_bevy_single::<(Entity, &mut MoreThenOneMatch), With<NoMatch>>();
@@ -331,7 +326,7 @@ pub fn SingleQuery() -> Element {
             }
             div {
                 h2 {
-                    {format!("single match: {}", counter.use_display(|n| n.0.to_string()))}
+                    {format!("single match: {}", counter.use_display(|n| n.value.to_string()))}
                 }
                 button {
                     onclick: increment_counter,

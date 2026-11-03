@@ -21,7 +21,7 @@ flume = {version = "0.12"}
 anyhow = "1"
 tokio = "1.51"
 parking_lot = "0.13.0"
-kovan = "0.2.2"
+kovan = {git = "https://github.com/rydb/kovan", branch = "master", features = ["recycle"]}
 ptr_meta = "0.3.2"
 imbl = "7"
 
@@ -36,6 +36,7 @@ bevy_log = {version = "0.20"}
 bevy_reflect = {version = "0.20"}
 bevy_ptr = {version = "0.20"}
 tracing = { version = "0.1", default-features = false, features = ["std"] }
+allocation-counter = "0.8.1"
 glam = {version = "0.32"}
 trait-set = {version = "0.3"}
 bytemuck = {version = "1.25", features = ["derive"]}
@@ -52,7 +53,3 @@ winit = "0.31.0-beta.3"
 parley = { version = "0.12", features = ["std"] }
 tracing-subscriber = "0.3"
 tracing-chrome = "0.7"
-
-# [[example]]
-# name = "minimal_dioxus"
-# required-features = [""]

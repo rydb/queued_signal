@@ -257,7 +257,9 @@ fn reflect_bound_shared<T: Send + Sync + 'static>(
 }
 
 /// Loads an Arc-backed reflected value as a reflected view.
-unsafe fn load_arc_reflect<T>(shared: &ErasedShared<dyn Reflect>) -> (*const dyn Reflect, Guard)
+unsafe fn load_arc_reflect<T>(
+    shared: &ErasedShared<dyn Reflect>,
+) -> (*const dyn Reflect, u64, Guard)
 where
     T: Reflect + Send + Sync + 'static,
 {
@@ -265,9 +267,10 @@ where
     let typed = unsafe { &*(shared.data().as_ptr() as *const CoerceShared<T, dyn Reflect>) };
     let epoch = pin();
     let atom_guard = typed.atom().load();
+    let version = atom_guard.version();
     let value: &Value<T, dyn Reflect> = &atom_guard;
     let ptr = value.value() as *const T;
-    (ptr as *const dyn Reflect, epoch)
+    (ptr as *const dyn Reflect, version, epoch)
 }
 
 /// Stores an Arc-backed reflected value when the boxed value matches.
@@ -282,7 +285,7 @@ where
     let typed = unsafe { &*(shared.data().as_ptr() as *const CoerceShared<T, dyn Reflect>) };
     match value.downcast::<T>() {
         Ok(boxed) => {
-            typed.atom().store(Value::new(*boxed));
+            typed.atom().store(Value::new(*boxed), 0);
             Ok(())
         }
         Err(boxed) => Err(boxed),
@@ -292,11 +295,12 @@ where
 /// Loads a typed cell's value as a runtime reflect view.
 unsafe fn load_reflect_bound<T: Send + Sync + 'static>(
     shared: &ErasedShared<dyn Reflect>,
-) -> (*const dyn Reflect, Guard) {
+) -> (*const dyn Reflect, u64, Guard) {
     // SAFETY: data points at the live CoerceShared for the bound typed cell.
     let typed = unsafe { &*(shared.data().as_ptr() as *const CoerceShared<T, dyn Any>) };
     let epoch = pin();
     let atom_guard = typed.atom().load();
+    let version = atom_guard.version();
     let value: &Value<T, dyn Any> = &atom_guard;
     let raw = (value.value() as *const T).cast::<u8>() as *mut u8;
     // SAFETY: raw points at the live T value and the pointer mirrors T.
@@ -307,7 +311,7 @@ unsafe fn load_reflect_bound<T: Send + Sync + 'static>(
         .expect("reflect bind missing ReflectFromPtr");
     // SAFETY: ptr holds the type mirrored by reflect_from_ptr.
     let reflect = unsafe { reflect.ptr_as_reflect(ptr) };
-    (reflect as *const dyn Reflect, epoch)
+    (reflect as *const dyn Reflect, version, epoch)
 }
 
 /// Rejects writes through a reflect-bound view, which shares the typed cell.

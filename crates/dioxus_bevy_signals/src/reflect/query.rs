@@ -893,7 +893,8 @@ fn reflect_query_handle(
         view,
         notify_rx: signal.state.notify_rx(),
         health_rx: signal.state.health_rx.clone(),
-        registry: signal.state.registry.clone(),
+        slots: signal.state.slots.clone(),
+        atomics: signal.state.atomics.clone(),
     };
 
     let state = signal.state.clone();
@@ -926,7 +927,8 @@ fn typed_query_handle<Q: MirrorQueryData + Send + Sync + 'static, F: QueryFilter
         view,
         notify_rx: typed.state.notify_rx(),
         health_rx: typed.state.health_rx.clone(),
-        registry: typed.state.registry.clone(),
+        slots: typed.state.slots.clone(),
+        atomics: typed.state.atomics.clone(),
     };
 
     let state = typed.state.clone();

@@ -1,26 +1,39 @@
+use std::time::Duration;
+
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
-use bevy_time::{Real, Time};
+use bevy_time::{Real, Time, Timer, TimerMode};
 use dioxus::prelude::*;
 use dioxus_bevy_signals::resource::use_bevy_resource;
 use dioxus_core::Element;
 
-use crate::{DioxusTestPlugin, TickTimer};
+#[derive(Resource)]
+pub struct ResourceTickTimer(pub Timer);
 
-#[derive(Clone, Resource, Debug)]
-pub struct Counter {
-    pub value: i32,
+impl Default for ResourceTickTimer {
+    fn default() -> Self {
+        Self(Timer::new(
+            Duration::from_millis(1000),
+            TimerMode::Repeating,
+        ))
+    }
 }
 
-pub fn bevy_tick_counter(
-    mut counter: ResMut<Counter>,
-    mut timer: ResMut<TickTimer>,
-    time: Res<Time<Real>>,
-) {
+pub fn tick_resource_timer(mut timer: ResMut<ResourceTickTimer>, time: Res<Time<Real>>) {
     timer.0.tick(time.delta());
+}
+
+pub fn tick_resource_counter(timer: Res<ResourceTickTimer>, mut counter: ResMut<ResourceCounter>) {
     if timer.0.just_finished() {
         counter.value += 1;
     }
+}
+
+use crate::DioxusTestPlugin;
+
+#[derive(Clone, Resource, Debug)]
+pub struct ResourceCounter {
+    pub value: i32,
 }
 
 /// Plugin for initializing the bevy resource synchronization test.
@@ -28,8 +41,9 @@ pub struct CounterResourceTestPlugin;
 
 impl Plugin for CounterResourceTestPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, bevy_tick_counter)
-            .insert_resource(Counter { value: 0 });
+        app.add_systems(Update, (tick_resource_timer, tick_resource_counter))
+            .insert_resource(ResourceCounter { value: 0 })
+            .insert_resource(ResourceTickTimer::default());
     }
 }
 
@@ -54,11 +68,10 @@ impl DioxusTestPlugin for ResourceTestsPlugin {
         app.add_plugins(self.clone());
     }
 }
-
 /// Bevy resource and dioxus sync test.
 #[component]
 pub fn CounterResource() -> Element {
-    let counter = use_bevy_resource::<Counter, _, _>(|n| &n.value, |err| err);
+    let counter = use_bevy_resource::<ResourceCounter, _, _>(|n| &n.value, |err| err);
 
     let onclick = move |_| {
         counter.mutate(|c| c.value += 10);

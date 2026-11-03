@@ -124,24 +124,26 @@ impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Queued
         *self.health.read()
     }
 
-    /// Read the current value, subscribing to version updates.
+    /// Read the current value, subscribing the scope through the slot array.
     pub fn read(&self) -> Result<TrackedReadGuard<T>, QueuedSignalNoneState> {
-        let _ = self.version.read();
-        let writer = self.writer.read();
-        match writer.as_ref() {
-            Some(signal) => Ok(signal.read()),
-            None => Err(QueuedSignalNoneState::NotRegistered),
+        let writer = self.writer.peek();
+        if let Some(signal) = writer.as_ref() {
+            return Ok(signal.read());
         }
+        drop(writer);
+        let _ = self.writer.read();
+        Err(QueuedSignalNoneState::NotRegistered)
     }
 
     /// Read the value, mapping it through `f`.
     pub fn read_ok<U>(&self, f: impl FnOnce(&T) -> U) -> Result<U, QueuedSignalNoneState> {
-        let _ = self.version.read();
-        let writer = self.writer.read();
-        match writer.as_ref() {
-            Some(signal) => Ok(f(&signal.read())),
-            None => Err(QueuedSignalNoneState::NotRegistered),
+        let writer = self.writer.peek();
+        if let Some(signal) = writer.as_ref() {
+            return Ok(f(&signal.read()));
         }
+        drop(writer);
+        let _ = self.writer.read();
+        Err(QueuedSignalNoneState::NotRegistered)
     }
 }
 

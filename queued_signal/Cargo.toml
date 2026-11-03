@@ -22,3 +22,6 @@ queued_signal_tracing = { workspace = true }
 
 [features]
 trace = ["queued_signal_tracing/trace"]
+
+[dev-dependencies]
+allocation-counter = {workspace = true}

@@ -10,8 +10,9 @@ use tokio::sync::watch;
 
 use crate::atom_coerce_dyn::{AtomCoerceDyn, EraseMut};
 use crate::state::{
-    HealthStatus, MutationOp, QueuedSignal, QueuedStateDyn, ReaderRegistry, TrackedReadGuardDyn,
+    HealthStatus, MutationOp, QueuedSignal, QueuedStateDyn, ReadAtomics, TrackedReadGuardDyn,
 };
+use crate::subscriber_slots::{PassEpoch, SubscriberSlots};
 
 /// Routes a relative mutation through an erased view.
 type MutateFn<D> = unsafe fn(&ErasedQueuedWrite<D>, Arc<dyn Fn(&mut D) + Send + Sync>);
@@ -124,14 +125,14 @@ impl<D: ?Sized + 'static> QueuedSignalDyn<D> {
         holder: AtomCoerceDyn<D>,
         notify_rx: watch::Receiver<u64>,
         health_rx: watch::Receiver<HealthStatus>,
-        registry: Arc<ReaderRegistry>,
         write: ErasedQueuedWrite<D>,
     ) -> QueuedSignalDyn<D> {
         let state = QueuedStateDyn {
             view: holder.handle_dyn(),
             notify_rx,
             health_rx,
-            registry,
+            slots: SubscriberSlots::new(PassEpoch::new()),
+            atomics: Arc::new(ReadAtomics::new()),
         };
         QueuedSignalDyn {
             state,
@@ -150,7 +151,8 @@ impl<D: ?Sized + 'static> QueuedSignalDyn<D> {
             view: holder.handle_dyn(),
             notify_rx: signal.state.notify_rx(),
             health_rx: signal.state.health_rx.clone(),
-            registry: signal.state.registry.clone(),
+            slots: signal.state.slots.clone(),
+            atomics: signal.state.atomics.clone(),
         };
         QueuedSignalDyn {
             state,
