@@ -18,7 +18,7 @@ use queued_signal_benches::candidates::{self, Candidate, Clock, DriveReport};
 use queued_signal_benches::csv::{Record, RunSink, Unit};
 use queued_signal_benches::isolation::{self, Args};
 use queued_signal_benches::manifest;
-use queued_signal_benches::pin::{self, PinMap, Role};
+use queued_signal_benches::pin::{self, PinMap};
 use queued_signal_benches::settle;
 use queued_signal_benches::stats::{self, Stats};
 
@@ -72,8 +72,9 @@ fn main() {
     if !isolation::owns_rows(&args) {
         let sink = RunSink::open("e1", args.run_id.as_deref()).expect("results directory");
         write_caveats(&sink);
-        let mut pin_map = PinMap::plan();
-        pin_map.pin_here(Role::Writer);
+        let pin_map = PinMap::plan();
+        // The parent leaves its affinity alone, because a child inherits it and would only see
+        // one core. Each row pins the threads it owns.
         manifest::write(&sink, &pin_map).expect("manifest");
         let ok = isolation::spawn_rows(&args, rows.len(), sink.run_id());
         isolation::finish_parent(ok);

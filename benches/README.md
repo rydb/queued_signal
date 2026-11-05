@@ -24,6 +24,10 @@ It is a workspace member so the core crate's dev dependencies stay unchanged.
 - Warm up before timing and discard the warmup batches.
 - Writer and reader on distinct cores when the machine has two. The map is recorded in
   `manifest.json` whether pinning succeeded or failed.
+- The parent process never pins itself. A child inherits the affinity of the thread that
+  spawns it, so pinning the parent would leave every row on one core and every contention
+  row would report uncontended cost. A row pins the threads it owns after it reads the
+  available cores.
 - Thirty repetitions minimum per configuration.
 - Report p50, p99, and p999. Never report a bare mean.
 

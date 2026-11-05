@@ -19,6 +19,31 @@ const FIGURES: [(&str, &str); 4] = [
     ("e6", "prunes-total"),
 ];
 
+/// Designs in the headline read table, with the label a reader sees.
+const HEADLINE_READ: [(&str, &str); 6] = [
+    ("b0", "b0 plain field, no producer, floor"),
+    ("b3", "b3 rwlock"),
+    ("b4", "b4 mutex"),
+    ("b6", "b6 snapshot"),
+    ("b6r", "b6r rotating snapshot"),
+    ("b7", "b7 queued signal"),
+];
+
+/// Designs in the headline fan out table, with the label a reader sees.
+const HEADLINE_FANOUT: [(&str, &str); 5] = [
+    ("b1", "b1 dioxus signal"),
+    ("b2", "b2 bevy resource"),
+    ("b5", "b5 channel per subscriber"),
+    ("b6", "b6 snapshot"),
+    ("b7", "b7 queued signal"),
+];
+
+/// Loaded producers the headline read column uses.
+const HEADLINE_PRODUCERS: f64 = 8.0;
+
+/// Subscribers the headline fan out column uses.
+const HEADLINE_SUBSCRIBERS: f64 = 1_024.0;
+
 /// Largest frame read p99 at eight writers that the report accepts, in nanoseconds.
 ///
 /// This is the same microsecond that E4 counts as an over-bound read, so the guard reuses the
@@ -41,6 +66,11 @@ fn main() {
                 summary.push_str(&format!("- {key}: {value}\n"));
             }
         }
+        summary.push('\n');
+    }
+
+    if let Some(table) = headline(&run_dir) {
+        summary.push_str(&table);
         summary.push('\n');
     }
 
@@ -109,16 +139,16 @@ fn main() {
     }
 }
 
-/// Median of one column of the `read` metric at one writer count, when the file exists.
-fn median_read(path: &Path, writers: f64, column: usize) -> Option<f64> {
+/// Median of one column of a metric at one parameter value, when the file exists.
+fn median_metric(path: &Path, metric: &str, param: f64, column: usize) -> Option<f64> {
     let text = fs::read_to_string(path).ok()?;
     let mut values = Vec::new();
     for line in text.lines().skip(1) {
         let columns: Vec<&str> = line.split(',').collect();
-        if columns.len() < 14 || columns[6] != "read" {
+        if columns.len() < 14 || columns[6] != metric {
             continue;
         }
-        if columns[5].parse::<f64>().ok()? != writers {
+        if columns[5].parse::<f64>().ok()? != param {
             continue;
         }
         values.push(columns[column].parse::<f64>().ok()?);
@@ -130,9 +160,68 @@ fn median_read(path: &Path, writers: f64, column: usize) -> Option<f64> {
 /// b7 frame p99 and b6r frame p50 at eight writers, when both rows are present.
 fn frame_read_bound(run_dir: &Path) -> Option<(f64, f64)> {
     let e4 = run_dir.join("e4");
-    let b7 = median_read(&e4.join("b7-frame.csv"), 8.0, 9)?;
-    let reference = median_read(&e4.join("b6r-frame.csv"), 8.0, 8)?;
+    let b7 = median_metric(&e4.join("b7-frame.csv"), "read", HEADLINE_PRODUCERS, 9)?;
+    let reference = median_metric(&e4.join("b6r-frame.csv"), "read", HEADLINE_PRODUCERS, 8)?;
     Some((b7, reference))
+}
+
+/// Reads under load and fan out at the largest subscriber count, in one table.
+///
+/// Every value is a median of the per repetition p50s from the CSVs, so the table cannot say
+/// anything the recorded rows do not. A design missing from a run is left out rather than shown
+/// with a placeholder.
+fn headline(run_dir: &Path) -> Option<String> {
+    let e4 = run_dir.join("e4");
+    let e2 = run_dir.join("e2");
+    let mut out = String::from("## Headline\n\n");
+    let mut found = false;
+
+    out.push_str(&format!(
+        "Frame read at {} producers, one reader, E4:\n\n",
+        HEADLINE_PRODUCERS as usize
+    ));
+    out.push_str("| Design | p50 | p99 |\n|---|---:|---:|\n");
+    for (id, label) in HEADLINE_READ {
+        let path = e4.join(format!("{id}-frame.csv"));
+        // The floor has no writer, so its only frame row is the zero producer one.
+        let producers = if id == "b0" { 0.0 } else { HEADLINE_PRODUCERS };
+        let (Some(p50), Some(p99)) = (
+            median_metric(&path, "read", producers, 8),
+            median_metric(&path, "read", producers, 9),
+        ) else {
+            continue;
+        };
+        found = true;
+        out.push_str(&format!("| {label} | {p50:.0} ns | {p99:.0} ns |\n"));
+    }
+
+    out.push_str(&format!(
+        "\nFan out at {} subscribers, E2:\n\n",
+        HEADLINE_SUBSCRIBERS as usize
+    ));
+    out.push_str("| Design | publish | frame per subscriber |\n|---|---:|---:|\n");
+    for (id, label) in HEADLINE_FANOUT {
+        let path = e2.join(format!("{id}-fanout.csv"));
+        let (Some(publish), Some(per_subscriber)) = (
+            median_metric(&path, "publish", HEADLINE_SUBSCRIBERS, 8),
+            median_metric(&path, "per-subscriber", HEADLINE_SUBSCRIBERS, 8),
+        ) else {
+            continue;
+        };
+        found = true;
+        out.push_str(&format!(
+            "| {label} | {publish:.0} ns | {per_subscriber:.1} ns |\n"
+        ));
+    }
+
+    if found {
+        out.push_str(
+            "\nThe read columns are one read timed inside a frame. The fan out columns are one \
+             publish and its frame divided by subscribers, so a design that marks nobody shows no \
+             per subscriber work. Caveats per design are under each experiment below.\n",
+        );
+    }
+    found.then_some(out)
 }
 
 /// Reads `--run`, which is either a run id or a path.
