@@ -4,7 +4,6 @@ use std::any::Any;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use flume::Sender;
 use kovan::Atom;
 use tokio::sync::watch;
 
@@ -13,6 +12,7 @@ use crate::state::{
     HealthStatus, MutationOp, Op, QueuedSignal, QueuedStateDyn, ReadAtomics, TrackedReadGuardDyn,
 };
 use crate::subscriber_slots::{PassEpoch, SubscriberSlots};
+use crate::write_queues::WriteQueues;
 
 /// Routes a relative mutation through an erased view.
 type MutateFn<D> = unsafe fn(&ErasedQueuedWrite<D>, Arc<dyn Fn(&mut D) + Send + Sync>);
@@ -34,7 +34,7 @@ pub struct ErasedQueuedWrite<D: ?Sized + 'static> {
 
 /// Typed sender context used when routing into a typed signal.
 struct TypedWrite<T: Clone + Send + Sync + 'static, D: ?Sized + 'static> {
-    op_tx: Sender<Op<T, D>>,
+    op_tx: WriteQueues<T, D>,
     marker: PhantomData<fn() -> D>,
 }
 
@@ -88,7 +88,7 @@ where
         .context()
         .downcast_ref::<TypedWrite<T, D>>()
         .expect("typed write context mismatch");
-    let _ = ctx.op_tx.send(Op::Add(MutationOp::Untyped(f)));
+    ctx.op_tx.push(Op::Add(MutationOp::Untyped(f)));
 }
 
 unsafe fn mutate_set_typed<T, D>(write: &ErasedQueuedWrite<D>, f: Arc<dyn Fn(&mut D) + Send + Sync>)
@@ -100,7 +100,7 @@ where
         .context()
         .downcast_ref::<TypedWrite<T, D>>()
         .expect("typed write context mismatch");
-    let _ = ctx.op_tx.send(Op::SetInPlace(MutationOp::Untyped(f)));
+    ctx.op_tx.push(Op::SetInPlace(MutationOp::Untyped(f)));
 }
 
 unsafe fn set_value_unsupported<D: ?Sized + 'static>(

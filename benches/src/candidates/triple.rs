@@ -114,7 +114,7 @@ struct SnapshotWriter {
 }
 
 impl Submitter for SnapshotWriter {
-    fn submit(&self, sample: Sample) {
+    fn submit(&mut self, sample: Sample) {
         self.snapshot.publish_value(sample.seq);
     }
 }
@@ -243,7 +243,7 @@ struct RotatingWriter {
 }
 
 impl Submitter for RotatingWriter {
-    fn submit(&self, sample: Sample) {
+    fn submit(&mut self, sample: Sample) {
         self.rotation.publish(sample.seq);
     }
 }

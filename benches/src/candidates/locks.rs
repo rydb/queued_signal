@@ -45,7 +45,7 @@ struct RwLockWriter {
 }
 
 impl Submitter for RwLockWriter {
-    fn submit(&self, sample: Sample) {
+    fn submit(&mut self, sample: Sample) {
         *self.value.write() = sample.seq;
     }
 }
@@ -108,7 +108,7 @@ struct MutexWriter {
 }
 
 impl Submitter for MutexWriter {
-    fn submit(&self, sample: Sample) {
+    fn submit(&mut self, sample: Sample) {
         *self.value.lock() = sample.seq;
     }
 }

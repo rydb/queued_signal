@@ -14,7 +14,7 @@ publishes a new generation, and wakes the readers that need it.
 ## Features
 
 - Wait-free reads: a read pins a generation, loads it, and dereferences a pointer.
-- Queued writes: mutations go through queues and a single driver resolves them.
+- Queued writes: each writer thread owns one unbounded queue, and a single driver resolves them.
 - Subscriber slots: a publish wakes only the components that read the signal, with no subscriber
 set mutex, no reference count on read, and no value clone.
 - Health tracking: reports how many replaced generations are still retained.

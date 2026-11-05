@@ -54,4 +54,5 @@ fn every_experiment_runs_in_smoke_mode() {
     smoke("e5", env!("CARGO_BIN_EXE_e5-frame-budget"));
     smoke("e6", env!("CARGO_BIN_EXE_e6-prune-policy"));
     smoke("e7", env!("CARGO_BIN_EXE_e7-memory"));
+    smoke("e8", env!("CARGO_BIN_EXE_e8-hot-writer"));
 }

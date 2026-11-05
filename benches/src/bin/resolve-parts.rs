@@ -6,7 +6,8 @@
 use std::hint::black_box;
 use std::time::Duration;
 
-use queued_signal::state::{Op, QueuedSignal, QueuedState, WriterDriver};
+use queued_signal::state::{QueuedSignal, QueuedState, WriterDriver};
+use queued_signal::write_queues::WriteQueues;
 use queued_signal_benches::stats::{self, Sampling};
 
 /// Signals on the surface, matching the largest E5 row.
@@ -19,7 +20,7 @@ struct Surface {
     drivers: Vec<WriterDriver<u64>>,
     signals: Vec<QueuedSignal<u64>>,
     states: Vec<QueuedState<u64>>,
-    senders: Vec<flume::Sender<Op<u64>>>,
+    senders: Vec<WriteQueues<u64>>,
 }
 
 fn build() -> Surface {
@@ -134,7 +135,7 @@ fn main() {
 
     let probe = stats::measure(sampling, || {
         for sender in senders.iter() {
-            black_box(sender.is_empty());
+            black_box(sender.queue_count());
         }
     })
     .p50;
@@ -168,7 +169,7 @@ fn main() {
         ("tick-busy", tick_busy),
         ("tick-busy-batch", tick_busy_batch),
         ("arc-alloc", arc_alloc),
-        ("probe-1", probe),
+        ("queue-count", probe),
         ("cell-store", cell_store),
         ("version-store", version_store),
         ("drain-ops", drain),

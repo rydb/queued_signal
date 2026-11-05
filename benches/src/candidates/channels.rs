@@ -47,7 +47,7 @@ struct ChannelWriter {
 }
 
 impl Submitter for ChannelWriter {
-    fn submit(&self, sample: Sample) {
+    fn submit(&mut self, sample: Sample) {
         for sender in self.senders.iter() {
             let _ = sender.send(sample);
         }

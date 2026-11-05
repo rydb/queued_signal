@@ -16,7 +16,6 @@
 use dioxus::prelude::*;
 use dioxus::signals::Signal;
 use dioxus_core::Task;
-use flume::{Receiver, Sender};
 use kovan::{Guard, pin};
 use parking_lot::Mutex;
 use std::any::Any;
@@ -32,6 +31,7 @@ use dioxus_core::ReactiveContext;
 use crate::atom_coerce::{AtomCoerce, AtomCoerceHandle, RcuGuard, RcuGuardTyped};
 use crate::atom_coerce_dyn::{AtomCoerceDynHandle, AtomCoerceDynSlotGuard, EraseMut};
 use crate::subscriber_slots::{PassEpoch, SubscriberSlots, VisitStats};
+use crate::write_queues::{QueueReader, WriteQueues};
 
 /// Health status of QueuedSignal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -737,15 +737,14 @@ const HEALTH_INTERVAL_TICKS: u32 = 8;
 
 /// Driver for managing reads and writes for a QueuedSignal.
 ///
-/// Owns the read buffer and the channels for receiving mutations. Call
-/// [`tick`](Self::tick) regularly to drain pending operations, publish
-/// to readers, and update health.
+/// Owns the read buffer and the per thread write queues. Call [`tick`](Self::tick) regularly to
+/// drain pending operations, publish to readers, and update health.
 pub struct WriterDriver<
     T: Clone + Send + Sync + 'static + EraseMut<D>,
     D: ?Sized + 'static = dyn Any,
 > {
     cell: AtomCoerce<T, D>,
-    op_rx: Receiver<Op<T, D>>,
+    reader: QueueReader<T, D>,
     notify_tx: watch::Sender<u64>,
     version: u64,
     current_version: u64,
@@ -758,8 +757,8 @@ pub struct WriterDriver<
     reclaim_history: std::collections::VecDeque<u64>,
     /// Whether the last window of publishes saw no reclamation progress.
     starved: bool,
-    /// Sender for queued writes
-    pub op_tx: Sender<Op<T, D>>,
+    /// Write handle for queued writes
+    pub op_tx: WriteQueues<T, D>,
     /// The read-side state that consumers subscribe to.
     pub queued_state: QueuedState<T, D>,
     publish_counter: Option<Arc<AtomicU64>>,
@@ -783,7 +782,7 @@ impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Writer
         let (notify_tx, notify_rx) = watch::channel(0u64);
         let (health_tx, health_rx) = watch::channel(HealthStatus::Healthy);
 
-        let (op_tx, op_rx) = flume::unbounded();
+        let op_tx = WriteQueues::new();
 
         let pass = PassEpoch::new();
         let slots = SubscriberSlots::new(pass);
@@ -799,7 +798,7 @@ impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Writer
 
         Self {
             cell,
-            op_rx,
+            reader: QueueReader::new(),
             notify_tx,
             health_tx,
             ticks_since_health: 0,
@@ -830,9 +829,14 @@ impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Writer
         self.publish_counter = Some(counter);
     }
 
-    /// Drains the queue and returns the pending operations in arrival order.
+    /// Drains every queue and returns the pending operations in merge order.
+    ///
+    /// A write that lands after this call waits for the next resolve, so a caller that forwards
+    /// the operations applies them in the order the resolver would.
     pub fn drain_ops(&mut self) -> DrainedOps<T, D> {
-        self.op_rx.drain().collect()
+        let mut ops = Vec::new();
+        self.reader.apply(&self.op_tx, |op| ops.push(op));
+        ops
     }
 
     /// Reads the current value through an owned guard.
@@ -934,7 +938,7 @@ impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Writer
 
     /// Enqueues a full-value replacement.
     pub fn set_value(&self, value: T) {
-        let _ = self.op_tx.send(Op::Set(SetValueOp::new(value)));
+        self.op_tx.push(Op::Set(SetValueOp::new(value)));
     }
 
     /// Enqueues an authoritative mutation.
@@ -942,9 +946,8 @@ impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Writer
     where
         F: Fn(&mut T) + Send + Sync + 'static,
     {
-        let _ = self
-            .op_tx
-            .send(Op::SetInPlace(MutationOp::Typed(Arc::new(f))));
+        self.op_tx
+            .push(Op::SetInPlace(MutationOp::Typed(Arc::new(f))));
     }
 
     /// Enqueues a relative mutation.
@@ -952,36 +955,33 @@ impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Writer
     where
         F: Fn(&mut T) + Send + Sync + 'static,
     {
-        let _ = self.op_tx.send(Op::Add(MutationOp::Typed(Arc::new(f))));
+        self.op_tx.push(Op::Add(MutationOp::Typed(Arc::new(f))));
     }
 
     /// Drops queued writes and enqueues a full replacement.
     ///
-    /// A replacement overrides every write already queued, so the queue is emptied here
-    /// rather than walked by the next resolve.
+    /// A replacement overrides every write already queued, so every queue is drained here rather
+    /// than walked by the next resolve. A write that lands after this call applies afterwards.
     pub fn write_absolute(&mut self, value: T) {
-        self.op_rx.drain();
-        let _ = self.op_tx.send(Op::Absolute(SetValueOp::new(value)));
+        self.reader.apply(&self.op_tx, |_op: Op<T, D>| {});
+        self.op_tx.push(Op::Absolute(SetValueOp::new(value)));
     }
 
     /// Resolves one signal and leaves reclamation and health to the caller.
     fn tick_inner(&mut self, publish_interval: Duration, record_reclaim: bool) {
-        // The queue is the pending state, so a submit that lands after this drain waits for the
+        // The queues are the pending state, so a submit that lands after this drain waits for the
         // next frame. A separate flag could clear in that gap and strand the write.
+        let cell = &self.cell;
         let mut working: Option<T> = None;
-        let mut saw_op = false;
-        while let Ok(op) = self.op_rx.try_recv() {
-            saw_op = true;
-            match op {
-                Op::Set(value) | Op::Absolute(value) => {
-                    working = Some(value.into_value());
-                }
-                Op::SetInPlace(op) | Op::Add(op) => {
-                    let value = working.get_or_insert_with(|| (*self.cell.read_typed()).clone());
-                    op.apply(value);
-                }
+        let saw_op = self.reader.apply(&self.op_tx, |op| match op {
+            Op::Set(value) | Op::Absolute(value) => {
+                working = Some(value.into_value());
             }
-        }
+            Op::SetInPlace(op) | Op::Add(op) => {
+                let value = working.get_or_insert_with(|| (*cell.read_typed()).clone());
+                op.apply(value);
+            }
+        });
         if !saw_op {
             return;
         }
@@ -1102,7 +1102,7 @@ pub struct QueuedSignal<
     pub state: QueuedState<T, D>,
     // keep the writer alive as long as this signal exists
     _driver: Option<Arc<Mutex<WriterDriver<T, D>>>>,
-    op_tx: Sender<Op<T, D>>,
+    op_tx: WriteQueues<T, D>,
 }
 
 impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Clone
@@ -1143,7 +1143,7 @@ impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Queued
     pub fn from_parts(
         state: QueuedState<T, D>,
         driver: Option<Arc<Mutex<WriterDriver<T, D>>>>,
-        op_tx: Sender<Op<T, D>>,
+        op_tx: WriteQueues<T, D>,
     ) -> Self {
         Self {
             state,
@@ -1166,8 +1166,8 @@ impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Queued
         self.state.read_cached(f)
     }
 
-    /// Clone of the write sender.
-    pub(crate) fn op_tx(&self) -> Sender<Op<T, D>> {
+    /// Clone of the write handle.
+    pub(crate) fn op_tx(&self) -> WriteQueues<T, D> {
         self.op_tx.clone()
     }
 
@@ -1176,7 +1176,7 @@ impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Queued
     where
         F: Fn(&mut T) + Send + Sync + 'static,
     {
-        let _ = self.op_tx.send(Op::Add(MutationOp::Typed(Arc::new(f))));
+        self.op_tx.push(Op::Add(MutationOp::Typed(Arc::new(f))));
     }
 
     /// Enqueue an authoritative mutation.
@@ -1184,14 +1184,13 @@ impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Queued
     where
         F: Fn(&mut T) + Send + Sync + 'static,
     {
-        let _ = self
-            .op_tx
-            .send(Op::SetInPlace(MutationOp::Typed(Arc::new(f))));
+        self.op_tx
+            .push(Op::SetInPlace(MutationOp::Typed(Arc::new(f))));
     }
 
     /// Enqueue an authoritative full-value replacement.
     pub fn set_value(&self, value: T) {
-        let _ = self.op_tx.send(Op::Set(SetValueOp::new(value)));
+        self.op_tx.push(Op::Set(SetValueOp::new(value)));
     }
 
     /// Current health status.
@@ -1403,7 +1402,7 @@ mod tests {
         let op_tx = driver.op_tx.clone();
         let writer = std::thread::spawn(move || {
             for value in 1..=2_000u64 {
-                let _ = op_tx.send(Op::Set(SetValueOp::new(value)));
+                op_tx.push(Op::Set(SetValueOp::new(value)));
             }
         });
 
@@ -1524,5 +1523,204 @@ mod tests {
         fn assert_sync<T: Sync>() {}
         assert_send::<QueuedState<i32>>();
         assert_sync::<QueuedState<i32>>();
+    }
+
+    #[test]
+    fn consecutive_sets_collapse_to_the_newest() {
+        let mut driver = WriterDriver::new(0i32);
+        driver.set_value(1);
+        driver.set_value(2);
+        driver.set_value(3);
+        driver.tick(Duration::ZERO);
+        assert_eq!(*driver.queued_state.read(), 3i32);
+    }
+
+    #[test]
+    fn mutations_apply_after_the_coalesced_set() {
+        let mut driver = WriterDriver::new(0i32);
+        driver.set_value(1);
+        driver.set_value(2);
+        driver.mutate_set(|value: &mut i32| *value = 10);
+        driver.mutate(|value: &mut i32| *value += 5);
+        driver.tick(Duration::ZERO);
+        assert_eq!(*driver.queued_state.read(), 15i32);
+    }
+
+    #[test]
+    fn a_clone_on_the_same_thread_joins_the_queue() {
+        let mut driver = WriterDriver::new(0i32);
+        let state = driver.queued_state.clone();
+        let first = QueuedSignal::from_parts(state.clone(), None, driver.op_tx.clone());
+        let second = first.clone();
+        first.set_value(4);
+        second.mutate(|value: &mut i32| *value += 1);
+        assert_eq!(driver.op_tx.queue_count(), 1, "one thread keeps one queue");
+        driver.tick(Duration::ZERO);
+        assert_eq!(*driver.queued_state.read(), 5i32);
+    }
+
+    #[test]
+    fn a_dropped_handle_keeps_its_queued_work() {
+        let mut driver = WriterDriver::new(0i32);
+        let state = driver.queued_state.clone();
+        let handle = QueuedSignal::from_parts(state, None, driver.op_tx.clone());
+        let dropped = handle.clone();
+        dropped.set_value(7);
+        drop(dropped);
+        driver.tick(Duration::ZERO);
+        assert_eq!(*driver.queued_state.read(), 7i32);
+        assert_eq!(
+            driver.op_tx.queue_count(),
+            1,
+            "a dropped handle keeps the thread queue"
+        );
+    }
+
+    #[test]
+    fn two_threads_write_one_signal() {
+        let mut driver = WriterDriver::new(0i32);
+        let first = driver.op_tx.clone();
+        std::thread::spawn(move || first.push(Op::Set(SetValueOp::new(1))))
+            .join()
+            .expect("the first writer");
+        let second = driver.op_tx.clone();
+        std::thread::spawn(move || second.push(Op::Set(SetValueOp::new(2))))
+            .join()
+            .expect("the second writer");
+        assert_eq!(
+            driver.op_tx.queue_count(),
+            2,
+            "each writer thread attaches a queue"
+        );
+        driver.tick(Duration::ZERO);
+        assert_eq!(
+            *driver.queued_state.read(),
+            2i32,
+            "the later block wins the merge"
+        );
+        assert_eq!(
+            driver.op_tx.queue_count(),
+            0,
+            "a drained queue of an exited thread is retired"
+        );
+    }
+
+    #[test]
+    fn blocks_apply_by_burst_stamp() {
+        let mut driver = WriterDriver::new(0i32);
+        let writer = driver.op_tx.clone();
+        std::thread::spawn(move || {
+            writer.push(Op::Set(SetValueOp::new(5)));
+            writer.push(Op::Add(MutationOp::Typed(Arc::new(|value: &mut i32| {
+                *value += 1;
+            }))));
+        })
+        .join()
+        .expect("the first writer");
+        let writer = driver.op_tx.clone();
+        std::thread::spawn(move || {
+            writer.push(Op::Add(MutationOp::Typed(Arc::new(|value: &mut i32| {
+                *value += 10;
+            }))));
+        })
+        .join()
+        .expect("the second writer");
+        driver.tick(Duration::ZERO);
+        assert_eq!(
+            *driver.queued_state.read(),
+            16i32,
+            "the later block composes onto the earlier one"
+        );
+    }
+
+    #[test]
+    fn write_absolute_clears_every_queue() {
+        let mut driver = WriterDriver::new(0i32);
+        let writer = driver.op_tx.clone();
+        std::thread::spawn(move || {
+            writer.push(Op::Set(SetValueOp::new(3)));
+            writer.push(Op::Add(MutationOp::Typed(Arc::new(|value: &mut i32| {
+                *value += 4;
+            }))));
+        })
+        .join()
+        .expect("the writer");
+
+        driver.write_absolute(100);
+        driver.tick(Duration::ZERO);
+
+        assert_eq!(
+            *driver.queued_state.read(),
+            100i32,
+            "the absolute value overrides every queue"
+        );
+    }
+
+    #[test]
+    fn concurrent_writers_are_all_drained() {
+        const WRITERS: usize = 4;
+        const PER_WRITER: usize = 2_000;
+        const TOTAL: u64 = (WRITERS * PER_WRITER) as u64;
+
+        let mut driver = WriterDriver::new(0u64);
+        let state = driver.queued_state.clone();
+        let threads: Vec<_> = (0..WRITERS)
+            .map(|_| {
+                let op_tx = driver.op_tx.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..PER_WRITER {
+                        let add: Arc<dyn Fn(&mut u64) + Send + Sync> =
+                            Arc::new(|value: &mut u64| *value += 1);
+                        op_tx.push(Op::Add(MutationOp::Typed(add)));
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().expect("a writer thread");
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            driver.tick(Duration::ZERO);
+            if *state.read() == TOTAL {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the writers were not all drained, got {}",
+                *state.read()
+            );
+        }
+        driver.tick(Duration::ZERO);
+        assert_eq!(
+            driver.op_tx.queue_count(),
+            0,
+            "every exited writer queue is retired"
+        );
+    }
+
+    #[test]
+    fn the_dyn_path_writes_through_the_registry() {
+        type DynOp = Arc<dyn Fn(&mut dyn Any) + Send + Sync>;
+
+        let mut driver = WriterDriver::<i32>::new(0);
+        let state = driver.queued_state.clone();
+        let signal = QueuedSignal::from_parts(state, None, driver.op_tx.clone());
+        let dyn_signal = crate::queued_signal_dyn::QueuedSignalDyn::<dyn Any>::from_typed(&signal);
+        let set: DynOp = Arc::new(|value: &mut dyn Any| {
+            if let Some(value) = value.downcast_mut::<i32>() {
+                *value = 41;
+            }
+        });
+        let add: DynOp = Arc::new(|value: &mut dyn Any| {
+            if let Some(value) = value.downcast_mut::<i32>() {
+                *value += 1;
+            }
+        });
+        dyn_signal.mutate_set(set);
+        dyn_signal.mutate(add);
+        driver.tick(Duration::ZERO);
+        assert_eq!(*driver.queued_state.read(), 42i32);
     }
 }

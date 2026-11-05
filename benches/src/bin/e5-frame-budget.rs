@@ -53,7 +53,7 @@ struct SignalWriter {
 }
 
 impl Submitter for SignalWriter {
-    fn submit(&self, sample: Sample) {
+    fn submit(&mut self, sample: Sample) {
         self.signal.set_value(sample);
     }
 }
@@ -276,7 +276,7 @@ fn build(candidate: &str, signals: usize) -> (Drain, Reader, Vec<Box<dyn Submitt
 
 /// Runs one repetition and returns what it measured.
 fn run_rep(row: &Row, frames: usize) -> RepOut {
-    let (mut drain, mut reader, submitters) = build(row.candidate, row.signals);
+    let (mut drain, mut reader, mut submitters) = build(row.candidate, row.signals);
     let ops = row.ops;
     let clock = Clock::new();
     let go = Arc::new(Barrier::new(2));
@@ -293,7 +293,7 @@ fn run_rep(row: &Row, frames: usize) -> RepOut {
             for _ in 0..frames {
                 go.wait();
                 let start = Instant::now();
-                for submitter in submitters.iter() {
+                for submitter in submitters.iter_mut() {
                     for _ in 0..ops {
                         let sample = clock.stamp(seq.fetch_add(1, Ordering::Relaxed));
                         submitter.submit(sample);

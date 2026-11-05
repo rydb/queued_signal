@@ -47,7 +47,7 @@ struct SignalWriter {
 }
 
 impl Submitter for SignalWriter {
-    fn submit(&self, sample: Sample) {
+    fn submit(&mut self, sample: Sample) {
         self.signal.set_value(sample);
     }
 }
@@ -221,7 +221,7 @@ fn run_rep(row: &Row, frames: usize) -> RepOut {
     let last_submit = Arc::new(AtomicU64::new(0));
 
     let mut handles = Vec::with_capacity(row.writers);
-    for submitter in bench.submitters.drain(..) {
+    for mut submitter in bench.submitters.drain(..) {
         let go = go.clone();
         let done = done.clone();
         let seq = seq.clone();

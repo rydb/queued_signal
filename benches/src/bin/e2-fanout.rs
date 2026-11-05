@@ -289,7 +289,7 @@ fn run_bevy_resource(_subscribers: usize, frames: usize) -> RepOut {
 /// B5, one channel per subscriber, drained once per frame.
 fn run_channels(subscribers: usize, frames: usize) -> RepOut {
     let cell = candidates::build_with_subscribers("b5", subscribers).expect("b5 exists");
-    let submitter = cell.submitter().expect("b5 has a writer handle");
+    let mut submitter = cell.submitter().expect("b5 has a writer handle");
     let clock = Clock::new();
     let mut report = DriveReport::default();
 
@@ -320,7 +320,7 @@ fn run_channels(subscribers: usize, frames: usize) -> RepOut {
 /// B6, one snapshot that every subscriber polls.
 fn run_snapshot(subscribers: usize, frames: usize) -> RepOut {
     let cell = candidates::build_with_subscribers("b6", subscribers).expect("b6 exists");
-    let submitter = cell.submitter().expect("b6 has a writer handle");
+    let mut submitter = cell.submitter().expect("b6 has a writer handle");
     let clock = Clock::new();
 
     let mut publish_ns = Vec::with_capacity(frames);

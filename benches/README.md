@@ -24,6 +24,9 @@ It is a workspace member so the core crate's dev dependencies stay unchanged.
 - Warm up before timing and discard the warmup batches.
 - Writer and reader on distinct cores when the machine has two. The map is recorded in
   `manifest.json` whether pinning succeeded or failed.
+- A comparison across two runs must time an unchanged control design in both of them. If the
+  control moves, the harness or the machine moved with it and the comparison says nothing about
+  the change under test.
 - The parent process never pins itself. A child inherits the affinity of the thread that
   spawns it, so pinning the parent would leave every row on one core and every contention
   row would report uncontended cost. A row pins the threads it owns after it reads the
@@ -38,6 +41,7 @@ cargo run --release -p queued_signal_benches --bin e1-multiwriter
 cargo run --release -p queued_signal_benches --bin e1-multiwriter -- --row 3
 cargo run --release -p queued_signal_benches --bin e1-multiwriter -- --row-shared
 cargo run --release -p queued_signal_benches --bin e1-multiwriter -- --smoke
+cargo run --release -p queued_signal_benches --bin e8-hot-writer
 cargo run --release -p queued_signal_benches --bin report
 cargo run --release -p queued_signal_benches --bin resolve-parts
 ```
@@ -79,6 +83,25 @@ by hand.
 | b6 | Preallocated snapshot with a version counter | Fixed participant set, no wake path, readers retry across a write section |
 | b6r | Preallocated snapshot rotating three slots | Single consumer, no wake path, a slow reader drops intermediate publications |
 | b7 | queued_signal | The candidate |
+| b7z | queued_signal with a zero runner cadence | The candidate without the frame policy, so a row separates the cadence from the cost |
+| b8 | queued_signal with one queue per writer | One queue per writer handle, so writers never share a head, and mutation order across queues is queue order rather than global arrival |
+
+### Who can write, and from where
+
+B1 and B2 are absent from the ladder because neither accepts a write from a thread that does not
+own its runtime. They appear only in E2, where the row owns the runtime and drives it from the same
+thread. This is a result about expressiveness, not an omission.
+
+| Id | Write from a non-owner thread | Structural reason |
+|---|---|---|
+| b0 | Yes | A plain field with no synchronisation, so any thread can store, at the cost of a data race |
+| b1 | No | A dioxus signal belongs to one runtime, and a write marks scopes that only that runtime visits |
+| b2 | No | A bevy resource is reached through a system on the app schedule, and a resource write is a world access |
+| b3, b4 | Yes | The lock is the handoff, so any thread may take it |
+| b5 | Yes | The channel is the handoff, and each subscriber owns a receiver |
+| b6 | Yes | Writers serialise through a write section over a fixed participant set |
+| b6r | Yes | One producer rotates three slots, and one consumer reads the newest complete one |
+| b7, b7z, b8 | Yes | The writer enqueues, and the resolver publishes on its own thread |
 
 ## Figures
 

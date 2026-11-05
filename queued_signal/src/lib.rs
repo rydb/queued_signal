@@ -14,3 +14,5 @@ pub mod signal;
 /// and [`HealthStatus`](state::HealthStatus).
 pub mod state;
 pub mod subscriber_slots;
+/// Per thread write queues: [`WriteQueues`](write_queues::WriteQueues).
+pub mod write_queues;

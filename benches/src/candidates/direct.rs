@@ -58,7 +58,7 @@ struct DirectWriter {
 }
 
 impl Submitter for DirectWriter {
-    fn submit(&self, sample: Sample) {
+    fn submit(&mut self, sample: Sample) {
         // SAFETY: the direct baseline is only used with one writer thread.
         unsafe { *self.value.value.get() = sample.seq };
     }

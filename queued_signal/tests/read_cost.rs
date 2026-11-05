@@ -129,6 +129,14 @@ fn write_report(rows: &[(&'static str, String, Stats)]) -> std::io::Result<PathB
     ));
     out.push_str("- Threads: 1 reader, plus one publisher for the frame rows\n");
     out.push_str("- Units: ns is nanoseconds, us is microseconds, ms is milliseconds\n");
+    out.push_str(
+        "- Store rows: a store reuses a published node when the pool has one and allocates when it\n  \
+         does not, so the minimum and the median of a store row describe two different paths\n",
+    );
+    out.push_str(
+        "- Publish rows: the version send happens only when a receiver waits, so a gate closed row\n  \
+         and its one waiting receiver row differ by the cost of that send\n",
+    );
 
     let mut current = "";
     for (section, name, stats) in rows {
@@ -155,8 +163,9 @@ fn write_report(rows: &[(&'static str, String, Stats)]) -> std::io::Result<PathB
     let peek = find(rows, "peek version, atomic load").p50;
     let health = find(rows, "health, atomic load").p50;
     let store = find(rows, "typed store").p50;
-    let publish = find(rows, "publish, watch notify only").p50;
-    let publish_value = find(rows, "publish value, store and notify").p50;
+    let gate = find(rows, "publish, gate closed").p50;
+    let notify = find(rows, "publish, one waiting receiver").p50;
+    let publish_value = find(rows, "publish value, gate closed").p50;
 
     out.push_str("\n## Summary\n\n");
     out.push_str(&format!(
@@ -171,7 +180,8 @@ fn write_report(rows: &[(&'static str, String, Stats)]) -> std::io::Result<PathB
         "- Peeking the version costs {peek:.2} ns and reading health costs {health:.2} ns, both one atomic load.\n"
     ));
     out.push_str(&format!(
-        "- The typed store costs {store:.2} ns, the watch notification {publish:.2} ns, and store plus notification {publish_value:.2} ns.\n"
+        "- A publish with no waiting receiver costs {gate:.2} ns, and the same publish with one waiting receiver costs {notify:.2} ns, so the version send costs {:.2} ns. A value publish with the gate closed costs {publish_value:.2} ns, and the typed store alone costs {store:.2} ns.\n",
+        notify - gate
     ));
     let frame_cold = find(rows, "frame read, cold").p50;
     let pin_cold = find(rows, "pin and load, cold").p50;
@@ -288,17 +298,28 @@ fn baseline_read_write_costs() {
         drop(held);
     }
 
-    // Writer path: version bump and watch notification with no receivers.
+    // Writer path: the version send is gated on a waiting receiver, so with none attached this row
+    // measures the gate rather than a notification.
     rows.push((
         "Write path",
-        "publish, watch notify only".to_owned(),
+        "publish, gate closed".to_owned(),
         stats(|| driver.publish()),
     ));
     rows.push((
         "Write path",
-        "publish value, store and notify".to_owned(),
+        "publish value, gate closed".to_owned(),
         stats(|| driver.publish_value(Counter(black_box(1)))),
     ));
+    // A held receiver opens the gate, so the version send is part of this row.
+    {
+        let receiver = state.notify_rx();
+        rows.push((
+            "Write path",
+            "publish, one waiting receiver".to_owned(),
+            stats(|| driver.publish()),
+        ));
+        drop(receiver);
+    }
 
     // Writer path: health scan over the registered readers.
     for registered in [1usize, 8, 64] {

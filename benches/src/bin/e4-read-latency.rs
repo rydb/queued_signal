@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
+use parking_lot::Mutex;
+
 use queued_signal_benches::candidates::{self, Candidate, Clock, DriveReport, FrameReader};
 use queued_signal_benches::csv::{Record, RunSink, Unit};
 use queued_signal_benches::isolation::{self, Args};
@@ -21,7 +23,10 @@ use queued_signal_benches::settle;
 use queued_signal_benches::stats::{self, Stats};
 
 /// Candidates that can read while a writer publishes.
-const CANDIDATES: [&str; 5] = ["b3", "b4", "b6", "b6r", "b7"];
+///
+/// B8 reads through the same signal as b7 and differs only in queue topology, so its read and
+/// publish columns price a writer gain against the reader cost in the same row.
+const CANDIDATES: [&str; 6] = ["b3", "b4", "b6", "b6r", "b7", "b8"];
 /// The floor, measured with no writer so its plain cell cannot race.
 const FLOOR: &str = "b0";
 /// Loaded writer counts.
@@ -42,8 +47,16 @@ const MULTI_FRAMES: usize = 10;
 const MULTI_READS: usize = 10;
 /// Simulated frame gap.
 const FRAME_GAP: Duration = Duration::from_millis(16);
-/// Reads slower than this count as a stall.
-const READ_BOUND_NS: f64 = 1_000.0;
+/// Smallest stall bound, in nanoseconds.
+///
+/// The bound is derived per repetition from a calibration read, because the timer is part of every
+/// sample. One microsecond is the floor, so a fast machine still counts microsecond stalls.
+const READ_BOUND_FLOOR_NS: f64 = 1_000.0;
+/// Reads in one calibration batch, which sets the bound for a repetition.
+const CALIBRATION_READS: usize = 4_096;
+/// Submits each writer times per repetition, so its cost is recorded in the row that records the
+/// reader's cost.
+const PUBLISH_CAP_PER_WRITER: usize = 2_000;
 /// Untimed reads before a repetition.
 const WARMUP_READS: usize = 1_000;
 
@@ -70,8 +83,10 @@ impl Row {
 /// Result of one repetition.
 struct RepOut {
     read_ns: Vec<f64>,
+    publish_ns: Vec<f64>,
     over_bound: u64,
     retained: u64,
+    bound: f64,
 }
 
 fn main() {
@@ -117,11 +132,14 @@ fn main() {
 /// thread and appears with no writer at all.
 fn build_rows(smoke: bool) -> Vec<Row> {
     if smoke {
-        return vec![Row {
-            candidate: "b7",
-            mode: "tight",
-            writers: 2,
-        }];
+        return ["b7", "b8"]
+            .into_iter()
+            .map(|candidate| Row {
+                candidate,
+                mode: "tight",
+                writers: 2,
+            })
+            .collect();
     }
 
     let mut rows = Vec::new();
@@ -164,11 +182,28 @@ fn write_caveats(sink: &RunSink) {
             out.push_str(&format!("{id}: {}\n", candidate.caveat()));
         }
     }
+    out.push_str(
+        "read-bound: four times the p99 of a calibration read on this thread, floored at one \
+         microsecond, recorded beside every over-bound count\n",
+    );
+    out.push_str(
+        "over-bound: reads slower than this repetition's read-bound, so the timer tail is part of \
+         the bound rather than counted as a stall\n",
+    );
+    out.push_str(&format!(
+        "publish: time a writer spends inside one submit while this row's readers are running, \
+         capped at {PUBLISH_CAP_PER_WRITER} submits per writer, timed the same way the reads are\n"
+    ));
     std::fs::write(sink.dir().join("caveats.txt"), out).expect("caveats");
 }
 
 /// Runs every repetition of one row.
 fn run_row(row: &Row, args: &Args, cores: &[usize]) -> Vec<Record> {
+    // A row that outlives this budget has hung, so the run fails instead of waiting on it.
+    let _deadline = isolation::Deadline::arm(
+        Duration::from_secs(30),
+        format!("e4 {} {} {}", row.candidate, row.mode, row.writers),
+    );
     let (frames, reads_per_frame, reps) = row.plan();
     let reps = if args.smoke { 1 } else { args.reps(reps) };
     let (frames, reads_per_frame) = if args.smoke {
@@ -227,24 +262,36 @@ fn run_rep(
         })
     };
 
+    let publish_ns = Arc::new(Mutex::new(Vec::<f64>::with_capacity(
+        writers * PUBLISH_CAP_PER_WRITER,
+    )));
     let mut handles = Vec::with_capacity(writers);
     for writer in 0..writers {
         let cell = cell.clone();
         let seq = seq.clone();
         let stop = stop.clone();
         let start = start.clone();
+        let publish_ns = publish_ns.clone();
         let core = writer_core(writer, cores);
         handles.push(std::thread::spawn(move || {
             if let Some(core) = core {
                 let _ = pin::pin_current_thread(core);
             }
-            let submitter = cell
+            let mut submitter = cell
                 .submitter()
                 .unwrap_or_else(|| panic!("{} has no writer handle", cell.id()));
+            let mut local = Vec::with_capacity(PUBLISH_CAP_PER_WRITER);
             start.wait();
             while !stop.load(Ordering::Acquire) {
                 let sample = clock.stamp(seq.fetch_add(1, Ordering::Relaxed));
+                let begin = Instant::now();
                 submitter.submit(sample);
+                if local.len() < PUBLISH_CAP_PER_WRITER {
+                    local.push(begin.elapsed().as_nanos() as f64);
+                }
+            }
+            if !local.is_empty() {
+                publish_ns.lock().extend_from_slice(&local);
             }
         }));
     }
@@ -270,17 +317,18 @@ fn run_rep(
     };
     let mut samples = Vec::with_capacity(total);
     let mut over_bound = 0u64;
+    let bound = calibrate_bound();
 
     if frames == 0 {
         let mut reader = cell.frame_reader();
         for _ in 0..reads_per_frame {
-            timed_read(&*cell, &mut reader, &mut samples, &mut over_bound);
+            timed_read(&*cell, &mut reader, &mut samples, &mut over_bound, bound);
         }
     } else {
         for frame in 0..frames {
             let mut reader = cell.frame_reader();
             for _ in 0..reads_per_frame {
-                timed_read(&*cell, &mut reader, &mut samples, &mut over_bound);
+                timed_read(&*cell, &mut reader, &mut samples, &mut over_bound, bound);
             }
             if frame + 1 < frames {
                 std::thread::sleep(FRAME_GAP);
@@ -296,19 +344,38 @@ fn run_rep(
 
     let retained = cell.retained();
     let _ = settle::settle_default(|| cell.retained());
+    let publish_ns = publish_ns.lock().clone();
     RepOut {
         read_ns: samples,
+        publish_ns,
         over_bound,
         retained,
+        bound,
     }
 }
 
-/// Times one read, recording it and counting stalls.
+/// Derives this repetition's stall bound from the cost of timing a plain field read.
+///
+/// The timer is inside every sample, so a bound below the timer's own tail would count the clock.
+fn calibrate_bound() -> f64 {
+    let value = std::cell::Cell::new(0u64);
+    let mut samples = Vec::with_capacity(CALIBRATION_READS);
+    for index in 1..=CALIBRATION_READS as u64 {
+        let begin = Instant::now();
+        value.set(index);
+        black_box(value.get());
+        samples.push(begin.elapsed().as_nanos() as f64);
+    }
+    (stats::summarize(samples).p99 * 4.0).max(READ_BOUND_FLOOR_NS)
+}
+
+/// Times one read, recording it and counting stalls against the repetition's bound.
 fn timed_read(
     cell: &dyn Candidate,
     reader: &mut Option<Box<dyn FrameReader>>,
     samples: &mut Vec<f64>,
     over_bound: &mut u64,
+    bound: f64,
 ) {
     let begin = Instant::now();
     let sample = match reader.as_mut() {
@@ -317,7 +384,7 @@ fn timed_read(
     };
     black_box(sample);
     let ns = begin.elapsed().as_nanos() as f64;
-    if ns > READ_BOUND_NS {
+    if ns > bound {
         *over_bound += 1;
     }
     samples.push(ns);
@@ -340,16 +407,24 @@ fn reader_core(cores: &[usize]) -> Option<usize> {
 fn push_records(records: &mut Vec<Record>, row: &Row, rep: u32, out: RepOut) {
     let RepOut {
         read_ns,
+        publish_ns,
         over_bound,
         retained,
+        bound,
     } = out;
     let read = stats::summarize(read_ns);
 
-    for (metric, unit, stats) in [
+    let mut rows = vec![
         ("read", Unit::Nanoseconds, read),
+        ("read-bound", Unit::Nanoseconds, Stats::single(bound)),
         ("over-bound", Unit::Count, Stats::single(over_bound as f64)),
         ("retained", Unit::Count, Stats::single(retained as f64)),
-    ] {
+    ];
+    if !publish_ns.is_empty() {
+        rows.push(("publish", Unit::Nanoseconds, stats::summarize(publish_ns)));
+    }
+
+    for (metric, unit, stats) in rows {
         records.push(Record {
             candidate: row.candidate,
             workload: row.mode,

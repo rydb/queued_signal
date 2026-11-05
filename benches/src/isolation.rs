@@ -6,9 +6,53 @@
 use std::env;
 use std::path::Path;
 use std::process::{self, Command};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 /// Exit code used when a row fails.
 pub const FAILURE: i32 = 1;
+
+/// Bound on how often the watchdog checks whether a row finished.
+const WATCHDOG_STEP: Duration = Duration::from_millis(50);
+
+/// Fails the process when a row outlives its budget.
+///
+/// A hung row would otherwise hold the run open with no output, so the watchdog reports the row
+/// and exits with [`FAILURE`]. Dropping the guard disarms it, so a fast row pays one atomic store.
+pub struct Deadline {
+    /// Whether the guarded row finished.
+    done: Arc<AtomicBool>,
+}
+
+impl Deadline {
+    /// Arms a watchdog for one row.
+    pub fn arm(limit: Duration, label: impl Into<String>) -> Self {
+        let done = Arc::new(AtomicBool::new(false));
+        let watched = Arc::clone(&done);
+        let label = label.into();
+        std::thread::spawn(move || {
+            let begin = Instant::now();
+            while begin.elapsed() < limit {
+                if watched.load(Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(WATCHDOG_STEP);
+            }
+            if !watched.load(Ordering::Acquire) {
+                eprintln!("[deadline] {label} did not finish within {limit:?}");
+                process::exit(FAILURE);
+            }
+        });
+        Self { done }
+    }
+}
+
+impl Drop for Deadline {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Release);
+    }
+}
 
 /// Command line options shared by every experiment binary.
 #[derive(Clone, Debug, Default)]

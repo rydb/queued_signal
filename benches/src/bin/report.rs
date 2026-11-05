@@ -20,13 +20,14 @@ const FIGURES: [(&str, &str); 4] = [
 ];
 
 /// Designs in the headline read table, with the label a reader sees.
-const HEADLINE_READ: [(&str, &str); 6] = [
+const HEADLINE_READ: [(&str, &str); 7] = [
     ("b0", "b0 plain field, no producer, floor"),
     ("b3", "b3 rwlock"),
     ("b4", "b4 mutex"),
     ("b6", "b6 snapshot"),
     ("b6r", "b6r rotating snapshot"),
     ("b7", "b7 queued signal"),
+    ("b8", "b8 queue per writer"),
 ];
 
 /// Designs in the headline fan out table, with the label a reader sees.
