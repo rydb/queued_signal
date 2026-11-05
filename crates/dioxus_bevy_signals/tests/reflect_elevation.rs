@@ -113,13 +113,10 @@ fn untyped_resource_elevates_to_typed() {
     {
         let world = app.world_mut();
         let driver = WriterDriver::new(Counter(7));
-        let set_value_tx = driver.set_value_tx.clone();
-        let set_tx = driver.set_tx.clone();
-        let add_tx = driver.add_tx.clone();
+        let op_tx = driver.op_tx.clone();
         let queued_state = driver.queued_state.clone();
         let driver_arc = Arc::new(Mutex::new(driver));
-        let signal =
-            QueuedSignal::from_parts(queued_state, Some(driver_arc), add_tx, set_tx, set_value_tx);
+        let signal = QueuedSignal::from_parts(queued_state, Some(driver_arc), op_tx);
         world.insert_resource(ResourceQueuedSignalMirror(signal));
         notify_typed_resource_mirror::<Counter>(world);
     }

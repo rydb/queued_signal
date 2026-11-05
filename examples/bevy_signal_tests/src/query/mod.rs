@@ -1,7 +1,4 @@
-use std::{
-    fmt::Display,
-    time::Duration,
-};
+use std::{fmt::Display, time::Duration};
 
 use bevy_app::prelude::*;
 use bevy_ecs::{prelude::*, world::CommandQueue};

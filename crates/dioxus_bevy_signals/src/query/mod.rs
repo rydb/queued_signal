@@ -183,9 +183,7 @@ impl<T: DioxusComponentSync> DioxusMirror<T> {
     ) -> (Self, DioxusTrackingQueries<T>) {
         let mut driver = WriterDriver::new(value.clone());
 
-        let set_value_tx = driver.set_value_tx.clone();
-        let set_tx = driver.set_tx.clone();
-        let add_tx = driver.add_tx.clone();
+        let op_tx = driver.op_tx.clone();
         let queued_state = driver.queued_state.clone();
 
         let version = Arc::new(AtomicU64::new(0));
@@ -197,13 +195,7 @@ impl<T: DioxusComponentSync> DioxusMirror<T> {
         map.insert(query_to_tracking_id::<Q, F>(), 0);
         (
             Self {
-                value: QueuedSignal::from_parts(
-                    queued_state,
-                    Some(driver_arc.clone()),
-                    add_tx,
-                    set_tx,
-                    set_value_tx,
-                ),
+                value: QueuedSignal::from_parts(queued_state, Some(driver_arc.clone()), op_tx),
                 driver: driver_arc,
                 version,
             },
@@ -542,20 +534,13 @@ impl<T: DioxusQuerySync + 'static, F: QueryFilter + 'static> Command for Request
                             .run_if(resource_changed::<PendingQueryTrackingDeltas<T, F>>),
                     );
 
-                    let set_value_tx = query_driver.set_value_tx.clone();
-                    let set_tx = query_driver.set_tx.clone();
-                    let add_tx = query_driver.add_tx.clone();
+                    let op_tx = query_driver.op_tx.clone();
                     let queued_state = query_driver.queued_state.clone();
 
                     let driver_arc = Arc::new(Mutex::new(query_driver));
 
-                    let signal = QueuedSignal::from_parts(
-                        queued_state,
-                        Some(driver_arc.clone()),
-                        add_tx,
-                        set_tx,
-                        set_value_tx,
-                    );
+                    let signal =
+                        QueuedSignal::from_parts(queued_state, Some(driver_arc.clone()), op_tx);
 
                     world.insert_resource(MirrorQueryWriteDriver(driver_arc));
                     world.insert_resource(MirrorQuerySignal(signal.clone()));

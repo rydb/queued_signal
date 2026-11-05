@@ -5,11 +5,10 @@
 //! however long the app runs.
 
 use std::cell::{Cell, RefCell};
-use std::sync::Arc;
 use std::time::Duration;
 
 use dioxus::prelude::*;
-use queued_signal::state::{QueuedState, SetValueOp, WriterDriver};
+use queued_signal::state::{QueuedState, WriterDriver};
 
 thread_local! {
     static STATE: RefCell<Option<QueuedState<u32>>> = const { RefCell::new(None) };
@@ -41,10 +40,7 @@ fn a_publish_releases_the_previous_generation() {
 
     let mut peak = 0;
     for value in 1..=30u32 {
-        driver
-            .set_value_tx
-            .send(SetValueOp(Arc::new(value)))
-            .unwrap();
+        driver.set_value(value);
         driver.tick(Duration::ZERO);
         let _ = dom.render_immediate_to_vec();
 

@@ -84,7 +84,14 @@ fn reclaim_health_tracks_retained_generations() {
     cell.store(2);
     assert_eq!(cell.reclaim_health().retained(), 1);
 
-    flush_reclamation();
-    drain_deferred_frees();
+    // Reclamation runs on the receiver thread, so settle with a bounded wait under test load.
+    for _ in 0..10_000 {
+        flush_reclamation();
+        drain_deferred_frees();
+        if cell.reclaim_health().retained() == 0 {
+            break;
+        }
+        std::thread::yield_now();
+    }
     assert_eq!(cell.reclaim_health().retained(), 0);
 }

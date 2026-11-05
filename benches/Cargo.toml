@@ -1,0 +1,21 @@
+[package]
+name = "queued_signal_benches"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Benchmark harness and experiment binaries for queued_signal"
+
+[dependencies]
+queued_signal = {workspace = true}
+
+parking_lot = {workspace = true}
+flume = {workspace = true}
+allocation-counter = {workspace = true}
+libc = {workspace = true}
+serde_json = {workspace = true}
+charton = {workspace = true}
+
+dioxus = {workspace = true, features = ["macro", "hooks", "signals"]}
+dioxus-core = {workspace = true}
+bevy_app = {workspace = true}
+bevy_ecs = {workspace = true}

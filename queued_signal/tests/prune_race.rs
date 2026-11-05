@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use queued_signal::subscriber_slots::{PassEpoch, SubscriberSlots};
 
@@ -60,13 +60,24 @@ fn publish_racing_a_join_never_loses_an_update() {
     let second = spawn_reader(slots.clone(), published.clone(), stop.clone(), 1);
     thread::sleep(Duration::from_millis(20));
 
+    // The late reader holds a slot before the publish that has to wake it.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while slots.len() < 2 && Instant::now() < deadline {
+        thread::yield_now();
+    }
+    assert_eq!(slots.len(), 2, "the late reader must claim a slot");
+
     for _ in 0..200 {
         publish(&slots, &marked);
     }
 
+    // Both readers stop before the last publish, so that publish has to wake them. A reader that
+    // is still running reads the published version and needs no wake, which would say nothing
+    // about whether a reader that is behind is marked.
     stop.store(true, Ordering::Release);
     first.join().unwrap();
     second.join().unwrap();
+    publish(&slots, &marked);
 
     assert_eq!(
         marked.load(Ordering::Relaxed) & 0b11,

@@ -60,3 +60,52 @@ fn read_path_does_not_allocate() {
     });
     assert_eq!(erased_reads.count_total, 0, "erased read allocated");
 }
+
+#[test]
+fn first_publishes_take_seeded_nodes() {
+    let mut driver = WriterDriver::new(0u32);
+    let state = driver.queued_state.clone();
+    // Warm the thread local pin state, the watch send, and the reclaimer thread, and spend one of
+    // the eight seeded nodes.
+    drop(state.read());
+    driver.publish_value(0);
+
+    // The seven remaining seeded nodes cover these publishes without a fresh allocation.
+    let measured = measure(|| {
+        for value in 1..8u32 {
+            driver.publish_value(value);
+        }
+    });
+    assert_eq!(
+        measured.count_total, 0,
+        "the seeded nodes must cover the first publishes, allocated {}",
+        measured.count_total
+    );
+}
+
+#[test]
+fn publish_reuses_seeded_generations() {
+    let mut driver = WriterDriver::new(0u32);
+
+    // Warm the seed, the reclaimer, and the watch channel.
+    for value in 0..64u32 {
+        driver.publish_value(value);
+        driver.submit_pending();
+        flush_reclamation();
+    }
+
+    // Reclamation returns each replaced generation to the pool, so the publishes below take a
+    // seeded or returned node rather than a fresh allocation.
+    let measured = measure(|| {
+        for value in 0..64u32 {
+            driver.publish_value(value);
+            driver.submit_pending();
+            flush_reclamation();
+        }
+    });
+    assert!(
+        measured.count_total <= 8,
+        "64 publishes with reclamation allocated {} times",
+        measured.count_total
+    );
+}

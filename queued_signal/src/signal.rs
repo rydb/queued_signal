@@ -167,20 +167,12 @@ impl<T: Clone + Send + Sync + 'static> HubCommand for RegisterCommand<T> {
         }
 
         let driver = WriterDriver::new(this.initial);
-        let set_value_tx = driver.set_value_tx.clone();
-        let set_tx = driver.set_tx.clone();
-        let add_tx = driver.add_tx.clone();
+        let op_tx = driver.op_tx.clone();
         let queued_state = driver.queued_state.clone();
 
         let driver_arc = Arc::new(Mutex::new(driver));
 
-        let signal = QueuedSignal::from_parts(
-            queued_state,
-            Some(driver_arc.clone()),
-            add_tx,
-            set_tx,
-            set_value_tx,
-        );
+        let signal = QueuedSignal::from_parts(queued_state, Some(driver_arc.clone()), op_tx);
 
         hub.signals.insert(type_id, Box::new(signal));
 

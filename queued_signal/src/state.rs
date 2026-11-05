@@ -17,6 +17,7 @@ use dioxus::prelude::*;
 use dioxus::signals::Signal;
 use dioxus_core::Task;
 use flume::{Receiver, Sender};
+use kovan::{Guard, pin};
 use parking_lot::Mutex;
 use std::any::Any;
 use std::fmt::{Debug, Display};
@@ -30,8 +31,7 @@ use dioxus_core::ReactiveContext;
 
 use crate::atom_coerce::{AtomCoerce, AtomCoerceHandle, RcuGuard, RcuGuardTyped};
 use crate::atom_coerce_dyn::{AtomCoerceDynHandle, AtomCoerceDynSlotGuard, EraseMut};
-use crate::macros::warn;
-use crate::subscriber_slots::{PassEpoch, SubscriberSlots};
+use crate::subscriber_slots::{PassEpoch, SubscriberSlots, VisitStats};
 
 /// Health status of QueuedSignal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +84,11 @@ pub struct ReadAtomics {
     version: AtomicU64,
     pinned: AtomicUsize,
     status: AtomicU64,
+    /// Receivers held by state instances, which never wait on the version channel.
+    ///
+    /// Comparing this with the sender's receiver count tells the writer whether any wait
+    /// exists, so a publish with no async observer skips the channel update.
+    owned_receivers: AtomicUsize,
 }
 
 /// Bits reserved for the status tag, with the retained count above them.
@@ -112,12 +117,30 @@ const fn decode_health(word: u64) -> HealthStatus {
 
 impl ReadAtomics {
     /// Creates the words at version zero with no retained generation.
+    ///
+    /// The first state instance contributes one owned receiver.
     pub fn new() -> Self {
         Self {
             version: AtomicU64::new(0),
             pinned: AtomicUsize::new(0),
             status: AtomicU64::new(0),
+            owned_receivers: AtomicUsize::new(1),
         }
+    }
+
+    /// Records one state instance holding its own version receiver.
+    pub(crate) fn own_receiver(&self) {
+        self.owned_receivers.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Releases the record for a state instance that is dropping.
+    pub(crate) fn release_receiver(&self) {
+        self.owned_receivers.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Number of version receivers held by state instances.
+    pub fn owned_receivers(&self) -> usize {
+        self.owned_receivers.load(Ordering::Relaxed)
     }
 
     /// Publishes a version to readers.
@@ -186,9 +209,38 @@ impl<T: Clone + Send + Sync + 'static, D: ?Sized + 'static> MutationOp<T, D> {
     }
 }
 
-/// Full-value replacement operation carrying an owned value
+/// Full-value replacement operation carrying an owned value.
 #[derive(Debug)]
-pub struct SetValueOp<T>(pub Arc<T>);
+pub struct SetValueOp<T>(T);
+
+impl<T> SetValueOp<T> {
+    /// Wraps a value for the next resolve.
+    pub fn new(value: T) -> Self {
+        Self(value)
+    }
+
+    /// Borrows the value from the write buffer.
+    pub fn value(&self) -> &T {
+        &self.0
+    }
+
+    /// Moves the value into the read buffer.
+    pub(crate) fn into_value(self) -> T {
+        self.0
+    }
+}
+
+/// A queued write, applied in arrival order.
+pub enum Op<T: Clone + Send + Sync + 'static, D: ?Sized + 'static = dyn Any> {
+    /// Replaces the value.
+    Set(SetValueOp<T>),
+    /// Mutates the value through the typed or erased view.
+    SetInPlace(MutationOp<T, D>),
+    /// Composes a relative change onto the value.
+    Add(MutationOp<T, D>),
+    /// Replaces the value at the submit point in arrival order.
+    Absolute(SetValueOp<T>),
+}
 
 /// Inner state of a QueuedSignal.
 pub struct QueuedState<T: Clone + Send + Sync + 'static, D: ?Sized + 'static = dyn Any> {
@@ -215,6 +267,7 @@ impl<T: Clone + Send + Sync + 'static, D: ?Sized + 'static> Debug for QueuedStat
 
 impl<T: Clone + Send + Sync + 'static, D: ?Sized + 'static> Clone for QueuedState<T, D> {
     fn clone(&self) -> Self {
+        self.atomics.own_receiver();
         Self {
             cell: self.cell.clone(),
             notify_rx: self.notify_rx.clone(),
@@ -222,6 +275,12 @@ impl<T: Clone + Send + Sync + 'static, D: ?Sized + 'static> Clone for QueuedStat
             slots: self.slots.clone(),
             atomics: self.atomics.clone(),
         }
+    }
+}
+
+impl<T: Clone + Send + Sync + 'static, D: ?Sized + 'static> Drop for QueuedState<T, D> {
+    fn drop(&mut self) {
+        self.atomics.release_receiver();
     }
 }
 
@@ -233,6 +292,16 @@ impl<T: Clone + Send + Sync + 'static, D: ?Sized + 'static> QueuedState<T, D> {
             self.slots.join(context, guard.version());
         }
         TrackedReadGuard::new(guard)
+    }
+
+    /// Pins the current generation once and reuses the pin across a frame.
+    pub fn frame_read(&self) -> FrameRead<T, D> {
+        FrameRead {
+            state: self.clone(),
+            epoch: None,
+            ptr: std::ptr::null(),
+            version: 0,
+        }
     }
 
     /// Projects the current value without registering a reader.
@@ -365,6 +434,7 @@ impl<D: ?Sized + 'static> Debug for QueuedStateDyn<D> {
 
 impl<D: ?Sized + 'static> Clone for QueuedStateDyn<D> {
     fn clone(&self) -> Self {
+        self.atomics.own_receiver();
         Self {
             view: self.view.clone(),
             notify_rx: self.notify_rx.clone(),
@@ -372,6 +442,12 @@ impl<D: ?Sized + 'static> Clone for QueuedStateDyn<D> {
             slots: self.slots.clone(),
             atomics: self.atomics.clone(),
         }
+    }
+}
+
+impl<D: ?Sized + 'static> Drop for QueuedStateDyn<D> {
+    fn drop(&mut self) {
+        self.atomics.release_receiver();
     }
 }
 
@@ -432,6 +508,65 @@ impl<D: ?Sized + 'static> QueuedStateDyn<D> {
                 tokio::task::yield_now().await;
             }
         })
+    }
+}
+
+/// A pin held across one frame.
+///
+/// The scope takes one pin when it first reads and keeps it until the scope drops. Each refresh
+/// loads the published node once, and the node holds the version with the value, so a frame read
+/// is one dereference into one line rather than a version word plus a node.
+pub struct FrameRead<T, D = dyn Any>
+where
+    T: Clone + Send + Sync + 'static,
+    D: ?Sized + 'static,
+{
+    state: QueuedState<T, D>,
+    epoch: Option<Guard>,
+    ptr: *const T,
+    version: u64,
+}
+
+impl<T, D> FrameRead<T, D>
+where
+    T: Clone + Send + Sync + 'static,
+    D: ?Sized + 'static,
+{
+    /// Reads the newest value under the scope's existing pin.
+    pub fn read(&mut self) -> &T {
+        self.refresh();
+        // SAFETY: the scope keeps the epoch pinned, and the node behind the pointer was loaded
+        // under that pin, so the value stays alive for the borrow.
+        unsafe { &*self.ptr }
+    }
+
+    /// Reads the newest value and records the reader in the slot array.
+    pub fn read_tracked(&mut self) -> &T {
+        self.refresh();
+        if let Some(context) = ReactiveContext::current() {
+            self.state.slots.join(context, self.version);
+        }
+        // SAFETY: as in `read`.
+        unsafe { &*self.ptr }
+    }
+
+    /// Version of the generation this scope holds.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Pins once for the scope and reads the published node.
+    fn refresh(&mut self) {
+        if self.epoch.is_none() {
+            self.epoch = Some(pin());
+        }
+        let guard = self
+            .epoch
+            .as_ref()
+            .expect("a frame read pins before it loads");
+        let (ptr, version) = self.state.cell.load_typed_under(guard);
+        self.ptr = ptr;
+        self.version = version;
     }
 }
 
@@ -586,17 +721,19 @@ impl<D: ?Sized + 'static> AsRef<D> for TrackedReadGuardDyn<D> {
 }
 
 /// Pending operations returned by a driver drain.
-pub type DrainedOps<T, D> = (
-    Vec<SetValueOp<T>>,
-    Vec<MutationOp<T, D>>,
-    Vec<MutationOp<T, D>>,
-);
+pub type DrainedOps<T, D> = Vec<Op<T, D>>;
 
 /// Publishes with no reclamation progress that report a stall.
 ///
 /// A replaced generation is released by a later retire, so a couple of publishes with nothing freed
 /// is the normal lag. A whole window with nothing freed means a reader is starving the reclaimer.
 const STALL_WINDOW_PUBLISHES: u64 = 4;
+
+/// Ticks between health scans.
+///
+/// Health is a diagnostic, so it is sampled on a short cadence rather than on every tick. A stall
+/// is still reported within this many frames.
+const HEALTH_INTERVAL_TICKS: u32 = 8;
 
 /// Driver for managing reads and writes for a QueuedSignal.
 ///
@@ -608,26 +745,21 @@ pub struct WriterDriver<
     D: ?Sized + 'static = dyn Any,
 > {
     cell: AtomCoerce<T, D>,
-    set_value_rx: Receiver<SetValueOp<T>>,
-    set_rx: Receiver<MutationOp<T, D>>,
-    add_rx: Receiver<MutationOp<T, D>>,
-    abs_slot: Arc<Mutex<Option<T>>>,
+    op_rx: Receiver<Op<T, D>>,
     notify_tx: watch::Sender<u64>,
     version: u64,
     current_version: u64,
     health_tx: watch::Sender<HealthStatus>,
     last_health: HealthStatus,
+    /// Ticks since the last health scan.
+    ticks_since_health: u32,
     last_publish: Instant,
     /// Reclaimed count recorded at each of the last publishes, newest last.
     reclaim_history: std::collections::VecDeque<u64>,
     /// Whether the last window of publishes saw no reclamation progress.
     starved: bool,
-    /// Sender for authoritative full-value replacements.
-    pub set_value_tx: Sender<SetValueOp<T>>,
-    /// Sender for authoritative closure mutations.
-    pub set_tx: Sender<MutationOp<T, D>>,
-    /// Sender for relative closure mutations.
-    pub add_tx: Sender<MutationOp<T, D>>,
+    /// Sender for queued writes
+    pub op_tx: Sender<Op<T, D>>,
     /// The read-side state that consumers subscribe to.
     pub queued_state: QueuedState<T, D>,
     publish_counter: Option<Arc<AtomicU64>>,
@@ -651,9 +783,7 @@ impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Writer
         let (notify_tx, notify_rx) = watch::channel(0u64);
         let (health_tx, health_rx) = watch::channel(HealthStatus::Healthy);
 
-        let (set_value_tx, set_value_rx) = flume::unbounded();
-        let (set_tx, set_rx) = flume::unbounded();
-        let (add_tx, add_rx) = flume::unbounded();
+        let (op_tx, op_rx) = flume::unbounded();
 
         let pass = PassEpoch::new();
         let slots = SubscriberSlots::new(pass);
@@ -669,26 +799,23 @@ impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Writer
 
         Self {
             cell,
-            set_value_rx,
-            set_rx,
-            add_rx,
-            abs_slot: Arc::new(Mutex::new(None)),
+            op_rx,
             notify_tx,
             health_tx,
+            ticks_since_health: 0,
             // Above two publish intervals, which is the lag a replaced generation has before a
             // later retire releases it.
             last_publish: Instant::now(),
+            // Room for the push that precedes the pop, so a steady publish stream never grows it.
             reclaim_history: std::collections::VecDeque::with_capacity(
-                STALL_WINDOW_PUBLISHES as usize + 1,
+                STALL_WINDOW_PUBLISHES as usize + 2,
             ),
             starved: false,
             publish_counter: None,
             version: 0,
             current_version: 0,
             last_health: HealthStatus::Healthy,
-            set_value_tx,
-            set_tx,
-            add_tx,
+            op_tx,
             queued_state: state,
         }
     }
@@ -703,12 +830,9 @@ impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Writer
         self.publish_counter = Some(counter);
     }
 
-    /// Drains all channels and returns the pending operations.
+    /// Drains the queue and returns the pending operations in arrival order.
     pub fn drain_ops(&mut self) -> DrainedOps<T, D> {
-        let set_values = self.set_value_rx.drain().collect();
-        let sets = self.set_rx.drain().collect();
-        let adds = self.add_rx.drain().collect();
-        (set_values, sets, adds)
+        self.op_rx.drain().collect()
     }
 
     /// Reads the current value through an owned guard.
@@ -721,24 +845,47 @@ impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Writer
     /// Call this in the same pass as [`begin_pass`](QueuedState::begin_pass), so a reader that
     /// read during the previous pass still receives the mark.
     pub fn publish(&mut self) {
+        let _ = self.publish_counted();
+    }
+
+    /// Publishes the current version to readers and returns the visit counters.
+    ///
+    /// The counters expose the number of marks a publish issued, which timing alone cannot show.
+    pub fn publish_counted(&mut self) -> VisitStats {
         self.version += 1;
-        self.publish_current();
+        let visit = self.publish_current();
+        crate::atom_coerce::submit_if_pending();
+        visit
     }
 
     /// Publishes the version and the snapshot the caller already stored.
-    fn publish_current(&mut self) {
+    fn publish_current(&mut self) -> VisitStats {
+        self.publish_current_inner(true)
+    }
+
+    /// Publishes the epilogue, optionally recording reclaim progress.
+    fn publish_current_inner(&mut self, record_reclaim: bool) -> VisitStats {
         self.queued_state.atomics.store_version(self.version);
-        let _ = self.notify_tx.send(self.version);
+        // Every state instance holds one version receiver that never waits, so only a count above
+        // that means an async forwarder or a manual waiter is listening.
+        if self.notify_tx.receiver_count() > self.queued_state.atomics.owned_receivers() {
+            let _ = self.notify_tx.send(self.version);
+        }
         if let Some(ref counter) = self.publish_counter {
             counter.fetch_add(1, Ordering::Relaxed);
         }
-        self.queued_state
-            .slots
-            .visit(self.current_version, |context| context.mark_dirty());
-        // A retired batch only leaves the thread that retired it, and the receiver does the
-        // collecting and the destructor work. A publish that retired nothing pays one read.
-        crate::atom_coerce::submit_if_pending();
-        self.record_reclaim_progress();
+        // A signal with no subscriber block has no slot to mark, so it skips the visit entirely.
+        let visit = if self.queued_state.slots.has_blocks() {
+            self.queued_state
+                .slots
+                .visit(self.current_version, |context| context.mark_dirty())
+        } else {
+            VisitStats::default()
+        };
+        if record_reclaim {
+            self.record_reclaim_progress();
+        }
+        visit
     }
 
     /// Records reclamation progress for the publish that just happened.
@@ -763,10 +910,17 @@ impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Writer
 
     /// Stores a value into the read buffer and publishes a new version.
     pub fn publish_value(&mut self, value: T) {
+        let _ = self.publish_value_counted(value);
+    }
+
+    /// Stores a value, publishes a new version, and returns the visit counters.
+    pub fn publish_value_counted(&mut self, value: T) -> VisitStats {
         self.version += 1;
         self.current_version = self.version;
         self.cell.store_versioned(value, self.version);
-        self.publish_current();
+        let visit = self.publish_current();
+        crate::atom_coerce::submit_if_pending();
+        visit
     }
 
     /// Submits whatever this thread has retired, so the next health read is not counting it.
@@ -778,70 +932,130 @@ impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Writer
         crate::atom_coerce::submit_if_pending();
     }
 
-    /// Drains all buffers and replaces with the given value.
-    pub fn write_absolute(&self, value: T) {
-        let mut slot = self.abs_slot.lock();
-        if slot.is_some() {
-            warn!("Absolute value overwritten before being applied.");
-        }
-        *slot = Some(value);
-        self.set_value_rx.drain();
-        self.set_rx.drain();
-        self.add_rx.drain();
+    /// Enqueues a full-value replacement.
+    pub fn set_value(&self, value: T) {
+        let _ = self.op_tx.send(Op::Set(SetValueOp::new(value)));
     }
 
-    /// Drain pending operations, publish if the interval has elapsed,
-    /// and update the health status.
+    /// Enqueues an authoritative mutation.
+    pub fn mutate_set<F>(&self, f: F)
+    where
+        F: Fn(&mut T) + Send + Sync + 'static,
+    {
+        let _ = self
+            .op_tx
+            .send(Op::SetInPlace(MutationOp::Typed(Arc::new(f))));
+    }
+
+    /// Enqueues a relative mutation.
+    pub fn mutate<F>(&self, f: F)
+    where
+        F: Fn(&mut T) + Send + Sync + 'static,
+    {
+        let _ = self.op_tx.send(Op::Add(MutationOp::Typed(Arc::new(f))));
+    }
+
+    /// Drops queued writes and enqueues a full replacement.
     ///
-    /// Call this once per frame. Each call begins a subscriber pass, so a reader that does not
-    /// read again before the next call is pruned from the slot array.
-    pub fn tick(&mut self, publish_interval: Duration) {
-        self.queued_state.begin_pass();
-        let abs_taken = { self.abs_slot.lock().take() };
+    /// A replacement overrides every write already queued, so the queue is emptied here
+    /// rather than walked by the next resolve.
+    pub fn write_absolute(&mut self, value: T) {
+        self.op_rx.drain();
+        let _ = self.op_tx.send(Op::Absolute(SetValueOp::new(value)));
+    }
 
-        let did_work;
-
-        if let Some(abs_val) = abs_taken {
-            self.version += 1;
-            self.current_version = self.version;
-            self.cell.store_versioned(abs_val, self.version);
-            self.set_value_rx.drain();
-            self.set_rx.drain();
-            self.add_rx.drain();
-            did_work = true;
-        } else {
-            let (set_values, sets, adds) = self.drain_ops();
-            let has_ops = !set_values.is_empty() || !sets.is_empty() || !adds.is_empty();
-            if !has_ops {
-                self.update_health();
-                return;
+    /// Resolves one signal and leaves reclamation and health to the caller.
+    fn tick_inner(&mut self, publish_interval: Duration, record_reclaim: bool) {
+        // The queue is the pending state, so a submit that lands after this drain waits for the
+        // next frame. A separate flag could clear in that gap and strand the write.
+        let mut working: Option<T> = None;
+        let mut saw_op = false;
+        while let Ok(op) = self.op_rx.try_recv() {
+            saw_op = true;
+            match op {
+                Op::Set(value) | Op::Absolute(value) => {
+                    working = Some(value.into_value());
+                }
+                Op::SetInPlace(op) | Op::Add(op) => {
+                    let value = working.get_or_insert_with(|| (*self.cell.read_typed()).clone());
+                    op.apply(value);
+                }
             }
-            self.version += 1;
-            self.current_version = self.version;
-            self.cell.rcu_versioned(self.version, |old| {
-                let mut working = old.clone();
-                for op in &set_values {
-                    working = (*op.0).clone();
-                }
-                for op in &sets {
-                    op.apply(&mut working);
-                }
-                for op in &adds {
-                    op.apply(&mut working);
-                }
-                working
-            });
-            did_work = true;
+        }
+        if !saw_op {
+            return;
         }
 
-        if did_work && self.last_publish.elapsed() >= publish_interval {
-            self.publish_current();
-            self.last_publish = Instant::now();
+        // A pass advances only on a frame with work, and only while a subscriber block exists.
+        if self.queued_state.slots.has_blocks() {
+            self.queued_state.begin_pass();
         }
 
-        // An op applied without a publish still retires a generation.
+        self.version += 1;
+        self.current_version = self.version;
+        let value = match working {
+            Some(value) => value,
+            None => (*self.cell.read_typed()).clone(),
+        };
+        self.cell.store_versioned(value, self.version);
+
+        // A zero interval publishes every resolve, so it needs no clock read at all.
+        let always_publish = publish_interval.is_zero();
+        if always_publish || self.last_publish.elapsed() >= publish_interval {
+            self.publish_current_inner(record_reclaim);
+            if !always_publish {
+                self.last_publish = Instant::now();
+            }
+        }
+    }
+
+    /// Drains one signal, publishes if due, flushes reclamation, and updates health.
+    ///
+    /// Call this once per frame for a single signal. A batch of signals should use
+    /// [`tick_batch`](Self::tick_batch), which shares one flush and one health step.
+    pub fn tick(&mut self, publish_interval: Duration) {
+        self.tick_inner(publish_interval, true);
         crate::atom_coerce::submit_if_pending();
-        self.update_health();
+        self.refresh_health_on_cadence();
+    }
+
+    /// Resolves a batch of signals with one flush and one health step.
+    ///
+    /// The batch advances the health cadence once, so a frame pays one flush and one scan
+    /// regardless of how many signals it resolves.
+    pub fn tick_batch(drivers: &mut [Self], publish_interval: Duration) {
+        for driver in drivers.iter_mut() {
+            driver.tick_inner(publish_interval, false);
+        }
+        crate::atom_coerce::submit_if_pending();
+        let Some(first) = drivers.first_mut() else {
+            return;
+        };
+        // Reclamation is global, so the batch samples one window and shares the verdict.
+        first.record_reclaim_progress();
+        let starved = first.starved;
+        first.ticks_since_health += 1;
+        let health_due = first.ticks_since_health >= HEALTH_INTERVAL_TICKS;
+        if health_due {
+            first.ticks_since_health = 0;
+        }
+        for driver in drivers.iter_mut() {
+            driver.starved = starved;
+        }
+        if health_due {
+            for driver in drivers.iter_mut() {
+                driver.update_health();
+            }
+        }
+    }
+
+    /// Refreshes health when the tick cadence says it is due.
+    fn refresh_health_on_cadence(&mut self) {
+        self.ticks_since_health += 1;
+        if self.ticks_since_health >= HEALTH_INTERVAL_TICKS {
+            self.ticks_since_health = 0;
+            self.update_health();
+        }
     }
 
     /// Recomputes and publishes the current health status.
@@ -888,9 +1102,7 @@ pub struct QueuedSignal<
     pub state: QueuedState<T, D>,
     // keep the writer alive as long as this signal exists
     _driver: Option<Arc<Mutex<WriterDriver<T, D>>>>,
-    add_tx: Sender<MutationOp<T, D>>,
-    set_tx: Sender<MutationOp<T, D>>,
-    set_value_tx: Sender<SetValueOp<T>>,
+    op_tx: Sender<Op<T, D>>,
 }
 
 impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Clone
@@ -900,9 +1112,7 @@ impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Clone
         Self {
             state: self.state.clone(),
             _driver: self._driver.clone(),
-            add_tx: self.add_tx.clone(),
-            set_tx: self.set_tx.clone(),
-            set_value_tx: self.set_value_tx.clone(),
+            op_tx: self.op_tx.clone(),
         }
     }
 }
@@ -923,9 +1133,7 @@ impl<T: Clone + Send + Sync + Debug + 'static + EraseMut<D>, D: ?Sized + 'static
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QueuedSignal")
             .field("state", &self.state)
-            .field("add_tx", &self.add_tx)
-            .field("set_tx", &self.set_tx)
-            .field("set_value_tx", &self.set_value_tx)
+            .field("op_tx", &self.op_tx)
             .finish()
     }
 }
@@ -935,16 +1143,12 @@ impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Queued
     pub fn from_parts(
         state: QueuedState<T, D>,
         driver: Option<Arc<Mutex<WriterDriver<T, D>>>>,
-        add_tx: Sender<MutationOp<T, D>>,
-        set_tx: Sender<MutationOp<T, D>>,
-        set_value_tx: Sender<SetValueOp<T>>,
+        op_tx: Sender<Op<T, D>>,
     ) -> Self {
         Self {
             state,
             _driver: driver,
-            add_tx,
-            set_tx,
-            set_value_tx,
+            op_tx,
         }
     }
 
@@ -962,14 +1166,9 @@ impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Queued
         self.state.read_cached(f)
     }
 
-    /// Clone of the relative mutation sender.
-    pub(crate) fn add_tx(&self) -> Sender<MutationOp<T, D>> {
-        self.add_tx.clone()
-    }
-
-    /// Clone of the authoritative mutation sender.
-    pub(crate) fn set_tx(&self) -> Sender<MutationOp<T, D>> {
-        self.set_tx.clone()
+    /// Clone of the write sender.
+    pub(crate) fn op_tx(&self) -> Sender<Op<T, D>> {
+        self.op_tx.clone()
     }
 
     /// Enqueue a relative mutation.
@@ -977,7 +1176,7 @@ impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Queued
     where
         F: Fn(&mut T) + Send + Sync + 'static,
     {
-        let _ = self.add_tx.send(MutationOp::Typed(Arc::new(f)));
+        let _ = self.op_tx.send(Op::Add(MutationOp::Typed(Arc::new(f))));
     }
 
     /// Enqueue an authoritative mutation.
@@ -985,12 +1184,14 @@ impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Queued
     where
         F: Fn(&mut T) + Send + Sync + 'static,
     {
-        let _ = self.set_tx.send(MutationOp::Typed(Arc::new(f)));
+        let _ = self
+            .op_tx
+            .send(Op::SetInPlace(MutationOp::Typed(Arc::new(f))));
     }
 
     /// Enqueue an authoritative full-value replacement.
     pub fn set_value(&self, value: T) {
-        let _ = self.set_value_tx.send(SetValueOp(Arc::new(value)));
+        let _ = self.op_tx.send(Op::Set(SetValueOp::new(value)));
     }
 
     /// Current health status.
@@ -1099,15 +1300,9 @@ mod tests {
     fn writer_driver_tick_ordering() {
         let mut driver = WriterDriver::new(0i32);
 
-        driver.set_value_tx.send(SetValueOp(Arc::new(42))).unwrap();
-        driver
-            .set_tx
-            .send(MutationOp::Typed(Arc::new(|v: &mut i32| *v += 10)))
-            .unwrap();
-        driver
-            .add_tx
-            .send(MutationOp::Typed(Arc::new(|v: &mut i32| *v += 1)))
-            .unwrap();
+        driver.set_value(42);
+        driver.mutate_set(|v: &mut i32| *v += 10);
+        driver.mutate(|v: &mut i32| *v += 1);
 
         driver.tick(Duration::ZERO);
 
@@ -1119,7 +1314,7 @@ mod tests {
     fn writer_driver_tick_set_value_alone() {
         let mut driver = WriterDriver::new(0i32);
 
-        driver.set_value_tx.send(SetValueOp(Arc::new(99))).unwrap();
+        driver.set_value(99);
 
         driver.tick(Duration::ZERO);
 
@@ -1127,23 +1322,126 @@ mod tests {
         assert_eq!(val, 99i32);
     }
 
-    #[test]
-    fn writer_driver_tick_mutate_set_wins_over_mutate() {
-        let mut driver = WriterDriver::new(0i32);
+    /// A value that counts its clones, so a write path can prove the value moved.
+    #[derive(Debug)]
+    struct Counted {
+        clones: Arc<AtomicUsize>,
+        payload: Vec<u8>,
+    }
 
-        driver
-            .add_tx
-            .send(MutationOp::Typed(Arc::new(|v: &mut i32| *v += 1)))
-            .unwrap();
-        driver
-            .set_tx
-            .send(MutationOp::Typed(Arc::new(|v: &mut i32| *v = 10)))
-            .unwrap();
+    impl Counted {
+        fn new() -> Self {
+            Self {
+                clones: Arc::new(AtomicUsize::new(0)),
+                payload: vec![7; 64],
+            }
+        }
+    }
+
+    impl Clone for Counted {
+        fn clone(&self) -> Self {
+            self.clones.fetch_add(1, Ordering::Relaxed);
+            Self {
+                clones: Arc::clone(&self.clones),
+                payload: self.payload.clone(),
+            }
+        }
+    }
+
+    #[test]
+    fn an_unshared_set_value_moves_without_a_clone() {
+        let mut driver = WriterDriver::new(Counted::new());
+        let value = Counted::new();
+        let clones = Arc::clone(&value.clones);
+        driver.set_value(value);
+        clones.store(0, Ordering::Relaxed);
 
         driver.tick(Duration::ZERO);
 
-        let val = *driver.queued_state.read();
-        assert_eq!(val, 11i32);
+        assert_eq!(clones.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn writer_driver_tick_applies_in_arrival_order() {
+        let mut driver = WriterDriver::new(0i32);
+
+        driver.mutate(|v: &mut i32| *v += 1);
+        driver.mutate_set(|v: &mut i32| *v = 10);
+        driver.tick(Duration::ZERO);
+        assert_eq!(
+            *driver.queued_state.read(),
+            10i32,
+            "a later set replaces earlier adds"
+        );
+
+        driver.mutate_set(|v: &mut i32| *v = 10);
+        driver.mutate(|v: &mut i32| *v += 1);
+        driver.tick(Duration::ZERO);
+        assert_eq!(
+            *driver.queued_state.read(),
+            11i32,
+            "an add after a set composes onto it"
+        );
+    }
+
+    #[test]
+    fn writer_driver_tick_absolute_discards_earlier_writes() {
+        let mut driver = WriterDriver::new(0i32);
+
+        driver.set_value(1);
+        driver.write_absolute(5);
+        driver.mutate(|v: &mut i32| *v += 2);
+        driver.tick(Duration::ZERO);
+
+        assert_eq!(*driver.queued_state.read(), 7i32);
+    }
+
+    #[test]
+    fn a_submit_racing_a_resolve_is_never_stranded() {
+        let mut driver = WriterDriver::new(0u64);
+        let state = driver.queued_state.clone();
+        let op_tx = driver.op_tx.clone();
+        let writer = std::thread::spawn(move || {
+            for value in 1..=2_000u64 {
+                let _ = op_tx.send(Op::Set(SetValueOp::new(value)));
+            }
+        });
+
+        // The last write must arrive without another submit to wake the resolver, which a
+        // separate pending flag cannot promise once it clears between a send and the drain.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            driver.tick(Duration::ZERO);
+            if *state.read() == 2_000 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the last write was never resolved"
+            );
+        }
+        writer.join().expect("the writer thread");
+    }
+
+    #[test]
+    fn idle_ticks_leave_the_version_alone() {
+        let mut driver = WriterDriver::new(0i32);
+        let state = driver.queued_state.clone();
+        for _ in 0..16 {
+            driver.tick(Duration::ZERO);
+        }
+        assert_eq!(state.peek_version(), 0, "an idle frame must not publish");
+    }
+
+    #[test]
+    fn publish_notifies_an_external_version_receiver() {
+        let mut driver = WriterDriver::new(0i32);
+        let state = driver.queued_state.clone();
+        // A receiver taken outside the state counts as a listener, so a publish must wake it.
+        let mut rx = state.notify_rx();
+        driver.publish_value(1);
+        assert!(rx.has_changed().expect("the sender is alive"));
+        assert_eq!(*rx.borrow_and_update(), 1);
     }
 
     #[test]
@@ -1212,7 +1510,7 @@ mod tests {
         let old_guard = driver.read();
         assert_eq!(*old_guard, 0);
 
-        driver.set_value_tx.send(SetValueOp(Arc::new(42))).unwrap();
+        driver.set_value(42);
         driver.tick(Duration::ZERO);
 
         assert_eq!(*old_guard, 0);

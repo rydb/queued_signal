@@ -3,7 +3,7 @@
 use std::any::Any;
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;
-use std::mem::ManuallyDrop;
+use std::mem::{ManuallyDrop, MaybeUninit};
 use std::ops::Deref;
 use std::ptr;
 use std::ptr::NonNull;
@@ -162,6 +162,12 @@ impl ReclaimHealth {
     }
 }
 
+impl Default for ReclaimHealth {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// One node published into an atom.
 ///
 /// The reclamation header must stay the first field so the node can be
@@ -173,10 +179,16 @@ impl ReclaimHealth {
 struct AtomNode<T> {
     header: RetiredNode,
     deferred: crate::deferred::DeferredHeader,
-    version: u64,
     health: *const ReclaimHealth,
-    val: ManuallyDrop<T>,
+    version: u64,
+    val: MaybeUninit<T>,
 }
+
+/// Nodes kept ready at construction so the first publications do not reach the allocator.
+///
+/// The set is seed only. A publish takes a node from the pool, and the pool is refilled by the
+/// reclaimer after it frees a generation, so reuse stays gated by reclamation.
+const PREALLOCATED_NODES: usize = 8;
 
 impl<T: Send + Sync + 'static> AtomNode<T> {
     /// Takes a node for `val` at the given publication version, reusing a pooled one when there is.
@@ -186,27 +198,38 @@ impl<T: Send + Sync + 'static> AtomNode<T> {
             return Box::into_raw(Box::new(Self {
                 header: RetiredNode::new(),
                 deferred: crate::deferred::DeferredHeader::new(),
-                version,
                 health: counters as *const ReclaimHealth,
-                val: ManuallyDrop::new(val),
+                version,
+                val: MaybeUninit::new(val),
             }));
         }
-        let node = pooled as *mut Self;
+        let node = pooled;
         // SAFETY: the node came from this pool, so it is an allocation of this type whose value was
         // dropped before it was pooled.
         unsafe {
             (*node).header = RetiredNode::new();
             (*node).deferred = crate::deferred::DeferredHeader::new();
-            (*node).version = version;
             (*node).health = counters;
-            (*node).val = ManuallyDrop::new(val);
+            (*node).version = version;
+            (*node).val = MaybeUninit::new(val);
         }
         node
     }
 
+    /// Allocates a node whose value is not written yet, for a preallocated pool.
+    fn uninit(counters: &ReclaimHealth) -> *mut Self {
+        Box::into_raw(Box::new(Self {
+            header: RetiredNode::new(),
+            deferred: crate::deferred::DeferredHeader::new(),
+            health: counters as *const ReclaimHealth,
+            version: 0,
+            val: MaybeUninit::uninit(),
+        }))
+    }
+
     /// Points at the value inside a node.
     ///
-    /// The caller must keep the node alive.
+    /// The caller must keep the node alive and the value initialized.
     unsafe fn val_ptr(node: *const Self) -> *const T {
         unsafe { std::ptr::addr_of!((*node).val) as *const T }
     }
@@ -265,6 +288,24 @@ fn give_pooled<T: Send + Sync + 'static>(node: *mut AtomNode<T>, counters: &Recl
     }
 }
 
+/// Seeds the writing thread's cache with nodes that hold no value yet.
+///
+/// Only the writing thread touches the cache, and this runs at construction, so the link can be
+/// written without an atomic handoff. A publication still takes a seeded node through
+/// `take_pooled`, and the reclaimer refills the cache after it frees a generation, so a seeded
+/// node is never overwritten while it is live.
+fn seed_pooled<T: Send + Sync + 'static>(counters: &ReclaimHealth, count: usize) {
+    let cache = counters.cache();
+    let mut head = ptr::null_mut();
+    for _ in 0..count {
+        let node = AtomNode::<T>::uninit(counters);
+        // SAFETY: the node is unpublished, so only this thread reaches its link.
+        unsafe { (*node).deferred.set_link(head) };
+        head = node as *mut ();
+    }
+    cache.store(head, Ordering::Release);
+}
+
 /// Frees every pooled node, using the type only `Atom<T>` and its destructor know.
 unsafe fn free_pooled<T: Send + Sync + 'static>(counters: &ReclaimHealth) {
     for list in [counters.cache(), counters.pool()] {
@@ -282,7 +323,7 @@ unsafe fn free_pooled<T: Send + Sync + 'static>(counters: &ReclaimHealth) {
 unsafe fn free_node<T: Send + Sync + 'static>(ptr: *mut ()) {
     let node = ptr as *mut AtomNode<T>;
     unsafe {
-        ManuallyDrop::drop(&mut (*node).val);
+        (*node).val.assume_init_drop();
         // SAFETY: the counters outlive every node, see `Atom::drop`.
         let counters_ptr = (*node).health;
         let counters = &*counters_ptr;
@@ -359,13 +400,17 @@ impl<T: Send + Sync + 'static> Atom<T> {
     /// Publishes a first node holding `val`.
     pub fn new(val: T) -> Self {
         let counters = Box::into_raw(Box::new(ReclaimHealth::new()));
-        Self {
+        // SAFETY: the allocation above is owned by this atom and outlives the seed.
+        let counters_ref = unsafe { &*counters };
+        let atom = Self {
             // The first published version is the driver's, so the initial node is version zero.
-            // SAFETY: the allocation above is owned by this atom.
-            root: Atomic::new(AtomNode::boxed(val, 0, unsafe { &*counters })),
+            root: Atomic::new(AtomNode::boxed(val, 0, counters_ref)),
             // SAFETY: the allocation above is owned by this atom.
             counters: unsafe { NonNull::new_unchecked(counters) },
-        }
+        };
+        // Seed a small reuse set so the first publications do not reach the allocator.
+        seed_pooled::<T>(counters_ref, PREALLOCATED_NODES);
+        atom
     }
 
     /// Reclamation counters for this atom.
@@ -412,8 +457,8 @@ impl<T: Send + Sync + 'static> Atom<T> {
         loop {
             let current = self.root.load(Ordering::Acquire, &epoch);
             let node = current.as_raw();
-            // SAFETY: the atom always holds a live node.
-            let old_value: &T = Deref::deref(unsafe { &(*node).val });
+            // SAFETY: the atom always holds a live node with an initialized value.
+            let old_value: &T = unsafe { (*node).val.assume_init_ref() };
             let next_ptr = AtomNode::boxed(f(old_value), version, counters);
             // SAFETY: the node is a fresh allocation that is published below.
             let next = unsafe { Shared::from_raw(next_ptr) };
@@ -432,7 +477,7 @@ impl<T: Send + Sync + 'static> Atom<T> {
                 }
                 // The exchange failed, so the node was never published and goes back to the pool.
                 Err(_) => unsafe {
-                    ManuallyDrop::drop(&mut (*next_ptr).val);
+                    (*next_ptr).val.assume_init_drop();
                     give_pooled(next_ptr, counters);
                 },
             }
@@ -442,13 +487,23 @@ impl<T: Send + Sync + 'static> Atom<T> {
     /// Pins the epoch and returns the guard with the current value pointer.
     pub(crate) fn load_parts(&self) -> (Guard, *const T, u64) {
         let epoch = pin();
-        let node = self.root.load(Ordering::Acquire, &epoch);
-        let raw = node.as_raw();
-        // SAFETY: the atom always holds a published node.
-        let ptr = unsafe { AtomNode::val_ptr(raw) };
-        // SAFETY: the node stays alive under the pin.
-        let version = unsafe { (*raw).version };
+        let (ptr, version) = self.load_parts_under(&epoch);
         (epoch, ptr, version)
+    }
+
+    /// Loads the current value under an existing pin, without taking a new one.
+    ///
+    /// The caller's guard keeps the thread's epoch active, and the load keeps the returned node
+    /// alive, so a frame scope can re-read the published node while holding one pin. The version
+    /// and the value live in the same node allocation, so this is one dereference into one line.
+    pub(crate) fn load_parts_under(&self, guard: &Guard) -> (*const T, u64) {
+        let node = self.root.load(Ordering::Acquire, guard);
+        let raw = node.as_raw();
+        // SAFETY: the atom always holds a published node with an initialized value.
+        let ptr = unsafe { AtomNode::val_ptr(raw) };
+        // SAFETY: the node stays alive under the caller's pin.
+        let version = unsafe { (*raw).version };
+        (ptr, version)
     }
 
     /// Hands a replaced node to the reclaimer and records when that happened.
@@ -799,6 +854,17 @@ impl<T: Send + Sync + 'static, D: ?Sized + 'static> AtomCoerceHandle<T, D> {
         RcuGuardTyped::new(&self.shared)
     }
 
+    /// Reads the current value under a pin the caller already holds.
+    ///
+    /// Returns the value pointer and the version of the same node, so a frame scope reuses one pin
+    /// across a frame and reads the version with the value in one line.
+    pub(crate) fn load_typed_under(&self, guard: &Guard) -> (*const T, u64) {
+        let (value, version) = self.shared.atom.load_parts_under(guard);
+        // SAFETY: the pin keeps the node that holds the value alive.
+        let ptr = unsafe { std::ptr::addr_of!((*value).value) };
+        (ptr, version)
+    }
+
     /// Reclamation counters for this cell.
     pub fn reclaim_health(&self) -> &ReclaimHealth {
         self.shared.atom.reclaim_health()
@@ -929,5 +995,50 @@ mod tests {
 
         drop(handle);
         assert_eq!(AtomCoerce::strong_count(&cell), 1);
+    }
+
+    #[test]
+    fn version_and_value_share_one_cache_line() {
+        type Payload = (u64, u64);
+        let version = std::mem::offset_of!(AtomNode<Payload>, version);
+        let value = std::mem::offset_of!(AtomNode<Payload>, val);
+        assert_eq!(
+            value - version,
+            std::mem::size_of::<u64>(),
+            "the published version must sit immediately before the value"
+        );
+        assert_eq!(
+            version / 64,
+            value / 64,
+            "version at {version} and value at {value} must share a cache line"
+        );
+    }
+
+    #[test]
+    fn seeded_pool_feeds_publishes_and_retained_settles() {
+        let cell = AtomCoerce::<u64, dyn Any>::new(0u64);
+        for round in 1..=PREALLOCATED_NODES as u64 + 8 {
+            cell.store_versioned(round, round);
+        }
+        for _ in 0..2_000 {
+            flush_reclamation();
+            if cell.reclaim_health().retained() == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            cell.reclaim_health().retained(),
+            0,
+            "a publish burst must settle to zero retained generations"
+        );
+    }
+
+    #[test]
+    fn dropping_an_unused_cell_frees_the_seed() {
+        // The seed holds no value, so this also checks that the destructor never drops an
+        // uninitialized value.
+        let cell = AtomCoerce::<String, dyn Any>::new(String::from("seed"));
+        drop(cell);
     }
 }

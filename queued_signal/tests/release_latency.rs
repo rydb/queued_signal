@@ -73,7 +73,7 @@ fn run_second_thread_case(label: &str, reads: bool, flush_every: u32) {
                     black_box(guard.0);
                     drop(guard);
                     rounds += 1;
-                    if flush_every > 0 && rounds % flush_every == 0 {
+                    if flush_every > 0 && rounds.is_multiple_of(flush_every) {
                         flush_reclamation();
                     }
                 }

@@ -27,8 +27,11 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      # The workspace test run includes the benchmark harness smoke test, which runs every
+      # experiment once with smoke sampling. No measurement pass runs in CI.
       - run: nix develop -c cargo test --workspace
       - run: nix develop -c cargo clippy --workspace -- -D warnings
+      - run: nix develop -c cargo clippy -p queued_signal_benches --all-targets -- -D warnings
       - run: nix develop -c cargo fmt --check --all
 
   features:

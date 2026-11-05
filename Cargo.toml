@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["./crates/*", "examples", "queued_signal", "crates/queued_signal_tracing"]
+members = [
+    "./crates/*",
+    "benches",
+    "examples",
+    "queued_signal",
+    "crates/queued_signal_tracing",
+]
 
 
 [workspace.dependencies]
@@ -37,6 +43,9 @@ bevy_reflect = {version = "0.20"}
 bevy_ptr = {version = "0.20"}
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 allocation-counter = "0.8.1"
+libc = "0.2"
+serde_json = "1"
+charton = "0.9"
 glam = {version = "0.32"}
 trait-set = {version = "0.3"}
 bytemuck = {version = "1.25", features = ["derive"]}

@@ -5,11 +5,10 @@
 //! whatever the driver marked.
 
 use std::cell::{Cell, RefCell};
-use std::sync::Arc;
 use std::time::Duration;
 
 use dioxus::prelude::*;
-use queued_signal::state::{QueuedState, SetValueOp, WriterDriver};
+use queued_signal::state::{QueuedState, WriterDriver};
 
 thread_local! {
     static STATE: RefCell<Option<QueuedState<u32>>> = const { RefCell::new(None) };
@@ -55,10 +54,7 @@ fn set_show(value: bool) {
 }
 
 fn publish(driver: &mut WriterDriver<u32>, value: u32) {
-    driver
-        .set_value_tx
-        .send(SetValueOp(Arc::new(value)))
-        .unwrap();
+    driver.set_value(value);
     driver.tick(Duration::ZERO);
 }
 
@@ -125,4 +121,29 @@ fn readers_render_once_per_publish_and_prune_a_skipped_branch() {
     let _ = dom.render_immediate_to_vec();
     assert_eq!(renders(), 1);
     assert_eq!(last_value(), version + 1);
+}
+
+#[test]
+fn a_publish_renders_the_arrival_order_composition() {
+    let mut driver = WriterDriver::new(1u32);
+    let state = driver.queued_state.clone();
+    STATE.with(|slot| *slot.borrow_mut() = Some(state));
+    reset_renders();
+    LAST.with(|last| last.set(0));
+
+    let mut dom = VirtualDom::new(app);
+    dom.rebuild_in_place();
+
+    driver.set_value(10);
+    driver.mutate(|value: &mut u32| *value += 5);
+    driver.tick(Duration::ZERO);
+    reset_renders();
+    let _ = dom.render_immediate_to_vec();
+
+    assert_eq!(renders(), 1);
+    assert_eq!(
+        last_value(),
+        15,
+        "an add queued after a set composes onto that set"
+    );
 }

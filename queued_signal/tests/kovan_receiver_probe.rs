@@ -91,8 +91,8 @@ fn a_receiver_thread_frees_nodes_retired_under_a_held_guard() {
                 thread::sleep(PUBLISH_EVERY);
             }
             drop(held);
-            // The atom owns the last node; leaking it keeps the drop count exact.
-            std::mem::forget(atom);
+            // The atom owns the last node; leaking the box keeps the drop count exact.
+            let _ = Box::leak(Box::new(atom));
         })
     };
 

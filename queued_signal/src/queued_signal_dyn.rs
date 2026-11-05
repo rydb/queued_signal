@@ -10,7 +10,7 @@ use tokio::sync::watch;
 
 use crate::atom_coerce_dyn::{AtomCoerceDyn, EraseMut};
 use crate::state::{
-    HealthStatus, MutationOp, QueuedSignal, QueuedStateDyn, ReadAtomics, TrackedReadGuardDyn,
+    HealthStatus, MutationOp, Op, QueuedSignal, QueuedStateDyn, ReadAtomics, TrackedReadGuardDyn,
 };
 use crate::subscriber_slots::{PassEpoch, SubscriberSlots};
 
@@ -34,8 +34,7 @@ pub struct ErasedQueuedWrite<D: ?Sized + 'static> {
 
 /// Typed sender context used when routing into a typed signal.
 struct TypedWrite<T: Clone + Send + Sync + 'static, D: ?Sized + 'static> {
-    add_tx: Sender<MutationOp<T, D>>,
-    set_tx: Sender<MutationOp<T, D>>,
+    op_tx: Sender<Op<T, D>>,
     marker: PhantomData<fn() -> D>,
 }
 
@@ -62,8 +61,7 @@ impl<D: ?Sized + 'static> ErasedQueuedWrite<D> {
         T: Clone + Send + Sync + 'static + EraseMut<D>,
     {
         let context: Arc<dyn Any + Send + Sync> = Arc::new(TypedWrite {
-            add_tx: signal.add_tx(),
-            set_tx: signal.set_tx(),
+            op_tx: signal.op_tx(),
             marker: PhantomData,
         });
         ErasedQueuedWrite {
@@ -90,7 +88,7 @@ where
         .context()
         .downcast_ref::<TypedWrite<T, D>>()
         .expect("typed write context mismatch");
-    let _ = ctx.add_tx.send(MutationOp::Untyped(f));
+    let _ = ctx.op_tx.send(Op::Add(MutationOp::Untyped(f)));
 }
 
 unsafe fn mutate_set_typed<T, D>(write: &ErasedQueuedWrite<D>, f: Arc<dyn Fn(&mut D) + Send + Sync>)
@@ -102,7 +100,7 @@ where
         .context()
         .downcast_ref::<TypedWrite<T, D>>()
         .expect("typed write context mismatch");
-    let _ = ctx.set_tx.send(MutationOp::Untyped(f));
+    let _ = ctx.op_tx.send(Op::SetInPlace(MutationOp::Untyped(f)));
 }
 
 unsafe fn set_value_unsupported<D: ?Sized + 'static>(
@@ -147,6 +145,8 @@ impl<D: ?Sized + 'static> QueuedSignalDyn<D> {
         T: Clone + Send + Sync + 'static + EraseMut<D>,
     {
         let holder = AtomCoerceDyn::bound(signal.state.cell_dyn());
+        // This view holds its own receiver, which never waits, so it counts as an owned one.
+        signal.state.atomics.own_receiver();
         let state = QueuedStateDyn {
             view: holder.handle_dyn(),
             notify_rx: signal.state.notify_rx(),

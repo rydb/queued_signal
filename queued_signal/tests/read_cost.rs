@@ -11,6 +11,8 @@ use queued_signal::state::WriterDriver;
 use std::fs;
 use std::hint::black_box;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Number of batch samples per benchmark.
@@ -65,6 +67,21 @@ fn stats_batched(batch: usize, f: &mut impl FnMut()) -> Stats {
     finish(samples)
 }
 
+/// Times one read after a frame gap, so the published node is no longer in this core's cache.
+fn cold_stats(f: &mut impl FnMut()) -> Stats {
+    for _ in 0..32 {
+        f();
+    }
+    let mut samples = Vec::with_capacity(SAMPLES);
+    for _ in 0..SAMPLES {
+        std::thread::sleep(Duration::from_millis(1));
+        let start = Instant::now();
+        f();
+        samples.push(start.elapsed().as_nanos() as f64);
+    }
+    finish(samples)
+}
+
 /// Chooses one unit for a row from its median value.
 fn unit_for(ns: f64) -> (f64, &'static str) {
     if ns >= 1_000_000.0 {
@@ -105,9 +122,12 @@ fn write_report(rows: &[(&'static str, String, Stats)]) -> std::io::Result<PathB
         }
     ));
     out.push_str(&format!(
-        "- Samples: {SAMPLES} batch averages of {BATCH} operations\n"
+        "- Hot rows: {SAMPLES} batch averages of {BATCH} operations\n"
     ));
-    out.push_str("- Threads: 1, uncontended\n");
+    out.push_str(&format!(
+        "- Frame rows: {SAMPLES} single reads after a 1 ms frame gap, with a publisher thread\n"
+    ));
+    out.push_str("- Threads: 1 reader, plus one publisher for the frame rows\n");
     out.push_str("- Units: ns is nanoseconds, us is microseconds, ms is milliseconds\n");
 
     let mut current = "";
@@ -153,6 +173,16 @@ fn write_report(rows: &[(&'static str, String, Stats)]) -> std::io::Result<PathB
     out.push_str(&format!(
         "- The typed store costs {store:.2} ns, the watch notification {publish:.2} ns, and store plus notification {publish_value:.2} ns.\n"
     ));
+    let frame_cold = find(rows, "frame read, cold").p50;
+    let pin_cold = find(rows, "pin and load, cold").p50;
+    let peek_cold = find(rows, "peek version, cold").p50;
+    let multi = find(rows, "frame read, 10 per frame").p50;
+    out.push_str(&format!(
+        "- A cold frame read costs {frame_cold:.2} ns, a cold pin and load {pin_cold:.2} ns, and a cold version peek {peek_cold:.2} ns.\n"
+    ));
+    out.push_str(&format!(
+        "- Ten reads of one signal in a frame cost {multi:.2} ns each with one pin.\n"
+    ));
 
     fs::write(&path, out)?;
     Ok(path)
@@ -165,6 +195,12 @@ struct Counter(u32);
 #[cfg_attr(miri, ignore = "measures wall clock time")]
 #[test]
 fn baseline_read_write_costs() {
+    // A debug build reports numbers that do not belong in the committed report, so only a
+    // release run writes it.
+    if cfg!(debug_assertions) {
+        // read cost report is written by a release run only
+        return;
+    }
     let mut rows: Vec<(&'static str, String, Stats)> = Vec::new();
 
     let mut driver = WriterDriver::<Counter>::new(Counter(0));
@@ -306,6 +342,75 @@ fn baseline_read_write_costs() {
             "typed rcu".to_owned(),
             stats(|| atom.rcu(|counter| Counter(counter.0.wrapping_add(1)))),
         ));
+    }
+
+    // Frame cadence: a reader that sleeps a frame, then reads the signal the writer just published.
+    // The publisher keeps the node fresh, so each timed read sees a changed version.
+    {
+        let mut driver = WriterDriver::<Counter>::new(Counter(0));
+        let state = driver.queued_state.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let publisher = std::thread::spawn(move || {
+            let mut value = 1u32;
+            while !worker_stop.load(Ordering::Acquire) {
+                driver.publish_value(Counter(value));
+                value = value.wrapping_add(1);
+                std::thread::sleep(Duration::from_micros(500));
+            }
+        });
+
+        let mut scope = state.frame_read();
+        rows.push((
+            "Frame cadence",
+            "frame read, cold".to_owned(),
+            cold_stats(&mut || {
+                black_box(scope.read());
+            }),
+        ));
+        rows.push((
+            "Frame cadence",
+            "peek version, cold".to_owned(),
+            cold_stats(&mut || {
+                black_box(state.peek_version());
+            }),
+        ));
+        rows.push((
+            "Frame cadence",
+            "pin and load, cold".to_owned(),
+            cold_stats(&mut || {
+                let guard = state.cell.read_typed();
+                black_box(&*guard);
+            }),
+        ));
+        rows.push((
+            "Frame cadence",
+            "tracked read, cold".to_owned(),
+            cold_stats(&mut || {
+                let guard = state.read();
+                black_box(&*guard);
+            }),
+        ));
+
+        // Ten reads of one signal inside one frame, served from the scope's single pin.
+        let mut multi = state.frame_read();
+        let mut multi_samples = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
+            std::thread::sleep(Duration::from_millis(1));
+            let start = Instant::now();
+            for _ in 0..10 {
+                black_box(multi.read());
+            }
+            multi_samples.push(start.elapsed().as_nanos() as f64 / 10.0);
+        }
+        rows.push((
+            "Frame cadence",
+            "frame read, 10 per frame".to_owned(),
+            finish(multi_samples),
+        ));
+
+        stop.store(true, Ordering::Release);
+        publisher.join().expect("publisher thread");
     }
 
     let path = write_report(&rows).expect("write baseline report");

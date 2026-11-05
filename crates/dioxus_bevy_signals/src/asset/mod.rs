@@ -372,9 +372,7 @@ impl<A: DioxusAssetSync> Command for RequestBevyAssetMirror<A> {
             None => {
                 let asset_state_driver = WriterDriver::new(Err(AssetNoneState::Fetching));
 
-                let set_value_tx = asset_state_driver.set_value_tx.clone();
-                let set_tx = asset_state_driver.set_tx.clone();
-                let add_tx = asset_state_driver.add_tx.clone();
+                let op_tx = asset_state_driver.op_tx.clone();
                 let queued_state = asset_state_driver.queued_state.clone();
 
                 let asset_state_driver_arc = Arc::new(Mutex::new(asset_state_driver));
@@ -382,9 +380,7 @@ impl<A: DioxusAssetSync> Command for RequestBevyAssetMirror<A> {
                 let asset_state = QueuedSignal::from_parts(
                     queued_state,
                     Some(asset_state_driver_arc.clone()),
-                    add_tx,
-                    set_tx,
-                    set_value_tx,
+                    op_tx,
                 );
 
                 let extra_info_driver = WriterDriver::new(AssetUpdateExtraInfo {
@@ -392,9 +388,7 @@ impl<A: DioxusAssetSync> Command for RequestBevyAssetMirror<A> {
                     asset_id: self.asset_id,
                 });
 
-                let set_value_tx = extra_info_driver.set_value_tx.clone();
-                let set_tx = extra_info_driver.set_tx.clone();
-                let add_tx = extra_info_driver.add_tx.clone();
+                let op_tx = extra_info_driver.op_tx.clone();
                 let queued_state = extra_info_driver.queued_state.clone();
 
                 let extra_info_driver_arc = Arc::new(Mutex::new(extra_info_driver));
@@ -402,9 +396,7 @@ impl<A: DioxusAssetSync> Command for RequestBevyAssetMirror<A> {
                 let extra_info = QueuedSignal::from_parts(
                     queued_state,
                     Some(extra_info_driver_arc.clone()),
-                    add_tx,
-                    set_tx,
-                    set_value_tx,
+                    op_tx,
                 );
                 let mirror = AssetMaybeMirror {
                     state: asset_state.clone(),

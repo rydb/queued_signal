@@ -31,3 +31,6 @@ target
 /.direnv
 
 /plans
+
+# Raw benchmark runs are reproducible from the harness.
+/results

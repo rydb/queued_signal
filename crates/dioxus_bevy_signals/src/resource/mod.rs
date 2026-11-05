@@ -11,7 +11,7 @@ use dioxus_core::{IntoAttributeValue, IntoDynNode};
 use dioxus_hooks::{use_context, use_future, use_memo, use_signal};
 use dioxus_signals::{Memo, ReadableExt, Signal, WritableExt};
 use parking_lot::Mutex;
-use queued_signal::state::{HealthStatus, QueuedSignal, TrackedReadGuard, WriterDriver};
+use queued_signal::state::{HealthStatus, Op, QueuedSignal, TrackedReadGuard, WriterDriver};
 use std::any::TypeId;
 use std::collections::HashSet;
 use std::fmt::Display;
@@ -85,20 +85,13 @@ impl<T: ResourceDioxusSync> Command for RequestBevyResource<T> {
                 };
 
                 let driver = WriterDriver::new(resource.clone());
-                let set_value_tx = driver.set_value_tx.clone();
-                let set_tx = driver.set_tx.clone();
-                let add_tx = driver.add_tx.clone();
+                let op_tx = driver.op_tx.clone();
                 let queued_state = driver.queued_state.clone();
 
                 let driver_arc = Arc::new(Mutex::new(driver));
 
-                let signal = QueuedSignal::from_parts(
-                    queued_state,
-                    Some(driver_arc.clone()),
-                    add_tx,
-                    set_tx,
-                    set_value_tx,
-                );
+                let signal =
+                    QueuedSignal::from_parts(queued_state, Some(driver_arc.clone()), op_tx);
                 world.insert_resource(ResourceWriteDriver(driver_arc));
 
                 add_systems_through_world(world, DioxusSyncPostUpdate, sync_resource::<T>);
@@ -124,8 +117,8 @@ fn sync_resource<T: ResourceDioxusSync>(
 ) {
     let bevy_changed = resource.is_changed();
     let mut guard = driver.0.lock();
-    let (mut set_values, mut sets, adds) = guard.drain_ops();
-    let has_dioxus_ops = !set_values.is_empty() || !sets.is_empty() || !adds.is_empty();
+    let ops = guard.drain_ops();
+    let has_dioxus_ops = !ops.is_empty();
 
     if !bevy_changed && !has_dioxus_ops {
         guard.update_health();
@@ -138,23 +131,20 @@ fn sync_resource<T: ResourceDioxusSync>(
 
     if bevy_changed {
         // Bevy wins authoritative ops; only relative adds compose.
-        set_values.clear();
-        sets.clear();
-        for op in adds {
-            op.apply(&mut *resource);
+        for op in ops {
+            if let Op::Add(op) = op {
+                op.apply(&mut *resource);
+            }
         }
         // Publish bevy's value to the cell.
         guard.publish_value(resource.clone());
     } else {
-        // Apply the oplog to the bevy resource, the write buffer.
-        for op in &set_values {
-            *resource = (*op.0).clone();
-        }
-        for op in &sets {
-            op.apply(&mut *resource);
-        }
-        for op in &adds {
-            op.apply(&mut *resource);
+        // Apply the oplog to the bevy resource in arrival order.
+        for op in ops {
+            match op {
+                Op::Set(value) | Op::Absolute(value) => *resource = value.value().clone(),
+                Op::SetInPlace(op) | Op::Add(op) => op.apply(&mut *resource),
+            }
         }
 
         // Publish the bevy resource as the new snapshot.
