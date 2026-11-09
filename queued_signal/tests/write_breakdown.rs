@@ -1,8 +1,7 @@
 //! Isolates the parts of the write path so the store's median can be attributed.
 //!
-//! Each measurement runs the same loop so the numbers are comparable. The reclaimer thread starts
-//! on the first retired node and stays for the rest of the test, so the later rows include its
-//! interference the same way a running signal does.
+//! Each measurement runs the same loop so the numbers are comparable. Reclamation runs on the
+//! calling thread, so the later rows include its interference the same way a running signal does.
 
 use std::hint::black_box;
 use std::sync::atomic::Ordering;

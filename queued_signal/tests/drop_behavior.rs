@@ -1,9 +1,9 @@
-//! Deferred destruction and reclamation counters.
+//! Drop behaviour and reclamation counters.
 //!
-//! The drainer queue is process wide, so this file keeps every check in one
-//! test function and never runs two drains in parallel.
+//! A replaced generation is dropped on the thread that reclaims it, so every check settles with a
+//! bounded wait rather than draining a queue.
 
-use queued_signal::atom_coerce::{AtomCoerce, drain_deferred_frees, flush_reclamation};
+use queued_signal::atom_coerce::{AtomCoerce, flush_reclamation};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -17,9 +17,9 @@ impl Drop for DropCounter {
 }
 
 #[test]
-fn deferred_drop_suite() {
+fn drop_suite() {
     held_guard_keeps_the_replaced_value_alive();
-    drain_runs_the_destructor_once();
+    reclamation_runs_the_destructor_once();
     reclaim_health_tracks_retained_generations();
 }
 
@@ -55,16 +55,15 @@ fn held_guard_keeps_the_replaced_value_alive() {
     assert_eq!(drops.load(Ordering::SeqCst), 1, "release drops it once");
 }
 
-/// The drainer runs each queued destructor exactly once.
-fn drain_runs_the_destructor_once() {
+/// Reclamation runs each destructor exactly once.
+fn reclamation_runs_the_destructor_once() {
     let drops = Arc::new(AtomicUsize::new(0));
     let cell = AtomCoerce::<DropCounter>::new(DropCounter(drops.clone()));
     cell.store(DropCounter(drops.clone()));
 
-    // Reclamation runs on the receiver thread, so yield while it catches up.
+    // Reclamation runs on the flushing thread, so settle with a bounded wait.
     for _ in 0..10_000 {
         flush_reclamation();
-        drain_deferred_frees();
         if drops.load(Ordering::SeqCst) == 1 {
             break;
         }
@@ -72,7 +71,7 @@ fn drain_runs_the_destructor_once() {
     }
     assert_eq!(drops.load(Ordering::SeqCst), 1);
 
-    drain_deferred_frees();
+    flush_reclamation();
     assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
 
@@ -84,10 +83,9 @@ fn reclaim_health_tracks_retained_generations() {
     cell.store(2);
     assert_eq!(cell.reclaim_health().retained(), 1);
 
-    // Reclamation runs on the receiver thread, so settle with a bounded wait under test load.
+    // Reclamation runs on the flushing thread, so settle with a bounded wait under test load.
     for _ in 0..10_000 {
         flush_reclamation();
-        drain_deferred_frees();
         if cell.reclaim_health().retained() == 0 {
             break;
         }

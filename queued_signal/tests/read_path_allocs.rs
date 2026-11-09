@@ -26,7 +26,6 @@ fn read_path_does_not_allocate() {
         driver.publish_value(1);
     }
     flush_reclamation();
-    queued_signal::atom_coerce::drain_deferred_frees();
 
     let tracked = measure(|| {
         for _ in 0..256 {
@@ -65,8 +64,8 @@ fn read_path_does_not_allocate() {
 fn first_publishes_take_seeded_nodes() {
     let mut driver = WriterDriver::new(0u32);
     let state = driver.queued_state.clone();
-    // Warm the thread local pin state, the watch send, and the reclaimer thread, and spend one of
-    // the eight seeded nodes.
+    // Warm the thread local pin state, the watch send, and reclamation, and spend one of the eight
+    // seeded nodes.
     drop(state.read());
     driver.publish_value(0);
 
@@ -87,7 +86,7 @@ fn first_publishes_take_seeded_nodes() {
 fn publish_reuses_seeded_generations() {
     let mut driver = WriterDriver::new(0u32);
 
-    // Warm the seed, the reclaimer, and the watch channel.
+    // Warm the seed, reclamation, and the watch channel.
     for value in 0..64u32 {
         driver.publish_value(value);
         driver.submit_pending();

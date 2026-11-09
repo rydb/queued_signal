@@ -36,7 +36,6 @@ fn retained_generations_stay_bounded() {
     frequent_health_updates();
     writer_pinned_across_many_publishes();
     render_loop_projects_without_holding_a_guard();
-    publishes_await_a_submit();
 }
 
 /// A render loop that projects and drops the guard on every frame.
@@ -238,35 +237,3 @@ fn frequent_health_updates() {
     assert_eq!(driver.queued_state.health(), HealthStatus::Healthy);
 }
 
-/// Publishes that are never submitted are counted as retained until the next submit.
-///
-/// The resource mirror publishes from its sync system, so without a submit the retires sit in
-/// kovan's accumulating batch and the health count reports them as a backlog of their own.
-fn publishes_await_a_submit() {
-    let mut driver = WriterDriver::new(0u32);
-    for value in 1..=12u32 {
-        driver.publish_value(value);
-    }
-    driver.update_health();
-    assert!(
-        retained(&driver) >= 10,
-        "unsubmitted retires must count as retained, got {}",
-        retained(&driver)
-    );
-
-    driver.submit_pending();
-    let mut released = false;
-    for _ in 0..2000 {
-        driver.update_health();
-        if retained(&driver) == 0 {
-            released = true;
-            break;
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
-    assert!(
-        released,
-        "a submit must release the retires counted above, got {}",
-        retained(&driver)
-    );
-}

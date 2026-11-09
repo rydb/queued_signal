@@ -16,6 +16,7 @@ use parking_lot::Mutex;
 use queued_signal::state::{FrameRead, QueuedSignal, WriterDriver};
 
 use super::{Candidate, Clock, DriveReport, FrameReader, Sample, Submitter};
+use crate::publish::{NO_PUBLISH, PublishProbe, PublishSamples, WriterProbe};
 
 /// How often the runner drains and publishes, matching the hub's frame cadence.
 const TICK: Duration = Duration::from_millis(16);
@@ -52,6 +53,7 @@ impl Observed {
 pub struct QueuedCandidate {
     signal: QueuedSignal<Sample>,
     observed: Arc<Observed>,
+    probe: Option<Arc<PublishProbe>>,
 }
 
 /// Builds the real signal and starts its runner at the frame cadence.
@@ -64,6 +66,21 @@ pub fn new_signal() -> QueuedCandidate {
 /// A zero cadence ticks as fast as the runner allows, so a write is published on the runner's next
 /// loop instead of at the next frame.
 pub fn new_signal_with_tick(tick: Duration) -> QueuedCandidate {
+    build(tick, None)
+}
+
+/// Builds the real signal at the frame cadence with publish latency records enabled.
+pub fn new_signal_probed() -> QueuedCandidate {
+    build(TICK, Some(PublishProbe::new()))
+}
+
+/// Builds the real signal at a zero cadence with publish latency records enabled.
+pub fn new_zero_tick_signal_probed() -> QueuedCandidate {
+    build(Duration::ZERO, Some(PublishProbe::new()))
+}
+
+/// Builds the signal, its runner, and an optional publish probe.
+fn build(tick: Duration, probe: Option<Arc<PublishProbe>>) -> QueuedCandidate {
     let driver = WriterDriver::<Sample>::new(Sample {
         seq: 0,
         submitted_ns: 0,
@@ -75,6 +92,7 @@ pub fn new_signal_with_tick(tick: Duration) -> QueuedCandidate {
     let signal = QueuedSignal::from_parts(state, Some(driver.clone()), op_tx);
 
     let runner_observed = observed.clone();
+    let runner_probe = probe.clone();
     std::thread::spawn(move || {
         let mut last = Instant::now();
         loop {
@@ -84,18 +102,32 @@ pub fn new_signal_with_tick(tick: Duration) -> QueuedCandidate {
             }
             if tick.is_zero() || last.elapsed() >= tick {
                 let begin = Instant::now();
+                let work_begin = runner_probe.as_ref().map(|probe| probe.now_ns());
                 let mut held = driver.lock();
                 let before = held.queued_state.peek_version();
                 held.tick(Duration::ZERO);
                 let published = held.queued_state.peek_version() != before;
+                let pass_ns = begin.elapsed().as_nanos() as u64;
+                // A row without a probe keeps the original publish path, so its read side is
+                // untouched by the trace.
+                let newest_seq = if published && runner_probe.is_some() {
+                    held.queued_state.read().seq
+                } else {
+                    0
+                };
                 drop(held);
                 if published {
-                    let pass_ns = begin.elapsed().as_nanos() as u64;
                     let mut passes = runner_observed.passes.lock();
                     if passes.len() < PASS_CAP {
                         passes.push(pass_ns);
                     }
                     drop(passes);
+                    if let Some(probe) = runner_probe.as_ref() {
+                        let work_ns = work_begin
+                            .map(|begin| probe.now_ns().saturating_sub(begin))
+                            .unwrap_or(0);
+                        probe.record_generation(newest_seq, work_ns);
+                    }
                     let oldest = runner_observed.oldest.swap(NO_ENQUEUE, Ordering::AcqRel);
                     if oldest != NO_ENQUEUE {
                         runner_observed.published.lock().push(oldest);
@@ -109,30 +141,43 @@ pub fn new_signal_with_tick(tick: Duration) -> QueuedCandidate {
         }
     });
 
-    QueuedCandidate { signal, observed }
+    QueuedCandidate {
+        signal,
+        observed,
+        probe,
+    }
 }
 
 /// Writer handle that writes through the signal.
 struct QueuedWriter {
     signal: QueuedSignal<Sample>,
     observed: Arc<Observed>,
+    probe: Option<WriterProbe>,
 }
 
 impl Submitter for QueuedWriter {
     fn submit(&mut self, sample: Sample) {
+        let start_ns = self.probe.as_ref().map(WriterProbe::start_now);
         // The runner publishes a generation per tick and reports the oldest enqueue it covered.
         self.observed
             .oldest
             .fetch_min(sample.submitted_ns, Ordering::AcqRel);
         self.signal.set_value(sample);
+        if let (Some(probe), Some(start_ns)) = (self.probe.as_mut(), start_ns) {
+            probe.record(sample.seq, start_ns, NO_PUBLISH);
+        }
     }
 
     fn submit_mutation(&mut self, sample: Sample) {
+        let start_ns = self.probe.as_ref().map(WriterProbe::start_now);
         self.observed
             .oldest
             .fetch_min(sample.submitted_ns, Ordering::AcqRel);
         self.signal
             .mutate_set(move |value: &mut Sample| *value = sample);
+        if let (Some(probe), Some(start_ns)) = (self.probe.as_mut(), start_ns) {
+            probe.record(sample.seq, start_ns, NO_PUBLISH);
+        }
     }
 }
 
@@ -160,6 +205,7 @@ impl Candidate for QueuedCandidate {
         Some(Box::new(QueuedWriter {
             signal: self.signal.clone(),
             observed: self.observed.clone(),
+            probe: self.probe.as_ref().map(|probe| probe.writer()),
         }))
     }
 
@@ -191,5 +237,9 @@ impl Candidate for QueuedCandidate {
 
     fn retained(&self) -> u64 {
         self.signal.state.cell.reclaim_health().retained()
+    }
+
+    fn publish_samples(&self) -> Option<PublishSamples> {
+        self.probe.as_ref().map(|probe| probe.samples())
     }
 }

@@ -18,6 +18,7 @@ pub use direct::Direct;
 pub use locks::{MutexCell, RwLockCell};
 pub use triple::{AtomicSnapshot, RotatingSnapshot};
 
+use crate::publish::PublishSamples;
 use crate::stats::Stats;
 
 /// One mutation submitted to a candidate.
@@ -156,6 +157,13 @@ pub trait Candidate: Send + Sync {
     fn retained(&self) -> u64 {
         0
     }
+
+    /// Publish latency samples, when the candidate records them.
+    ///
+    /// A design built without a probe returns nothing, so a fixed burst row keeps its submit path.
+    fn publish_samples(&self) -> Option<PublishSamples> {
+        None
+    }
 }
 
 /// Candidate identifiers in ladder order, limited to the designs implemented so far.
@@ -205,5 +213,31 @@ pub fn build_for_writers(id: &str, _writers: usize) -> Option<Box<dyn Candidate>
         "b6" => Some(Box::new(AtomicSnapshot::multi_writer())),
         "b6r" => Some(Box::new(RotatingSnapshot::multi_writer())),
         _ => build_with_subscribers(id, 1),
+    }
+}
+
+/// Builds one candidate with publish latency records enabled.
+///
+/// Only the duration row uses this, so a fixed burst row keeps its original submit path. Every
+/// design records through the same helper, so the comparison is structurally identical.
+pub fn build_probed(id: &str, writers: usize) -> Option<Box<dyn Candidate>> {
+    match id {
+        "b3" => Some(Box::new(RwLockCell::with_probe())),
+        "b4" => Some(Box::new(MutexCell::with_probe())),
+        "b5" => Some(Box::new(ChannelPerSubscriber::with_probe(1))),
+        "b6" => Some(Box::new(if writers > 1 {
+            AtomicSnapshot::multi_writer_with_probe()
+        } else {
+            AtomicSnapshot::single_writer_with_probe()
+        })),
+        "b6r" => Some(Box::new(if writers > 1 {
+            RotatingSnapshot::multi_writer_with_probe()
+        } else {
+            RotatingSnapshot::single_writer_with_probe()
+        })),
+        "b7" => Some(Box::new(queued::new_signal_probed())),
+        "b7z" => Some(Box::new(queued::new_zero_tick_signal_probed())),
+        "b8" => Some(Box::new(rings::new_rings_probed())),
+        _ => None,
     }
 }

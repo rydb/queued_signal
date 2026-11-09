@@ -2,7 +2,7 @@
 //!
 //! A guard keeps the generation it read alive. Health reports the retained count while publishes
 //! keep releasing older generations, and reports a stall once a whole window of publishes released
-//! nothing. Reclamation runs on the receiver thread, so every check settles first.
+//! nothing. Reclamation runs on the calling thread, so every check settles first.
 
 use std::time::Duration;
 

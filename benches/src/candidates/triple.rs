@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::{Candidate, Clock, DriveReport, Sample, Submitter};
+use crate::publish::{PublishProbe, PublishSamples, WriterProbe};
 
 /// Preallocated snapshot with a version counter.
 pub struct Snapshot {
@@ -80,20 +81,35 @@ impl Snapshot {
 /// B6 with one writer.
 pub struct AtomicSnapshot {
     snapshot: Arc<Snapshot>,
+    probe: Option<Arc<PublishProbe>>,
 }
 
 impl AtomicSnapshot {
     /// Creates the single writer snapshot.
     pub fn single_writer() -> Self {
-        Self {
-            snapshot: Arc::new(Snapshot::single_writer()),
-        }
+        Self::build(Snapshot::single_writer(), None)
     }
 
     /// Creates the multi writer snapshot.
     pub fn multi_writer() -> Self {
+        Self::build(Snapshot::multi_writer(), None)
+    }
+
+    /// Creates the single writer snapshot with publish latency records enabled.
+    pub fn single_writer_with_probe() -> Self {
+        Self::build(Snapshot::single_writer(), Some(PublishProbe::new()))
+    }
+
+    /// Creates the multi writer snapshot with publish latency records enabled.
+    pub fn multi_writer_with_probe() -> Self {
+        Self::build(Snapshot::multi_writer(), Some(PublishProbe::new()))
+    }
+
+    /// Wraps one snapshot and an optional publish probe.
+    fn build(snapshot: Snapshot, probe: Option<Arc<PublishProbe>>) -> Self {
         Self {
-            snapshot: Arc::new(Snapshot::multi_writer()),
+            snapshot: Arc::new(snapshot),
+            probe,
         }
     }
 
@@ -111,11 +127,17 @@ impl AtomicSnapshot {
 /// Writer handle for B6.
 struct SnapshotWriter {
     snapshot: Arc<Snapshot>,
+    probe: Option<WriterProbe>,
 }
 
 impl Submitter for SnapshotWriter {
     fn submit(&mut self, sample: Sample) {
+        let start_ns = self.probe.as_ref().map(WriterProbe::start_now);
         self.snapshot.publish_value(sample.seq);
+        if let (Some(probe), Some(start_ns)) = (self.probe.as_mut(), start_ns) {
+            let published_ns = probe.publish_now();
+            probe.record(sample.seq, start_ns, published_ns);
+        }
     }
 }
 
@@ -187,20 +209,35 @@ impl Rotation {
 /// the other side is done with. The consumer never spins.
 pub struct RotatingSnapshot {
     rotation: Arc<Rotation>,
+    probe: Option<Arc<PublishProbe>>,
 }
 
 impl RotatingSnapshot {
     /// Rotation for one writer.
     pub fn single_writer() -> Self {
-        Self {
-            rotation: Arc::new(Rotation::new(false)),
-        }
+        Self::build(false, None)
     }
 
     /// Rotation for several writers, which serialise on one compare and exchange.
     pub fn multi_writer() -> Self {
+        Self::build(true, None)
+    }
+
+    /// Rotation for one writer with publish latency records enabled.
+    pub fn single_writer_with_probe() -> Self {
+        Self::build(false, Some(PublishProbe::new()))
+    }
+
+    /// Rotation for several writers with publish latency records enabled.
+    pub fn multi_writer_with_probe() -> Self {
+        Self::build(true, Some(PublishProbe::new()))
+    }
+
+    /// Wraps one rotation and an optional publish probe.
+    fn build(serialised: bool, probe: Option<Arc<PublishProbe>>) -> Self {
         Self {
-            rotation: Arc::new(Rotation::new(true)),
+            rotation: Arc::new(Rotation::new(serialised)),
+            probe,
         }
     }
 
@@ -227,6 +264,7 @@ impl Candidate for RotatingSnapshot {
     fn submitter(&self) -> Option<Box<dyn Submitter>> {
         Some(Box::new(RotatingWriter {
             rotation: self.rotation.clone(),
+            probe: self.probe.as_ref().map(|probe| probe.writer()),
         }))
     }
 
@@ -235,16 +273,26 @@ impl Candidate for RotatingSnapshot {
     fn read(&self) -> u64 {
         self.snapshot()
     }
+
+    fn publish_samples(&self) -> Option<PublishSamples> {
+        self.probe.as_ref().map(|probe| probe.samples())
+    }
 }
 
 /// Writer handle for the rotating variant.
 struct RotatingWriter {
     rotation: Arc<Rotation>,
+    probe: Option<WriterProbe>,
 }
 
 impl Submitter for RotatingWriter {
     fn submit(&mut self, sample: Sample) {
+        let start_ns = self.probe.as_ref().map(WriterProbe::start_now);
         self.rotation.publish(sample.seq);
+        if let (Some(probe), Some(start_ns)) = (self.probe.as_mut(), start_ns) {
+            let published_ns = probe.publish_now();
+            probe.record(sample.seq, start_ns, published_ns);
+        }
     }
 }
 
@@ -260,6 +308,7 @@ impl Candidate for AtomicSnapshot {
     fn submitter(&self) -> Option<Box<dyn Submitter>> {
         Some(Box::new(SnapshotWriter {
             snapshot: self.snapshot.clone(),
+            probe: self.probe.as_ref().map(|probe| probe.writer()),
         }))
     }
 
@@ -267,5 +316,9 @@ impl Candidate for AtomicSnapshot {
 
     fn read(&self) -> u64 {
         self.read_value()
+    }
+
+    fn publish_samples(&self) -> Option<PublishSamples> {
+        self.probe.as_ref().map(|probe| probe.samples())
     }
 }

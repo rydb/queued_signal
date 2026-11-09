@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use dioxus::prelude::*;
 use dioxus_core::{VNode, VirtualDom};
-use queued_signal::atom_coerce::{drain_deferred_frees, flush_reclamation};
+use queued_signal::atom_coerce::flush_reclamation;
 use queued_signal::state::{QueuedState, WriterDriver};
 
 use queued_signal_benches::candidates::Sample;
@@ -196,7 +196,6 @@ fn run_rep(row: &Row) -> RepOut {
     STATES.with(|slot| *slot.borrow_mut() = None);
     std::thread::sleep(SETTLE);
     flush_reclamation();
-    drain_deferred_frees();
     let rss = rss_bytes();
 
     // The states live as long as their drivers, so the row keeps the drivers alive until the

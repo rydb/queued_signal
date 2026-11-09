@@ -174,11 +174,14 @@ impl Default for ReclaimHealth {
 /// retired through the epoch scheme.
 ///
 /// The counters are reached through a plain pointer rather than a shared count, so publishing a node
-/// does not touch an atomic the drainer also touches on every free.
+/// does not touch an atomic the reclaiming thread also touches on every free.
 #[repr(C)]
 struct AtomNode<T> {
     header: RetiredNode,
-    deferred: crate::deferred::DeferredHeader,
+    /// Link while the node sits in a per atom pool.
+    next: *mut (),
+    /// Reserved space that keeps the version and value in one cache line.
+    _reserved: [usize; 2],
     health: *const ReclaimHealth,
     version: u64,
     val: MaybeUninit<T>,
@@ -191,13 +194,24 @@ struct AtomNode<T> {
 const PREALLOCATED_NODES: usize = 8;
 
 impl<T: Send + Sync + 'static> AtomNode<T> {
+    /// Link while the node sits in a per atom pool.
+    fn link(&self) -> *mut () {
+        self.next
+    }
+
+    /// Sets the pool link.
+    fn set_link(&mut self, next: *mut ()) {
+        self.next = next;
+    }
+
     /// Takes a node for `val` at the given publication version, reusing a pooled one when there is.
     fn boxed(val: T, version: u64, counters: &ReclaimHealth) -> *mut Self {
         let pooled = take_pooled(counters);
         if pooled.is_null() {
             return Box::into_raw(Box::new(Self {
                 header: RetiredNode::new(),
-                deferred: crate::deferred::DeferredHeader::new(),
+                next: ptr::null_mut(),
+                _reserved: [0; 2],
                 health: counters as *const ReclaimHealth,
                 version,
                 val: MaybeUninit::new(val),
@@ -208,7 +222,7 @@ impl<T: Send + Sync + 'static> AtomNode<T> {
         // dropped before it was pooled.
         unsafe {
             (*node).header = RetiredNode::new();
-            (*node).deferred = crate::deferred::DeferredHeader::new();
+            (*node).next = ptr::null_mut();
             (*node).health = counters;
             (*node).version = version;
             (*node).val = MaybeUninit::new(val);
@@ -220,7 +234,8 @@ impl<T: Send + Sync + 'static> AtomNode<T> {
     fn uninit(counters: &ReclaimHealth) -> *mut Self {
         Box::into_raw(Box::new(Self {
             header: RetiredNode::new(),
-            deferred: crate::deferred::DeferredHeader::new(),
+            next: ptr::null_mut(),
+            _reserved: [0; 2],
             health: counters as *const ReclaimHealth,
             version: 0,
             val: MaybeUninit::uninit(),
@@ -241,7 +256,7 @@ fn pop_node<T: Send + Sync + 'static>(head: &AtomicPtr<()>) -> *mut AtomNode<T> 
     while !current.is_null() {
         let node = current as *mut AtomNode<T>;
         // SAFETY: a pooled pointer is this node type, and its link holds the next pooled node.
-        let next = unsafe { (*node).deferred.link() };
+        let next = unsafe { (*node).link() };
         match head.compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => return node,
             Err(seen) => current = seen,
@@ -254,7 +269,7 @@ fn pop_node<T: Send + Sync + 'static>(head: &AtomicPtr<()>) -> *mut AtomNode<T> 
 ///
 /// The private cache is tried first, so a publication normally exchanges a line no other thread
 /// writes. Only an empty cache reaches the shared pool, and it takes the whole pool in one exchange
-/// so the receiver is not contended with for every node in its next burst.
+/// so the reclaiming thread is not contended with for every node in its next burst.
 fn take_pooled<T: Send + Sync + 'static>(counters: &ReclaimHealth) -> *mut AtomNode<T> {
     let cached = pop_node::<T>(counters.cache());
     if !cached.is_null() {
@@ -275,7 +290,7 @@ fn give_pooled<T: Send + Sync + 'static>(node: *mut AtomNode<T>, counters: &Recl
     let mut head = pool.load(Ordering::Relaxed);
     loop {
         // SAFETY: the node was just freed and nothing else reads its link.
-        unsafe { (*node).deferred.set_link(head) };
+        unsafe { (*node).set_link(head) };
         match pool.compare_exchange_weak(
             head,
             node as *mut (),
@@ -300,7 +315,7 @@ fn seed_pooled<T: Send + Sync + 'static>(counters: &ReclaimHealth, count: usize)
     for _ in 0..count {
         let node = AtomNode::<T>::uninit(counters);
         // SAFETY: the node is unpublished, so only this thread reaches its link.
-        unsafe { (*node).deferred.set_link(head) };
+        unsafe { (*node).set_link(head) };
         head = node as *mut ();
     }
     cache.store(head, Ordering::Release);
@@ -313,13 +328,13 @@ unsafe fn free_pooled<T: Send + Sync + 'static>(counters: &ReclaimHealth) {
         while !head.is_null() {
             let node = head as *mut AtomNode<T>;
             // SAFETY: every pooled node is an allocation of this type, never published again.
-            head = unsafe { (*node).deferred.link() };
+            head = unsafe { (*node).link() };
             drop(unsafe { Box::from_raw(node) });
         }
     }
 }
 
-/// Drops the value on the drainer and returns the node to the atom's pool.
+/// Drops the value on the reclaiming thread and returns the node to the atom's pool.
 unsafe fn free_node<T: Send + Sync + 'static>(ptr: *mut ()) {
     let node = ptr as *mut AtomNode<T>;
     unsafe {
@@ -338,8 +353,8 @@ unsafe fn free_node<T: Send + Sync + 'static>(ptr: *mut ()) {
     }
 }
 
-// SAFETY: RetiredNode is the first field of a repr(C) node, and dealloc hands
-// the whole allocation to the drainer without dropping the value.
+// SAFETY: RetiredNode is the first field of a repr(C) node, and dealloc takes
+// the whole allocation without dropping the value.
 unsafe impl<T: Send + Sync + 'static> Reclaimable for AtomNode<T> {
     fn retired_node(&self) -> &RetiredNode {
         &self.header
@@ -350,11 +365,9 @@ unsafe impl<T: Send + Sync + 'static> Reclaimable for AtomNode<T> {
     }
 
     unsafe fn dealloc(ptr: *mut Self) {
-        // Kovan owns the node until this call and never touches it again, so the embedded header
-        // can be linked into the queue.
-        let header = unsafe { &mut (*ptr).deferred };
-        header.prepare(ptr as *mut (), free_node::<T>);
-        crate::deferred::defer(header);
+        // SAFETY: kovan owns the node until this call and never touches it again, and this thread
+        // runs the destructor.
+        unsafe { free_node::<T>(ptr as *mut ()) };
     }
 }
 
@@ -430,7 +443,7 @@ impl<T: Send + Sync + 'static> Atom<T> {
         }
     }
 
-    /// Replaces the value at the caller's version, deferring the destruction of the old node.
+    /// Replaces the value at the caller's version, retiring the previous node.
     ///
     /// The caller supplies the version, so publishing takes no counter of its own. A caller without
     /// a version of its own passes zero.
@@ -506,15 +519,13 @@ impl<T: Send + Sync + 'static> Atom<T> {
         (ptr, version)
     }
 
-    /// Hands a replaced node to the reclaimer and records when that happened.
+    /// Hands a replaced node to the reclaimer.
     fn retire_node(&self, node: Shared<'_, AtomNode<T>>) {
         if node.is_null() {
             return;
         }
         // SAFETY: the node was allocated here and is retired exactly once.
         unsafe { retire_reclaimable(node.as_raw()) };
-        // The receiver collects it even when the calling thread holds a guard.
-        crate::deferred::wake();
     }
 }
 
@@ -529,7 +540,6 @@ impl<T: Send + Sync + 'static> Drop for Atom<T> {
         }
         // Prompt reclamation now that this thread holds no guard.
         flush();
-        drain_deferred_frees();
 
         // The counters outlive this atom while a node can still report into them. Whichever side
         // finds the count at zero releases them, and the other side leaves them alone.
@@ -927,11 +937,6 @@ impl<T: Send + Sync + 'static, D: ?Sized + 'static> Clone for AtomCoerceHandle<T
     }
 }
 
-/// Runs every deferred destructor that reclamation has queued.
-pub fn drain_deferred_frees() -> usize {
-    crate::deferred::drain()
-}
-
 /// Submits this thread's retired batch when it holds one.
 ///
 /// A batch only leaves the thread that retired it, so the write path submits before it returns
@@ -954,15 +959,13 @@ pub fn flush_thread_reclamation() {
     flush();
 }
 
-/// Runs a full reclamation cycle on the calling thread and wakes the receiver.
+/// Runs a full reclamation cycle on the calling thread.
 pub fn flush_reclamation() {
     for _ in 0..2 {
         let guard = pin();
         drop(guard);
         flush();
     }
-    crate::deferred::wake();
-    drain_deferred_frees();
 }
 
 #[cfg(test)]

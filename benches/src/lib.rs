@@ -9,6 +9,7 @@ pub mod csv;
 pub mod isolation;
 pub mod manifest;
 pub mod pin;
+pub mod publish;
 pub mod settle;
 pub mod stats;
 

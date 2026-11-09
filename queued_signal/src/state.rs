@@ -1064,8 +1064,8 @@ impl<T: Clone + Send + Sync + 'static + EraseMut<D>, D: ?Sized + 'static> Writer
     /// that window, which is a reader starving the reclaimer. `Degraded` means generations are
     /// retained while progress is still happening, and `Healthy` means nothing is retained.
     pub fn update_health(&mut self) {
-        // Submitting belongs to the write path and the destructors belong to the receiver, so a
-        // scan only reads the counters and publishes the status.
+        // Submitting belongs to the write path and the destructors run under it, so a scan only
+        // reads the counters and publishes the status.
         let retained = self.cell.reclaim_health().retained();
         let pinned = usize::try_from(retained).unwrap_or(usize::MAX);
         let status = if retained == 0 {

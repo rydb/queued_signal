@@ -8,10 +8,12 @@ use std::sync::Arc;
 use parking_lot::{Mutex, RwLock};
 
 use super::{Candidate, Clock, DriveReport, Sample, Submitter};
+use crate::publish::{PublishProbe, PublishSamples, WriterProbe};
 
 /// B3, a reference counted read write lock.
 pub struct RwLockCell {
     value: Arc<RwLock<u64>>,
+    probe: Option<Arc<PublishProbe>>,
 }
 
 impl RwLockCell {
@@ -19,6 +21,15 @@ impl RwLockCell {
     pub fn new() -> Self {
         Self {
             value: Arc::new(RwLock::new(0)),
+            probe: None,
+        }
+    }
+
+    /// Creates the lock with publish latency records enabled.
+    pub fn with_probe() -> Self {
+        Self {
+            value: Arc::new(RwLock::new(0)),
+            probe: Some(PublishProbe::new()),
         }
     }
 
@@ -42,11 +53,17 @@ impl Default for RwLockCell {
 /// Writer handle for B3.
 struct RwLockWriter {
     value: Arc<RwLock<u64>>,
+    probe: Option<WriterProbe>,
 }
 
 impl Submitter for RwLockWriter {
     fn submit(&mut self, sample: Sample) {
+        let start_ns = self.probe.as_ref().map(WriterProbe::start_now);
         *self.value.write() = sample.seq;
+        if let (Some(probe), Some(start_ns)) = (self.probe.as_mut(), start_ns) {
+            let published_ns = probe.publish_now();
+            probe.record(sample.seq, start_ns, published_ns);
+        }
     }
 }
 
@@ -62,6 +79,7 @@ impl Candidate for RwLockCell {
     fn submitter(&self) -> Option<Box<dyn Submitter>> {
         Some(Box::new(RwLockWriter {
             value: self.value.clone(),
+            probe: self.probe.as_ref().map(|probe| probe.writer()),
         }))
     }
 
@@ -70,11 +88,16 @@ impl Candidate for RwLockCell {
     fn read(&self) -> u64 {
         self.read_value()
     }
+
+    fn publish_samples(&self) -> Option<PublishSamples> {
+        self.probe.as_ref().map(|probe| probe.samples())
+    }
 }
 
 /// B4, a reference counted mutex.
 pub struct MutexCell {
     value: Arc<Mutex<u64>>,
+    probe: Option<Arc<PublishProbe>>,
 }
 
 impl MutexCell {
@@ -82,6 +105,15 @@ impl MutexCell {
     pub fn new() -> Self {
         Self {
             value: Arc::new(Mutex::new(0)),
+            probe: None,
+        }
+    }
+
+    /// Creates the mutex with publish latency records enabled.
+    pub fn with_probe() -> Self {
+        Self {
+            value: Arc::new(Mutex::new(0)),
+            probe: Some(PublishProbe::new()),
         }
     }
 
@@ -105,11 +137,17 @@ impl Default for MutexCell {
 /// Writer handle for B4.
 struct MutexWriter {
     value: Arc<Mutex<u64>>,
+    probe: Option<WriterProbe>,
 }
 
 impl Submitter for MutexWriter {
     fn submit(&mut self, sample: Sample) {
+        let start_ns = self.probe.as_ref().map(WriterProbe::start_now);
         *self.value.lock() = sample.seq;
+        if let (Some(probe), Some(start_ns)) = (self.probe.as_mut(), start_ns) {
+            let published_ns = probe.publish_now();
+            probe.record(sample.seq, start_ns, published_ns);
+        }
     }
 }
 
@@ -125,6 +163,7 @@ impl Candidate for MutexCell {
     fn submitter(&self) -> Option<Box<dyn Submitter>> {
         Some(Box::new(MutexWriter {
             value: self.value.clone(),
+            probe: self.probe.as_ref().map(|probe| probe.writer()),
         }))
     }
 
@@ -132,5 +171,9 @@ impl Candidate for MutexCell {
 
     fn read(&self) -> u64 {
         self.read_value()
+    }
+
+    fn publish_samples(&self) -> Option<PublishSamples> {
+        self.probe.as_ref().map(|probe| probe.samples())
     }
 }

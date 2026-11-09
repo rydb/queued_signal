@@ -19,6 +19,7 @@ use parking_lot::Mutex;
 use queued_signal::state::{FrameRead, QueuedSignal, WriterDriver};
 
 use super::{Candidate, Clock, DriveReport, FrameReader, Sample, Submitter};
+use crate::publish::{NO_PUBLISH, PublishProbe, PublishSamples, WriterProbe};
 use crate::stats::{self, Stats};
 
 /// How often the runner drains and publishes, matching the hub's frame cadence.
@@ -277,10 +278,21 @@ pub struct RingsCandidate {
     signal: QueuedSignal<Sample>,
     rings: Arc<RingSet>,
     observed: Arc<Observed>,
+    probe: Option<Arc<PublishProbe>>,
 }
 
 /// Builds the signal, the queues, and the resolver thread at the frame cadence.
 pub fn new_rings() -> RingsCandidate {
+    build(None)
+}
+
+/// Builds the same design with publish latency records enabled.
+pub fn new_rings_probed() -> RingsCandidate {
+    build(Some(PublishProbe::new()))
+}
+
+/// Builds the signal, the queues, the resolver thread, and an optional publish probe.
+fn build(probe: Option<Arc<PublishProbe>>) -> RingsCandidate {
     let driver = WriterDriver::<Sample>::new(Sample {
         seq: 0,
         submitted_ns: 0,
@@ -295,6 +307,7 @@ pub fn new_rings() -> RingsCandidate {
     let runner_driver = driver.clone();
     let runner_rings = rings.clone();
     let runner_observed = observed.clone();
+    let runner_probe = probe.clone();
     std::thread::spawn(move || {
         let mut consumers: Vec<Consumer> = Vec::new();
         let mut entries: Vec<Entry> = Vec::new();
@@ -313,6 +326,7 @@ pub fn new_rings() -> RingsCandidate {
                     consumers.push(Consumer::new(ring));
                 }
                 let begin = Instant::now();
+                let work_begin = runner_probe.as_ref().map(|probe| probe.now_ns());
                 entries.clear();
                 for consumer in consumers.iter_mut() {
                     consumer.drain_into(&mut entries);
@@ -340,6 +354,7 @@ pub fn new_rings() -> RingsCandidate {
                     for op in mutations.drain(..) {
                         op(&mut value);
                     }
+                    let newest_seq = value.seq;
                     held.publish_value(value);
                     let pass_ns = begin.elapsed().as_nanos() as u64;
                     let mut passes = runner_observed.passes.lock();
@@ -347,6 +362,12 @@ pub fn new_rings() -> RingsCandidate {
                         passes.push(pass_ns);
                     }
                     drop(passes);
+                    if let Some(probe) = runner_probe.as_ref() {
+                        let work_ns = work_begin
+                            .map(|begin| probe.now_ns().saturating_sub(begin))
+                            .unwrap_or(0);
+                        probe.record_generation(newest_seq, work_ns);
+                    }
                     if oldest != u64::MAX {
                         runner_observed.published.lock().push(oldest);
                     }
@@ -361,22 +382,32 @@ pub fn new_rings() -> RingsCandidate {
         signal,
         rings,
         observed,
+        probe,
     }
 }
 
 /// Writer handle that owns its queue.
 struct RingWriter {
     producer: Producer,
+    probe: Option<WriterProbe>,
 }
 
 impl Submitter for RingWriter {
     fn submit(&mut self, sample: Sample) {
+        let start_ns = self.probe.as_ref().map(WriterProbe::start_now);
         self.producer.push(Entry::Set(sample));
+        if let (Some(probe), Some(start_ns)) = (self.probe.as_mut(), start_ns) {
+            probe.record(sample.seq, start_ns, NO_PUBLISH);
+        }
     }
 
     fn submit_mutation(&mut self, sample: Sample) {
+        let start_ns = self.probe.as_ref().map(WriterProbe::start_now);
         let mutation = Arc::new(move |value: &mut Sample| *value = sample);
         self.producer.push(Entry::Mutate(mutation));
+        if let (Some(probe), Some(start_ns)) = (self.probe.as_mut(), start_ns) {
+            probe.record(sample.seq, start_ns, NO_PUBLISH);
+        }
     }
 }
 
@@ -405,6 +436,7 @@ impl Candidate for RingsCandidate {
         let ring = self.rings.attach();
         Some(Box::new(RingWriter {
             producer: Producer::new(ring),
+            probe: self.probe.as_ref().map(|probe| probe.writer()),
         }))
     }
 
@@ -456,5 +488,9 @@ impl Candidate for RingsCandidate {
 
     fn retained(&self) -> u64 {
         self.signal.state.cell.reclaim_health().retained()
+    }
+
+    fn publish_samples(&self) -> Option<PublishSamples> {
+        self.probe.as_ref().map(|probe| probe.samples())
     }
 }

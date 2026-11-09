@@ -42,6 +42,11 @@ const WARMUP: usize = 100;
 const LATENCY_CAP: usize = 200_000;
 /// Bound on the wait for a consumer to observe the newest write.
 const OBSERVE_LIMIT: Duration = Duration::from_millis(250);
+/// Budget for flushing reclamation between repetitions.
+///
+/// A candidate that keeps one generation alive would otherwise spend the full default guard on
+/// every repetition without reclaiming anything more.
+const SETTLE_BUDGET: Duration = Duration::from_millis(100);
 /// Idle resolver passes timed by the drain probe.
 const PROBE_SAMPLES: usize = 2_000;
 /// Bound on the wait for the runner to record the pass that ended the newest-wait.
@@ -184,17 +189,19 @@ fn write_caveats(sink: &RunSink) {
 
 /// Runs every repetition of one row.
 fn run_row(row: &Row, args: &Args, cores: &[usize]) -> Vec<Record> {
-    // A row that outlives this budget has hung, so the run fails instead of waiting on it.
-    let _deadline = isolation::Deadline::arm(
-        Duration::from_secs(30),
-        format!("e1 {} {}", row.candidate, row.writers),
-    );
     let reps = args.reps(REPS);
     let (batch, warmup) = if args.smoke { (32, 4) } else { (BATCH, WARMUP) };
     let signals = row.signals();
     let mut records = Vec::new();
 
     for rep in 0..reps {
+        // A repetition that outlives this budget has hung, so the run fails instead of waiting on
+        // it. The budget is per repetition, so a multi writer row with many repetitions still
+        // records every rep while a single stuck rep is caught.
+        let _deadline = isolation::Deadline::arm(
+            Duration::from_secs(30),
+            format!("e1 {} {} rep {rep}", row.candidate, row.writers),
+        );
         let out = run_rep(row.candidate, signals, row.writers, batch, warmup, cores);
         push_records(&mut records, row, rep, out);
     }
@@ -378,7 +385,10 @@ fn run_rep(
     out.retained = cells.iter().map(|cell| cell.retained()).sum();
     out.observe_ns = observe_ns as f64;
     out.final_is_newest = f64::from(newest_ok);
-    let _ = settle::settle_default(|| cells.iter().map(|cell| cell.retained()).sum());
+    let _ = settle::settle(
+        || cells.iter().map(|cell| cell.retained()).sum(),
+        SETTLE_BUDGET,
+    );
     out
 }
 

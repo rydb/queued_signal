@@ -1,12 +1,12 @@
 //! Reclamation settling between rows.
 //!
-//! A row that publishes leaves replaced generations for the receiver to collect. The next
+//! A row that publishes leaves replaced generations for reclamation to collect. The next
 //! row must start from a quiet signal, so every row settles first and records what it saw.
 
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use queued_signal::atom_coerce::{drain_deferred_frees, flush_reclamation};
+use queued_signal::atom_coerce::flush_reclamation;
 
 /// Flushes reclamation until the retained count reaches zero or the budget runs out.
 ///
@@ -15,7 +15,6 @@ pub fn settle(retained: impl Fn() -> u64, budget: Duration) -> u64 {
     let start = Instant::now();
     loop {
         flush_reclamation();
-        drain_deferred_frees();
         let count = retained();
         if count == 0 || start.elapsed() >= budget {
             return count;

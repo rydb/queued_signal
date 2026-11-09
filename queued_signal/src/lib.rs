@@ -3,7 +3,6 @@
 
 pub mod atom_coerce;
 pub mod atom_coerce_dyn;
-pub(crate) mod deferred;
 pub(crate) mod macros;
 pub mod queued_signal_dyn;
 /// High-level dioxus integration: [`QueuedSignalSender`](signal::QueuedSignalSender),
