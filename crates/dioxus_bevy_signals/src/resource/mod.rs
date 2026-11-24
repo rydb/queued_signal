@@ -11,7 +11,9 @@ use dioxus_core::{IntoAttributeValue, IntoDynNode};
 use dioxus_hooks::{use_context, use_future, use_memo, use_signal};
 use dioxus_signals::{Memo, ReadableExt, Signal, WritableExt};
 use parking_lot::Mutex;
-use queued_signal::state::{HealthStatus, Op, QueuedSignal, TrackedReadGuard, WriterDriver};
+use queued_signal::state::{
+    HealthStatus, Op, ProjectedReadGuard, QueuedSignal, TrackedReadGuard, WriterDriver,
+};
 use std::any::TypeId;
 use std::collections::HashSet;
 use std::fmt::Display;
@@ -21,7 +23,7 @@ use trait_set::trait_set;
 
 use crate::macros::*;
 
-use crate::{CommandQueueSender, add_systems_through_world};
+use crate::{CommandQueueSender, Projection, add_systems_through_world};
 
 /// Convenience re-export of the standard Result type.
 pub type Result<T, E> = std::result::Result<T, E>;
@@ -162,9 +164,6 @@ trait_set! {
     pub trait UBounds = Send + Sync + PartialEq + 'static
 }
 
-/// Borrowing projection used to display one field of a resource.
-type Projection<R, U> = Arc<dyn for<'a> Fn(&'a R) -> &'a U>;
-
 /// Dioxus signal for managing bevy resource synchronization.
 pub struct ResourceMirrorSignal<R, U, E>
 where
@@ -177,8 +176,8 @@ where
     /// None until the bevy round-trip completes.
     /// Writes are silently ignored while pending.
     writer: Signal<Option<QueuedSignal<R>>>,
-    /// Projection applied on each read, allocated once when the hook runs.
-    map_fn: Signal<Projection<R, U>>,
+    /// Projection applied on each read.
+    map_fn: Projection<R, U>,
     /// Latest version and error state, which holds no read pin.
     display: Memo<Result<(), E>>,
 }
@@ -209,11 +208,9 @@ where
         let Some(signal) = writer.as_ref() else {
             return Ok(());
         };
-        let map = self.map_fn.peek();
-        let projection: &Projection<R, U> = &map;
         // A tracked read joins the slot array, so a publish marks this scope directly while the
         // guard stays transient and drops before the render returns.
-        let value = signal.read().project(|resource| projection(resource));
+        let value = signal.read().project(self.map_fn);
         write!(f, "{}", *value)
     }
 }
@@ -300,7 +297,7 @@ impl<R: Clone + Send + Sync + 'static, U: UBounds, E> ResourceMirrorSignal<R, U,
         }
     }
 
-    /// .read() + .map()
+    /// .read() or .map() if the value doesn't exist.
     pub fn read_ok<O>(&self, f: impl FnOnce(&R) -> O) -> Result<O, ResourceNoneState> {
         let _ = self.version.read();
         let writer = self.writer.read();
@@ -309,13 +306,25 @@ impl<R: Clone + Send + Sync + 'static, U: UBounds, E> ResourceMirrorSignal<R, U,
             None => Err(ResourceNoneState::NotInitialized),
         }
     }
+    /// Read resource or return default value of it.
+    pub fn read_or_default(&self) -> ProjectedReadGuard<R>
+    where
+        R: Default,
+    {
+        let _ = self.version.read(); // preserve scope subscription
+        let writer = self.writer.read();
+        match writer.as_ref() {
+            Some(signal) => signal.read().project(|resource| resource),
+            None => ProjectedReadGuard::from_owned(R::default()),
+        }
+    }
 }
 
 /// Create or fetch a signal mirror for a bevy resource.
 ///
 /// `map_fn` projects a borrowed field of the resource for display and equality.
 pub fn use_bevy_resource<T, U, E>(
-    map_fn: impl for<'a> Fn(&'a T) -> &'a U + 'static,
+    map_fn: Projection<T, U>,
     err_fn: impl Fn(ResourceNoneState) -> E + Clone + 'static,
 ) -> ResourceMirrorSignal<T, U, E>
 where
@@ -328,8 +337,6 @@ where
     let version: Signal<u64> = use_signal(|| 0);
     let health_signal = use_signal(|| HealthStatus::Healthy);
     let mut writer: Signal<Option<QueuedSignal<T>>> = use_signal(|| None);
-    // The projection is allocated once and borrowed on every read.
-    let map_fn: Signal<Projection<T, U>> = use_signal(move || Arc::new(map_fn) as Projection<T, U>);
 
     let display: Memo<Result<(), E>> = {
         let err_fn = err_fn.clone();

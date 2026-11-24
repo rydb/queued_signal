@@ -236,4 +236,3 @@ fn frequent_health_updates() {
     assert_eq!(retained(&driver), 0);
     assert_eq!(driver.queued_state.health(), HealthStatus::Healthy);
 }
-

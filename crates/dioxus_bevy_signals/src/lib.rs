@@ -37,6 +37,9 @@ pub mod asset;
 #[cfg(feature = "reflect")]
 pub mod reflect;
 
+/// Borrowing projection from a value to one of its fields.
+pub type Projection<T, U> = for<'a> fn(&'a T) -> &'a U;
+
 /// Sender for bevy command queues across thread boundaries.
 pub type CommandSender = Sender<CommandQueue>;
 /// Receiver for bevy command queues across thread boundaries.

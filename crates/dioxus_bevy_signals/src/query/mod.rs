@@ -16,6 +16,7 @@ use std::{
     time::Duration,
 };
 
+pub mod component;
 mod macros;
 pub mod single;
 
@@ -30,7 +31,7 @@ use bevy_ecs::{
 };
 use dioxus_core::use_drop;
 use dioxus_hooks::{use_context, use_effect, use_future, use_memo, use_signal};
-use dioxus_signals::{ReadableExt, Signal, WritableExt};
+use dioxus_signals::{Memo, ReadableExt, Signal, WritableExt};
 use parking_lot::Mutex;
 use queued_signal::state::{
     HealthStatus, QueuedSignal, SignalReadGuard, TrackedReadGuard, WriterDriver,
@@ -110,8 +111,8 @@ impl<T: DioxusComponentSync + Debug> Debug for DioxusMirror<T> {
 
 impl<T: DioxusComponentSync> DioxusMirror<T> {
     /// Obtain a lightweight handle to this component mirror.
-    pub fn handle(&self) -> DioxusMirrorHandle<T> {
-        DioxusMirrorHandle {
+    pub fn handle(&self) -> ComponentMirrorHandle<T> {
+        ComponentMirrorHandle {
             value: self.value.clone(),
         }
     }
@@ -119,7 +120,7 @@ impl<T: DioxusComponentSync> DioxusMirror<T> {
 
 /// Dioxus handle for a bevy-side mirrored component.
 #[derive(Clone)]
-pub struct DioxusMirrorHandle<T: DioxusComponentSync> {
+pub struct ComponentMirrorHandle<T: DioxusComponentSync> {
     /// The signal handle for the mirrored value.
     pub value: QueuedSignal<T>,
 }
@@ -164,11 +165,18 @@ impl<Q: MirrorQueryData, F: QueryFilter> Default for MirrorQueryActive<Q, F> {
     }
 }
 
-impl<T: DioxusComponentSync> std::ops::Deref for DioxusMirrorHandle<T> {
+impl<T: DioxusComponentSync> std::ops::Deref for ComponentMirrorHandle<T> {
     type Target = QueuedSignal<T>;
 
     fn deref(&self) -> &Self::Target {
         &self.value
+    }
+}
+
+/// Compares the mirrored values behind two handles.
+impl<T: DioxusComponentSync + PartialEq> PartialEq for ComponentMirrorHandle<T> {
+    fn eq(&self, other: &Self) -> bool {
+        *self.value.read() == *other.value.read()
     }
 }
 
@@ -598,7 +606,7 @@ pub trait MirrorQueryData: QueryData + IterQueryData {
     /// ```
     /// this would be
     /// ```text
-    /// (Entity, DioxusMirrorHandle<A>, DioxusMirrorHandle<B>)
+    /// (Entity, ComponentMirrorHandle<A>, ComponentMirrorHandle<B>)
     /// ```
     type MirrorItemHandles: Clone + Send + Sync + 'static;
 
@@ -702,7 +710,7 @@ impl<A: DioxusComponentSync, B: DioxusComponentSync> MirrorQueryData for (Entity
 
     type MirrorSignalsWithoutFilter = Or<(Without<DioxusMirror<A>>, Without<DioxusMirror<B>>)>;
 
-    type MirrorItemHandles = (Entity, DioxusMirrorHandle<A>, DioxusMirrorHandle<B>);
+    type MirrorItemHandles = (Entity, ComponentMirrorHandle<A>, ComponentMirrorHandle<B>);
 
     type MirrorSignalsChangedFilter = Or<(Changed<DioxusMirror<A>>, Changed<DioxusMirror<B>>)>;
 
@@ -830,45 +838,60 @@ impl<A: DioxusComponentSync, B: DioxusComponentSync> crate::query::single::Singl
     for (Entity, &mut A, &mut B)
 {
     type Output = (
-        crate::query::single::SingleEntityHandle,
-        crate::query::single::SingleComponentHandle<A>,
-        crate::query::single::SingleComponentHandle<B>,
+        Memo<Result<Entity, crate::query::single::SingleQueryError>>,
+        crate::query::component::ComponentMirrorSignal<
+            A,
+            A,
+            crate::query::single::SingleQueryError,
+        >,
+        crate::query::component::ComponentMirrorSignal<
+            B,
+            B,
+            crate::query::single::SingleQueryError,
+        >,
     );
 
     fn create_parts<F: QueryFilter + 'static>(
         resolved: Signal<Result<Self::MirrorItemHandles, crate::query::single::SingleQueryError>>,
     ) -> Self::Output {
-        let mut entity_signal: Signal<Result<Entity, crate::query::single::SingleQueryError>> =
-            use_signal(|| Err(crate::query::single::SingleQueryError::NotInitialized));
+        let entity = use_memo(move || match resolved.read().as_ref() {
+            Ok(handles) => Ok(Self::handles_entity(handles)),
+            Err(err) => Err(err.clone()),
+        });
+
         let mut a_signal: Signal<
-            Result<DioxusMirrorHandle<A>, crate::query::single::SingleQueryError>,
+            Result<ComponentMirrorHandle<A>, crate::query::single::SingleQueryError>,
         > = use_signal(|| Err(crate::query::single::SingleQueryError::NotInitialized));
         let mut b_signal: Signal<
-            Result<DioxusMirrorHandle<B>, crate::query::single::SingleQueryError>,
+            Result<ComponentMirrorHandle<B>, crate::query::single::SingleQueryError>,
         > = use_signal(|| Err(crate::query::single::SingleQueryError::NotInitialized));
 
         use_memo(move || match resolved.read().as_ref() {
             Ok(handles) => {
                 let handles = handles.clone();
                 #[allow(non_snake_case)]
-                let (entity, A, B) = handles;
-                entity_signal.set(Ok(entity));
+                let (_, A, B) = handles;
                 a_signal.set(Ok(A));
                 b_signal.set(Ok(B));
             }
-            Err(e) => {
-                entity_signal.set(Err(e.clone()));
-                a_signal.set(Err(e.clone()));
-                b_signal.set(Err(e.clone()));
+            Err(err) => {
+                a_signal.set(Err(err.clone()));
+                b_signal.set(Err(err.clone()));
             }
         });
 
         (
-            crate::query::single::SingleEntityHandle {
-                signal: entity_signal,
-            },
-            crate::query::single::SingleComponentHandle { signal: a_signal },
-            crate::query::single::SingleComponentHandle { signal: b_signal },
+            entity,
+            crate::query::component::ComponentMirrorSignal::from_resolved(
+                a_signal,
+                |component: &A| component,
+                |err| err,
+            ),
+            crate::query::component::ComponentMirrorSignal::from_resolved(
+                b_signal,
+                |component: &B| component,
+                |err| err,
+            ),
         )
     }
 }
@@ -925,6 +948,13 @@ impl<T: MirrorQueryData, F: QueryFilter> Default for MirrorQuery<T, F> {
             reflect: Default::default(),
             _marker: Default::default(),
         }
+    }
+}
+
+impl<Q: MirrorQueryData, F: QueryFilter> MirrorQuery<Q, F> {
+    /// Returns the mirrored handles for an entity.
+    pub fn get(&self, entity: Entity) -> Option<&Q::MirrorItemHandles> {
+        self.value.get(&entity)
     }
 }
 
@@ -1033,6 +1063,15 @@ impl<Q: MirrorQueryData + 'static, F: QueryFilter + 'static> MirrorQuerySignalHa
             Some(signal) => Ok(signal.read()),
             None => Err(QueryNoneState::NotInitialized),
         }
+    }
+
+    /// Returns the mirrored handles for an entity, if the query matches it.
+    pub fn get(&self, entity: Entity) -> Option<Q::MirrorItemHandles> {
+        let _ = self.version.read();
+        let writer = self.writer.read();
+        let signal = writer.as_ref()?;
+        let guard = signal.read();
+        guard.get(entity).cloned()
     }
 
     /// Iterate over all mirrored query items.

@@ -1,20 +1,16 @@
 //! Implementation for [`Single<Q, F>`] mirror
 
+use std::fmt::Display;
 use std::marker::PhantomData;
 
-#[cfg(feature = "asset")]
-use bevy_asset::Handle;
 use bevy_ecs::{prelude::*, query::QueryFilter};
 use dioxus_hooks::{use_memo, use_signal};
-use dioxus_signals::{Memo, ReadableExt, Signal, WritableExt};
+use dioxus_signals::{ReadableExt, Signal, WritableExt};
 use queued_signal::state::{HealthStatus, QueuedSignal};
 
-#[cfg(feature = "asset")]
-use crate::asset::{AssetMaybeMirrorSignal, AssetNoneState, DioxusAssetSync, use_bevy_asset};
-
 use super::{
-    DioxusComponentSync, DioxusQuerySync, MirrorQuery, MirrorQueryData, MirrorQuerySignalHandle,
-    SignalReadGuard, use_bevy_query,
+    DioxusQuerySync, MirrorQuery, MirrorQueryData, MirrorQuerySignalHandle, SignalReadGuard,
+    use_bevy_query,
 };
 
 /// Error when a single-entity query does not resolve to exactly one match.
@@ -35,6 +31,18 @@ impl From<SingleQueryError> for String {
             SingleQueryError::NoMatchingEntity => "No matching entities".into(),
             SingleQueryError::MoreThanOneEntity(entities) => {
                 format!("more than one matching entity: {:#?}", entities)
+            }
+        }
+    }
+}
+
+impl Display for SingleQueryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SingleQueryError::NotInitialized => write!(f, "Not initialized"),
+            SingleQueryError::NoMatchingEntity => write!(f, "No matching entities"),
+            SingleQueryError::MoreThanOneEntity(entities) => {
+                write!(f, "more than one matching entity: {:#?}", entities)
             }
         }
     }
@@ -69,13 +77,13 @@ pub fn resolve_single<Q: DioxusQuerySync + 'static, F: QueryFilter + 'static>(
     item
 }
 
-/// Handle to a single-entity mirrored bevy query.
+/// Handle to a single-entity mirrored query.
 pub struct MirrorQuerySingleHandle<Q: MirrorQueryData + 'static, F: QueryFilter + 'static> {
     /// The single matched item, or an error describing why resolution failed.
     item: Signal<Result<Q::MirrorItemHandles, SingleQueryError>>,
     /// Health of the underlying signal.
     pub health: Signal<HealthStatus>,
-    /// None until the bevy round-trip completes.
+    /// None until the round trip completes.
     pub writer: Signal<Option<QueuedSignal<MirrorQuery<Q, F>>>>,
     _filter: PhantomData<F>,
 }
@@ -112,109 +120,18 @@ impl<Q: MirrorQueryData + 'static, F: QueryFilter + 'static> MirrorQuerySingleHa
     }
 }
 
-/// Handle for the Entity field of a single-entity query.
-#[derive(Clone, Copy)]
-pub struct SingleEntityHandle {
-    pub(crate) signal: Signal<Result<Entity, SingleQueryError>>,
-}
-
-impl SingleEntityHandle {
-    /// Read the current entity or error state.
-    pub fn read(&self) -> SignalReadGuard<'_, Result<Entity, SingleQueryError>> {
-        SignalReadGuard::new(self.signal.read())
-    }
-
-    /// .read() + .map() convienience method.
-    pub fn read_ok<U>(&self, f: impl FnOnce(&Entity) -> U) -> Result<U, SingleQueryError> {
-        let guard = self.signal.read();
-        match &*guard {
-            Ok(entity) => Ok(f(entity)),
-            Err(e) => Err(e.clone()),
-        }
-    }
-}
-
-/// Handle for a single component mirrored from a single-entity bevy query.
-#[derive(Clone)]
-pub struct SingleComponentHandle<T: DioxusComponentSync> {
-    pub(crate) signal: Signal<Result<super::DioxusMirrorHandle<T>, SingleQueryError>>,
-}
-
-impl<T: DioxusComponentSync> Copy for SingleComponentHandle<T> {}
-
-impl<T: DioxusComponentSync> SingleComponentHandle<T> {
-    /// Read the current component handle or error state.
-    pub fn read(
-        &self,
-    ) -> SignalReadGuard<'_, Result<super::DioxusMirrorHandle<T>, SingleQueryError>> {
-        SignalReadGuard::new(self.signal.read())
-    }
-
-    /// .read() + .map() convienience method.
-    pub fn read_ok<U>(
-        &self,
-        f: impl FnOnce(&super::DioxusMirrorHandle<T>) -> U,
-    ) -> Result<U, SingleQueryError> {
-        let guard = self.signal.read();
-        match &*guard {
-            Ok(handle) => Ok(f(handle)),
-            Err(e) => Err(e.clone()),
-        }
-    }
-
-    /// Mutate the underlying component value on the bevy side.
-    pub fn mutate<F>(&self, f: F)
-    where
-        F: Fn(&mut T) + Send + Sync + 'static,
-    {
-        let guard = self.signal.read();
-        if let Ok(handle) = &*guard {
-            handle.value.mutate(f);
-        }
-    }
-
-    /// Create a memoized display string from the component value.
-    pub fn use_display(&self, f: impl Fn(&T) -> String + 'static) -> Memo<String> {
-        let this = *self;
-        use_memo(move || {
-            this.read_ok(|handle| {
-                let guard = handle.read();
-                f(&guard)
-            })
-            .unwrap_or_else(|err| err.into())
-        })
-    }
-}
-
-#[cfg(feature = "asset")]
-impl<T, A> SingleComponentHandle<T>
-where
-    T: DioxusComponentSync + std::ops::Deref<Target = Handle<A>>,
-    A: DioxusAssetSync,
-{
-    /// Converts a handle-bearing component into an asset mirror signal.
-    pub fn use_asset(&self) -> AssetMaybeMirrorSignal<A> {
-        let this = *self;
-        let id_memo = use_memo(move || {
-            this.read_ok(|handle| Ok(handle.read().id()))
-                .unwrap_or(Err(AssetNoneState::Fetching))
-        });
-        use_bevy_asset(id_memo)
-    }
-}
-
-/// Maps a [`MirrorQueryData`] implementor to its destructured per-field handle tuple.
+/// Maps a [`MirrorQueryData`] implementor to its per-field mirror output.
 pub trait SingleQueryParts: MirrorQueryData {
-    /// The destructured tuple of per-field handles.
+    /// The resolved entity memo and one mirror per field.
     type Output;
 
-    /// Create the per-field handles from a resolved single signal.
+    /// Creates the per-field mirrors from a resolved single signal.
     fn create_parts<F: QueryFilter + 'static>(
         resolved: Signal<Result<Self::MirrorItemHandles, SingleQueryError>>,
     ) -> Self::Output;
 }
 
-/// Query for a single mirrored bevy entity, returning per-field handles.
+/// Query for a single mirrored entity, returning per-field mirrors.
 pub fn use_bevy_single<
     Q: DioxusQuerySync + SingleQueryParts + 'static,
     F: QueryFilter + 'static,

@@ -14,7 +14,7 @@ macro_rules! impl_mirror_query_data {
             // Or does not implement QueryFilter for 1-tuples, so use bare filters.
             type MirrorSignalsWithoutFilter = Without<DioxusMirror<$T>>;
 
-            type MirrorItemHandles = (Entity, DioxusMirrorHandle<$T>);
+            type MirrorItemHandles = (Entity, ComponentMirrorHandle<$T>);
 
             type MirrorSignalsChangedFilter = Changed<DioxusMirror<$T>>;
 
@@ -153,10 +153,10 @@ macro_rules! impl_mirror_query_data {
 
             type MirrorItemHandles = (
                 Entity,
-                DioxusMirrorHandle<$first>,
-                DioxusMirrorHandle<$second>,
-                DioxusMirrorHandle<$third>
-                $(, DioxusMirrorHandle<$rest>)*
+                ComponentMirrorHandle<$first>,
+                ComponentMirrorHandle<$second>,
+                ComponentMirrorHandle<$third>
+                $(, ComponentMirrorHandle<$rest>)*
             );
 
             type MirrorSignalsChangedFilter = Or<(
@@ -317,35 +317,41 @@ macro_rules! impl_single_query_parts {
     // Single-element arm (1 component)
     ($T:ident) => {
         impl<$T: DioxusComponentSync> SingleQueryParts for (Entity, &mut $T) {
-            type Output = (SingleEntityHandle, SingleComponentHandle<$T>);
+            type Output = (
+                Memo<Result<Entity, SingleQueryError>>,
+                ComponentMirrorSignal<$T, $T, SingleQueryError>,
+            );
 
             fn create_parts<F: QueryFilter + 'static>(
                 resolved: Signal<Result<Self::MirrorItemHandles, SingleQueryError>>,
             ) -> Self::Output {
-                let mut entity_signal: Signal<Result<Entity, SingleQueryError>> =
-                    use_signal(|| Err(SingleQueryError::NotInitialized));
-                let mut t_signal: Signal<Result<DioxusMirrorHandle<$T>, SingleQueryError>> =
+                let entity = use_memo(move || match resolved.read().as_ref() {
+                    Ok(handles) => Ok(Self::handles_entity(handles)),
+                    Err(err) => Err(err.clone()),
+                });
+
+                let mut t_signal: Signal<Result<ComponentMirrorHandle<$T>, SingleQueryError>> =
                     use_signal(|| Err(SingleQueryError::NotInitialized));
 
-                use_memo(move || {
-                    match resolved.read().as_ref() {
-                        Ok(handles) => {
-                            let handles = handles.clone();
-                            #[allow(non_snake_case)]
-                            let (entity, $T) = handles;
-                            entity_signal.set(Ok(entity));
-                            t_signal.set(Ok($T));
-                        }
-                        Err(e) => {
-                            entity_signal.set(Err(e.clone()));
-                            t_signal.set(Err(e.clone()));
-                        }
+                use_memo(move || match resolved.read().as_ref() {
+                    Ok(handles) => {
+                        let handles = handles.clone();
+                        #[allow(non_snake_case)]
+                        let (_, $T) = handles;
+                        t_signal.set(Ok($T));
+                    }
+                    Err(err) => {
+                        t_signal.set(Err(err.clone()));
                     }
                 });
 
                 (
-                    SingleEntityHandle { signal: entity_signal },
-                    SingleComponentHandle { signal: t_signal },
+                    entity,
+                    ComponentMirrorSignal::from_resolved(
+                        t_signal,
+                        |component: &$T| component,
+                        |err| err,
+                    ),
                 )
             }
         }
@@ -363,61 +369,78 @@ macro_rules! impl_single_query_parts {
                 for (Entity, &mut $first, &mut $second, &mut $third $(, &mut $rest)*)
             {
                 type Output = (
-                    SingleEntityHandle,
-                    SingleComponentHandle<$first>,
-                    SingleComponentHandle<$second>,
-                    SingleComponentHandle<$third>
-                    $(, SingleComponentHandle<$rest>)*
+                    Memo<Result<Entity, SingleQueryError>>,
+                    ComponentMirrorSignal<$first, $first, SingleQueryError>,
+                    ComponentMirrorSignal<$second, $second, SingleQueryError>,
+                    ComponentMirrorSignal<$third, $third, SingleQueryError>
+                    $(, ComponentMirrorSignal<$rest, $rest, SingleQueryError>)*
                 );
 
                 fn create_parts<F: QueryFilter + 'static>(
                     resolved: Signal<Result<Self::MirrorItemHandles, SingleQueryError>>,
                 ) -> Self::Output {
-                    let mut entity_signal: Signal<Result<Entity, SingleQueryError>> =
+                    let entity = use_memo(move || match resolved.read().as_ref() {
+                        Ok(handles) => Ok(Self::handles_entity(handles)),
+                        Err(err) => Err(err.clone()),
+                    });
+
+                    let mut [< $first:snake _signal >]: Signal<Result<ComponentMirrorHandle<$first>, SingleQueryError>> =
                         use_signal(|| Err(SingleQueryError::NotInitialized));
-                    let mut [< $first:snake _signal >]: Signal<Result<DioxusMirrorHandle<$first>, SingleQueryError>> =
+                    let mut [< $second:snake _signal >]: Signal<Result<ComponentMirrorHandle<$second>, SingleQueryError>> =
                         use_signal(|| Err(SingleQueryError::NotInitialized));
-                    let mut [< $second:snake _signal >]: Signal<Result<DioxusMirrorHandle<$second>, SingleQueryError>> =
-                        use_signal(|| Err(SingleQueryError::NotInitialized));
-                    let mut [< $third:snake _signal >]: Signal<Result<DioxusMirrorHandle<$third>, SingleQueryError>> =
+                    let mut [< $third:snake _signal >]: Signal<Result<ComponentMirrorHandle<$third>, SingleQueryError>> =
                         use_signal(|| Err(SingleQueryError::NotInitialized));
                     $(
-                        let mut [< $rest:snake _signal >]: Signal<Result<DioxusMirrorHandle<$rest>, SingleQueryError>> =
+                        let mut [< $rest:snake _signal >]: Signal<Result<ComponentMirrorHandle<$rest>, SingleQueryError>> =
                             use_signal(|| Err(SingleQueryError::NotInitialized));
                     )*
 
-                    use_memo(move || {
-                        match resolved.read().as_ref() {
-                            Ok(handles) => {
-                                let handles = handles.clone();
-                                #[allow(non_snake_case)]
-                                let (entity, $first, $second, $third $(, $rest)*) = handles;
-                                entity_signal.set(Ok(entity));
-                                [< $first:snake _signal >].set(Ok($first));
-                                [< $second:snake _signal >].set(Ok($second));
-                                [< $third:snake _signal >].set(Ok($third));
-                                $(
-                                    [< $rest:snake _signal >].set(Ok($rest));
-                                )*
-                            }
-                            Err(e) => {
-                                entity_signal.set(Err(e.clone()));
-                                [< $first:snake _signal >].set(Err(e.clone()));
-                                [< $second:snake _signal >].set(Err(e.clone()));
-                                [< $third:snake _signal >].set(Err(e.clone()));
-                                $(
-                                    [< $rest:snake _signal >].set(Err(e.clone()));
-                                )*
-                            }
+                    use_memo(move || match resolved.read().as_ref() {
+                        Ok(handles) => {
+                            let handles = handles.clone();
+                            #[allow(non_snake_case)]
+                            let (_, $first, $second, $third $(, $rest)*) = handles;
+                            [< $first:snake _signal >].set(Ok($first));
+                            [< $second:snake _signal >].set(Ok($second));
+                            [< $third:snake _signal >].set(Ok($third));
+                            $(
+                                [< $rest:snake _signal >].set(Ok($rest));
+                            )*
+                        }
+                        Err(err) => {
+                            [< $first:snake _signal >].set(Err(err.clone()));
+                            [< $second:snake _signal >].set(Err(err.clone()));
+                            [< $third:snake _signal >].set(Err(err.clone()));
+                            $(
+                                [< $rest:snake _signal >].set(Err(err.clone()));
+                            )*
                         }
                     });
 
                     (
-                        SingleEntityHandle { signal: entity_signal },
-                        SingleComponentHandle { signal: [< $first:snake _signal >] },
-                        SingleComponentHandle { signal: [< $second:snake _signal >] },
-                        SingleComponentHandle { signal: [< $third:snake _signal >] }
-                        $(, SingleComponentHandle { signal: [< $rest:snake _signal >] })*
+                        entity,
+                        ComponentMirrorSignal::from_resolved(
+                            [< $first:snake _signal >],
+                            |component: &$first| component,
+                            |err| err,
+                        ),
+                        ComponentMirrorSignal::from_resolved(
+                            [< $second:snake _signal >],
+                            |component: &$second| component,
+                            |err| err,
+                        ),
+                        ComponentMirrorSignal::from_resolved(
+                            [< $third:snake _signal >],
+                            |component: &$third| component,
+                            |err| err,
+                        )
+                        $(
+                            , ComponentMirrorSignal::from_resolved(
+                                [< $rest:snake _signal >],
+                                |component: &$rest| component,
+                                |err| err,
+                            )
+                        )*
                     )
                 }
             }
@@ -425,6 +448,7 @@ macro_rules! impl_single_query_parts {
     };
 }
 
+use super::component::*;
 use super::single::*;
 use super::*;
 use variadics_please::all_tuples;

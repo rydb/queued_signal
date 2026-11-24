@@ -330,7 +330,6 @@ pub fn SingleQuery() -> Element {
                     "increment counter"
                 }
             }
-
             h2 {
                 {format!("no match: {}", no_match.use_display(|_n| "ERROR: there is a match".into()))}
             }

@@ -4,6 +4,8 @@
 pub mod atom_coerce;
 pub mod atom_coerce_dyn;
 pub(crate) mod macros;
+/// Projected reads and writes over part of a queued value.
+pub mod projected;
 pub mod queued_signal_dyn;
 /// High-level dioxus integration: [`QueuedSignalSender`](signal::QueuedSignalSender),
 /// [`QueuedSignalHandle`](signal::QueuedSignalHandle), and
